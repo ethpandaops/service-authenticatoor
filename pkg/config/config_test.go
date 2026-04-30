@@ -89,7 +89,7 @@ cloudflareAccess:
 	}
 }
 
-func TestLoad_RejectsCFConfigWhenVerifyJWTOn(t *testing.T) {
+func TestLoad_RejectsMissingTeamDomainWhenVerifyJWTOn(t *testing.T) {
 	p := writeTempConfig(t, `
 issuer: "https://auth.foo.example"
 signing:
@@ -97,10 +97,27 @@ signing:
     privateKeyFile: "/etc/keys/private.pem"
 cloudflareAccess:
   verifyJWT: true
-  # teamDomain & audTag missing
+  # teamDomain missing
 `)
 	if _, err := Load(p); err == nil {
-		t.Error("expected error for missing CF teamDomain/audTag")
+		t.Error("expected error for missing CF teamDomain")
+	}
+}
+
+func TestLoad_AcceptsMissingAudTagWhenVerifyJWTOn(t *testing.T) {
+	// Audience verification is optional; a configured teamDomain alone
+	// ties the assertion to the CF Access team via signature + issuer.
+	p := writeTempConfig(t, `
+issuer: "https://auth.foo.example"
+signing:
+  rs256:
+    privateKeyFile: "/etc/keys/private.pem"
+cloudflareAccess:
+  verifyJWT: true
+  teamDomain: "test.cloudflareaccess.com"
+`)
+	if _, err := Load(p); err != nil {
+		t.Errorf("did not expect error with empty audTag: %v", err)
 	}
 }
 

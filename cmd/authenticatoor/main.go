@@ -177,7 +177,12 @@ func buildCFVerifier(ctx context.Context, log logrus.FieldLogger, cfg *config.Co
 	if err != nil {
 		return nil, err
 	}
-	log.WithField("team", cfg.CloudflareAccess.TeamDomain).Info("cf access verifier ready")
+	entry := log.WithField("team", cfg.CloudflareAccess.TeamDomain)
+	if cfg.CloudflareAccess.AudTag == "" {
+		entry.Warn("cf access verifier ready — audTag not set, accepting assertions from any application in the team")
+	} else {
+		entry.WithField("aud", cfg.CloudflareAccess.AudTag).Info("cf access verifier ready")
+	}
 	return v, nil
 }
 

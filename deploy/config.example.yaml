@@ -65,7 +65,11 @@ userHeader: "Cf-Access-Authenticated-User-Email"
 cloudflareAccess:
   verifyJWT: true
   teamDomain: "<team>.cloudflareaccess.com"
-  audTag: "REPLACE_WITH_CF_ACCESS_APP_AUD_TAG"
+  # Optional. When set, assertions whose aud doesn't match are rejected. When
+  # empty, the audience claim is not checked — assertions from any application
+  # in the same CF Access team are accepted (signature + issuer still tie them
+  # to the team). Useful when you can't easily look up the AUD per deployment.
+  audTag: ""
   jwtHeader: "Cf-Access-Jwt-Assertion"
 
 # ─── signing keys ─────────────────────────────────────────────────────────────

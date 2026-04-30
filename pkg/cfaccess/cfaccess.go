@@ -44,9 +44,11 @@ type Config struct {
 	// "<team>.cloudflareaccess.com"). The JWKS URL is derived from this:
 	//   https://<team>/cdn-cgi/access/certs
 	TeamDomain string
-	// AudTag is the AUD tag of the CF Access application (set per-app in
-	// the CF zero-trust dashboard). Tokens whose aud doesn't match this are
-	// rejected.
+	// AudTag is the AUD tag of the CF Access application. When non-empty,
+	// the verifier rejects assertions whose aud doesn't match. When empty,
+	// the audience claim is not checked — assertions from any application
+	// in the same CF Access team will be accepted (signature + issuer
+	// still pin them to the team).
 	AudTag string
 	// Now is overridable for tests; defaults to time.Now.
 	Now func() time.Time
@@ -66,9 +68,6 @@ type JWKSVerifier struct {
 func NewJWKSVerifier(ctx context.Context, log logrus.FieldLogger, cfg Config) (*JWKSVerifier, error) {
 	if cfg.TeamDomain == "" {
 		return nil, errors.New("cfaccess: TeamDomain is required")
-	}
-	if cfg.AudTag == "" {
-		return nil, errors.New("cfaccess: AudTag is required")
 	}
 	if cfg.Now == nil {
 		cfg.Now = time.Now
@@ -95,14 +94,17 @@ func (v *JWKSVerifier) Verify(ctx context.Context, tokenString string) (*Claims,
 	}
 
 	claims := &Claims{}
-	parser := jwt.NewParser(
+	opts := []jwt.ParserOption{
 		// CF uses RS256 with rotating keys.
 		jwt.WithValidMethods([]string{jwt.SigningMethodRS256.Alg()}),
-		jwt.WithIssuer("https://"+strings.TrimSuffix(v.cfg.TeamDomain, "/")),
-		jwt.WithAudience(v.cfg.AudTag),
+		jwt.WithIssuer("https://" + strings.TrimSuffix(v.cfg.TeamDomain, "/")),
 		jwt.WithExpirationRequired(),
 		jwt.WithTimeFunc(v.cfg.Now),
-	)
+	}
+	if v.cfg.AudTag != "" {
+		opts = append(opts, jwt.WithAudience(v.cfg.AudTag))
+	}
+	parser := jwt.NewParser(opts...)
 	tok, err := parser.ParseWithClaims(tokenString, claims, v.kf.Keyfunc)
 	if err != nil {
 		return nil, fmt.Errorf("cfaccess: parse: %w", err)

@@ -223,9 +223,6 @@ func (c *Config) Validate() error {
 		if c.CloudflareAccess.TeamDomain == "" {
 			return errors.New("cloudflareAccess.teamDomain is required when verifyJWT is true")
 		}
-		if c.CloudflareAccess.AudTag == "" {
-			return errors.New("cloudflareAccess.audTag is required when verifyJWT is true")
-		}
 	}
 
 	if slices.Contains(c.AllowedReturnHosts, "") {
