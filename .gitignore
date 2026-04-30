@@ -6,3 +6,4 @@
 *.pem
 .idea/
 .vscode/
+.plan/
