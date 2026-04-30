@@ -1,0 +1,8 @@
+/bin/
+/dist/
+/authenticatoor
+*.test
+*.out
+*.pem
+.idea/
+.vscode/

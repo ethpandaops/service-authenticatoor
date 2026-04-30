@@ -1,0 +1,98 @@
+# authenticatoor — example configuration
+#
+# Loaded from the path passed via --config (default: /etc/authenticatoor/config.yaml).
+# Every field can also be set via env var: AUTHENTICATOOR_<UPPER_PATH> with
+# dots replaced by underscores. For example, signing.rs256.privateKeyFile
+# becomes AUTHENTICATOOR_SIGNING_RS256_PRIVATEKEYFILE.
+
+# ─── server ───────────────────────────────────────────────────────────────────
+
+# Bind address. Default: ":8080".
+listen: ":8080"
+
+# REQUIRED. The canonical URL of this service. Used as the JWT "iss" claim.
+# Several other fields are derived from this when not configured explicitly:
+#   - audience          → the parent zone (i.e. with the "auth." stripped)
+#   - scopePattern      → "*.<parent zone>"
+#   - allowedReturnHosts → ["*.<parent zone>"]
+#   - cors.allowedOrigins → same as allowedReturnHosts
+issuer: "https://auth.example.com"
+
+# Optional. URL used in the OIDC discovery document and in the jwks_uri.
+# Defaults to the issuer URL.
+# externalURL: "https://auth.example.com"
+
+# ─── token shape ──────────────────────────────────────────────────────────────
+
+# The "aud" claim. Verifiers must accept this value. Defaults to the parent
+# zone of the issuer host.
+# audience:
+#   - "example.com"
+
+# The "scope" claim — a host wildcard pattern. Verifiers match their own
+# externally visible host against this pattern. Defaults to "*.<parent zone>".
+# scopePattern: "*.example.com"
+
+# Token lifetime. Default: "30m".
+tokenTTL: "30m"
+
+# ─── identity source ──────────────────────────────────────────────────────────
+
+# HTTP header carrying the authenticated user's email. CF Access forwards this
+# automatically. Default: "Cf-Access-Authenticated-User-Email".
+userHeader: "Cf-Access-Authenticated-User-Email"
+
+# ─── browser-callback / CORS allow-list ───────────────────────────────────────
+
+# Hosts that the /auth/login endpoint will redirect to via `return_to`.
+# Patterns use the same DNS-label glob syntax as scopePattern. Defaults to
+# ["*.<parent zone of issuer>"].
+# allowedReturnHosts:
+#   - "*.example.com"
+
+# Browsers that are allowed to call /auth/* with credentials via CORS. Defaults
+# to allowedReturnHosts.
+# cors:
+#   allowedOrigins:
+#     - "*.example.com"
+
+# ─── Cloudflare Access JWT verification (defense in depth) ────────────────────
+
+# When enabled (default), the service verifies the Cf-Access-Jwt-Assertion
+# header against Cloudflare's JWKS, in addition to trusting the user-email
+# header. Recommended even when the service is unreachable outside the CF
+# tunnel.
+cloudflareAccess:
+  verifyJWT: true
+  teamDomain: "<team>.cloudflareaccess.com"
+  audTag: "REPLACE_WITH_CF_ACCESS_APP_AUD_TAG"
+  jwtHeader: "Cf-Access-Jwt-Assertion"
+
+# ─── signing keys ─────────────────────────────────────────────────────────────
+
+signing:
+  mode: rs256
+  rs256:
+    # PEM-encoded RSA-2048+ private key, PKCS#1 or PKCS#8.
+    privateKeyFile: "/etc/authenticatoor/keys/private.pem"
+    # Optional. Defaults to a SHA-256 hash of the public key.
+    # keyId: "k1"
+    # If true and the file is missing, generate a new key on startup. DEV ONLY —
+    # production deployments must use a Kubernetes Secret with a stable key.
+    generateIfMissing: false
+    # During key rotation, list the previous public keys here so verifiers can
+    # still validate already-issued tokens until they expire. Drop entries
+    # after `tokenTTL` has passed.
+    # previousKeys:
+    #   - keyId: "k0"
+    #     publicKeyFile: "/etc/authenticatoor/keys/k0.pub.pem"
+
+# ─── observability ────────────────────────────────────────────────────────────
+
+logging:
+  level: info       # debug | info | warn | error
+  format: text      # text | json
+
+metrics:
+  enabled: false
+  listen: ":9090"
