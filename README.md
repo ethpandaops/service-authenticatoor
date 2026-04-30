@@ -15,13 +15,58 @@ Behind the upstream proxy (`/auth/*`):
   with the token in the URL fragment. `return_to` host must match
   `allowedReturnHosts`.
 - `GET /auth/userinfo` — small introspection endpoint.
+- `GET /auth/embed?target_origin=…` — issues a JWT and posts it to the
+  parent window via `postMessage`, restricted to the validated origin.
+  This is the silent token-acquisition path (loaded via an invisible
+  iframe).
 
 Public (no upstream auth — reachable by JWKS verifiers and browser JS):
 
 - `GET /jwks.json` — RS256 public keys.
 - `GET /.well-known/openid-configuration` — minimal OIDC discovery doc.
+- `GET /client.js` — drop-in browser client library. Exposes
+  `window.ethpandaops.authenticatoor.{checkLogin, login, logout,
+  getToken, isLoggedIn}`. Auth service URL is templated in at serve time.
 - `GET /healthz` — liveness probe.
 - `GET /` — landing page.
+
+## Browser integration
+
+```html
+<script src="https://auth.<devnet>.ethpandaops.io/client.js"></script>
+<script>
+  const auth = window.ethpandaops.authenticatoor;
+
+  // 1. Render the unauthenticated UI right away — don't await.
+  renderLoginButton();
+
+  // 2. checkLogin tries fragment → cache → silent iframe (up to 30s).
+  //    When it resolves with authenticated:true, swap to the authed UI.
+  auth.checkLogin().then((info) => {
+    if (info.authenticated) renderAuthedUI(info);
+  });
+
+  // 3. The login button calls auth.login() — full-page redirect, comes
+  //    back with #auth_token=… in the fragment (handled on next load).
+  document.querySelector('#login').addEventListener('click', () => auth.login());
+</script>
+```
+
+`checkLogin()` runs through three sources in order:
+1. **Fragment capture** — picks up `#auth_token=…&exp=…` if the page just
+   came back from `/auth/login`. Resolves immediately.
+2. **Cached token** — returns the still-fresh token from `sessionStorage`.
+   Resolves immediately.
+3. **Silent iframe** — loads `/auth/embed` in an invisible iframe, which
+   either posts the token back via `postMessage` (if the user already has
+   a CF Access cookie) or hangs there silently (CF Access tries to render
+   its login page in the iframe; the page's own `X-Frame-Options` blocks
+   it). The promise resolves when the iframe responds, or after 30s with
+   `authenticated: false`.
+
+Render the unauthenticated UI immediately — never block on the promise.
+The user can click "Login" any time during the 30-second window; the
+in-flight promise simply becomes irrelevant once the page navigates.
 
 ## Token format
 

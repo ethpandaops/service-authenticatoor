@@ -36,9 +36,11 @@ const indexHTML = `<!doctype html>
 <ul>
 <li><code>/auth/token</code> — issue a JWT</li>
 <li><code>/auth/login?return_to=…</code> — issue a JWT and redirect to an allow-listed host</li>
+<li><code>/auth/embed?target_origin=…</code> — issue a JWT and post it to an allow-listed parent window via postMessage (silent iframe path)</li>
 <li><code>/auth/userinfo</code> — identity introspection</li>
 <li><code>/jwks.json</code> — public keys (for verifiers)</li>
 <li><code>/.well-known/openid-configuration</code> — discovery</li>
+<li><code>/client.js</code> — drop-in browser client (<code>window.ethpandaops.authenticatoor</code>)</li>
 </ul>
 </body>
 </html>

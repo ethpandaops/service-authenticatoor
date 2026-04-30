@@ -156,6 +156,7 @@ func (s *Server) routes() http.Handler {
 	r.HandleFunc("/healthz", s.handleHealth).Methods(http.MethodGet)
 	r.HandleFunc("/jwks.json", s.handleJWKS).Methods(http.MethodGet)
 	r.HandleFunc("/.well-known/openid-configuration", s.handleOIDCConfig).Methods(http.MethodGet)
+	r.HandleFunc("/client.js", s.handleClientJS).Methods(http.MethodGet)
 	r.HandleFunc("/", s.handleIndex).Methods(http.MethodGet)
 
 	// Protected routes. The upstream proxy enforces user-facing auth on
@@ -176,6 +177,7 @@ func (s *Server) routes() http.Handler {
 	authRouter.HandleFunc("/token", s.handleToken).Methods(http.MethodGet, http.MethodOptions)
 	authRouter.HandleFunc("/login", s.handleLogin).Methods(http.MethodGet)
 	authRouter.HandleFunc("/userinfo", s.handleUserinfo).Methods(http.MethodGet, http.MethodOptions)
+	authRouter.HandleFunc("/embed", s.handleEmbed).Methods(http.MethodGet)
 
 	// Top-level access logger / panic recovery.
 	return s.recover(s.accessLog(r))
