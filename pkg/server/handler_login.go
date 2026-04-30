@@ -47,14 +47,21 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	s.loginRedirects.Inc()
 	s.log.WithField("email", email).WithField("jti", claims.ID).Info("login redirect")
 
-	dest.Fragment = url.Values{
+	// Build the redirect URL manually rather than going through
+	// dest.Fragment / dest.RawFragment — url.URL.String() re-percent-encodes
+	// fragments containing already-encoded characters (so e.g.
+	// user=alice%40example.com becomes user=alice%2540example.com).
+	// Strip any existing fragment from dest, then append our encoded form.
+	dest.Fragment = ""
+	dest.RawFragment = ""
+	encoded := url.Values{
 		"auth_token": {tok},
 		"exp":        {strconv.FormatInt(claims.ExpiresAt.Unix(), 10)},
 		"user":       {email},
 	}.Encode()
 
 	w.Header().Set("Cache-Control", "no-store")
-	http.Redirect(w, r, dest.String(), http.StatusFound)
+	http.Redirect(w, r, dest.String()+"#"+encoded, http.StatusFound)
 }
 
 // parseReturnTo parses raw as an absolute http(s) URL and returns the
