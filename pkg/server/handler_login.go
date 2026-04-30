@@ -50,6 +50,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	dest.Fragment = url.Values{
 		"auth_token": {tok},
 		"exp":        {strconv.FormatInt(claims.ExpiresAt.Unix(), 10)},
+		"user":       {email},
 	}.Encode()
 
 	w.Header().Set("Cache-Control", "no-store")

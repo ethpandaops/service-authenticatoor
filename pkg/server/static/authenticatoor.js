@@ -116,6 +116,28 @@
     };
   }
 
+  // ─── token introspection (fallback when user isn't supplied) ────────────
+
+  function base64UrlDecode(s) {
+    s = s.replace(/-/g, '+').replace(/_/g, '/');
+    while (s.length % 4) s += '=';
+    try { return atob(s); } catch (e) { return ''; }
+  }
+
+  function extractUserFromToken(token) {
+    if (!token) return '';
+    var parts = token.split('.');
+    if (parts.length !== 3) return '';
+    var json = base64UrlDecode(parts[1]);
+    if (!json) return '';
+    try {
+      var c = JSON.parse(json);
+      return c.email || c.sub || '';
+    } catch (e) {
+      return '';
+    }
+  }
+
   // ─── fragment capture (after /auth/login redirect) ──────────────────────
 
   function captureFromFragment() {
@@ -130,7 +152,9 @@
     var exp = parseInt(params.get('exp') || '0', 10);
     if (!token || !exp) return null;
 
-    var user = params.get('user') || '';
+    // Prefer the explicit user query param; fall back to the email/sub
+    // claim inside the JWT itself.
+    var user = params.get('user') || extractUserFromToken(token);
     writeStored(token, exp, user);
 
     // Strip the auth params from the URL so the user can't accidentally
@@ -175,8 +199,9 @@
         if (!d || d.type !== 'authenticatoor.token' || !d.token) return;
         done = true;
         cleanup();
-        writeStored(d.token, d.exp, d.user || '');
-        resolve({ token: d.token, exp: d.exp, user: d.user || '' });
+        var user = d.user || extractUserFromToken(d.token);
+        writeStored(d.token, d.exp, user);
+        resolve({ token: d.token, exp: d.exp, user: user });
       }
 
       window.addEventListener('message', onMessage);

@@ -218,6 +218,9 @@ func TestHandleLogin_Success(t *testing.T) {
 	if !strings.Contains(loc, "exp=") {
 		t.Errorf("location missing exp: %q", loc)
 	}
+	if !strings.Contains(loc, "user=alice%40example.com") {
+		t.Errorf("location missing user (URL-encoded): %q", loc)
+	}
 }
 
 func TestHandleLogin_DisallowedReturnTo(t *testing.T) {
