@@ -26,6 +26,21 @@ import (
 	"github.com/ethpandaops/service-authenticatoor/pkg/server"
 )
 
+// version and gitSHA are populated at build time via
+// -ldflags "-X main.version=... -X main.gitSHA=...".
+var (
+	version = "dev"
+	gitSHA  = "unknown"
+)
+
+// fullVersion is what cobra prints for --version.
+func fullVersion() string {
+	if gitSHA == "" || gitSHA == "unknown" {
+		return version
+	}
+	return version + " (" + gitSHA + ")"
+}
+
 func main() {
 	if err := newRootCmd().Execute(); err != nil {
 		fmt.Fprintln(os.Stderr, "fatal:", err)
@@ -37,8 +52,9 @@ func newRootCmd() *cobra.Command {
 	var cfgPath string
 
 	cmd := &cobra.Command{
-		Use:   "authenticatoor",
-		Short: "Issues short-lived RS256 JWTs for users authenticated by an upstream SSO proxy",
+		Use:     "authenticatoor",
+		Short:   "Issues short-lived RS256 JWTs for users authenticated by an upstream SSO proxy",
+		Version: fullVersion(),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return run(cmd.Context(), cfgPath)
 		},

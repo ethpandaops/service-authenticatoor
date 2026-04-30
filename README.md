@@ -51,7 +51,7 @@ go build -o authenticatoor ./cmd/authenticatoor
 Or via Docker:
 
 ```sh
-docker build -f deploy/Dockerfile -t authenticatoor:dev .
+docker build -t authenticatoor:dev .
 ```
 
 ## Run
@@ -63,7 +63,7 @@ authenticatoor genkey > /etc/authenticatoor/keys/private.pem
 chmod 600 /etc/authenticatoor/keys/private.pem
 ```
 
-Write a config (see [`deploy/config.example.yaml`](deploy/config.example.yaml)
+Write a config (see [`config.example.yaml`](config.example.yaml)
 and [`docs/config.md`](docs/config.md)):
 
 ```yaml
@@ -141,7 +141,9 @@ pkg/cors/             CORS middleware with strict allow-list
 pkg/cfaccess/         Cf-Access-Jwt-Assertion verification
 pkg/config/           YAML + env config loader, derivation, validation
 pkg/server/           HTTP server: routes, handlers, lifecycle
-deploy/               Dockerfile, example config
+Dockerfile            multi-stage source build
+Dockerfile-stub       packages a pre-built binary into a distroless image (used by CI)
+config.example.yaml   annotated example config
 docs/                 config reference
 ```
 

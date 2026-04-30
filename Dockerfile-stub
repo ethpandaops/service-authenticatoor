@@ -1,0 +1,18 @@
+# Dockerfile used by CI to package a pre-built binary into an image. The
+# binary in ./bin/authenticatoor is built on the GitHub Actions runner via
+# `make build` and then COPYed into this image.
+#
+# For source-builds (no pre-built artifact) use the main Dockerfile, which
+# builds the binary inside the image via a multi-stage build.
+
+FROM gcr.io/distroless/static-debian12:nonroot
+
+LABEL org.opencontainers.image.source="https://github.com/ethpandaops/service-authenticatoor"
+LABEL org.opencontainers.image.description="Issues short-lived RS256 JWTs for users authenticated by an upstream SSO proxy"
+
+COPY ./bin/authenticatoor /usr/local/bin/authenticatoor
+
+USER nonroot:nonroot
+EXPOSE 8080
+ENTRYPOINT ["/usr/local/bin/authenticatoor"]
+CMD ["--config", "/etc/authenticatoor/config.yaml"]

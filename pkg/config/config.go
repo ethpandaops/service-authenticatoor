@@ -5,7 +5,7 @@
 // optionally overridden by environment variables prefixed with
 // AUTHENTICATOOR_*. Values omitted from the file are derived from the
 // canonical issuer URL where reasonable, so a minimal config is just six
-// lines (see deploy/config.example.yaml).
+// lines (see config.example.yaml).
 package config
 
 import (
