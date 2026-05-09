@@ -27,7 +27,7 @@ func Middleware(v Verifier) func(http.Handler) http.Handler {
 				next.ServeHTTP(w, r)
 				return
 			}
-			claims, err := v.Verify(tok)
+			claims, err := v.Verify(tok, WithRequestHost(stripPort(r.Host)))
 			if err != nil {
 				// Bad token: forward without claims; downstream handler
 				// decides whether to 401.
@@ -81,4 +81,22 @@ func extractBearer(r *http.Request) string {
 		return q
 	}
 	return ""
+}
+
+// stripPort removes a trailing ":port" from a Host header value so it
+// can be matched against scope patterns. Handles bracketed IPv6 hosts.
+func stripPort(host string) string {
+	if host == "" {
+		return host
+	}
+	if host[0] == '[' {
+		if i := strings.IndexByte(host, ']'); i >= 0 {
+			return host[1:i]
+		}
+		return host
+	}
+	if i := strings.LastIndexByte(host, ':'); i >= 0 {
+		return host[:i]
+	}
+	return host
 }

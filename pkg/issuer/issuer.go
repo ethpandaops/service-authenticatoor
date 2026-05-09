@@ -52,6 +52,11 @@ type Config struct {
 	DefaultAudience []string
 	// Scope is the "scope" claim — a host wildcard pattern.
 	Scope string
+	// Services is the default "services" claim — a comma-separated
+	// allow/deny directive list (see auth.ServiceAllowed). Empty means
+	// no constraint is encoded into the token, and downstream verifiers
+	// will accept it for any service.
+	Services string
 	// TTL is how long issued tokens are valid for.
 	TTL time.Duration
 	// Now is overridable for tests; defaults to time.Now.
@@ -126,8 +131,9 @@ func (i *RS256Issuer) Issue(subject string, audience []string) (string, *auth.Cl
 			ExpiresAt: jwt.NewNumericDate(now.Add(i.cfg.TTL)),
 			ID:        jti,
 		},
-		Email: subject,
-		Scope: i.cfg.Scope,
+		Email:    subject,
+		Scope:    i.cfg.Scope,
+		Services: i.cfg.Services,
 	}
 
 	tok := jwt.NewWithClaims(jwt.SigningMethodRS256, claims)

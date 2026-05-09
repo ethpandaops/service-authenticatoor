@@ -11,7 +11,7 @@ type fakeVerifier struct {
 	tokens map[string]*Claims
 }
 
-func (f *fakeVerifier) Verify(s string) (*Claims, error) {
+func (f *fakeVerifier) Verify(s string, _ ...VerifyOption) (*Claims, error) {
 	if c, ok := f.tokens[s]; ok {
 		return c, nil
 	}

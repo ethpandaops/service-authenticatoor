@@ -11,14 +11,19 @@ import (
 )
 
 // Claims is the JWT payload format. It embeds the standard registered
-// claims and adds two custom fields:
+// claims and adds three custom fields:
 //
 //   - Email mirrors Subject for convenience.
 //   - Scope is a host wildcard pattern naming the set of hosts this token
 //     is valid for.
+//   - Services is a comma-separated allow/deny directive list naming the
+//     set of logical applications this token may be used against
+//     (e.g. "+all,-spamoor", "-all,+buildoor"). Empty ⇒ no constraint.
+//     Evaluated by ServiceAllowed.
 type Claims struct {
 	jwt.RegisteredClaims
 
-	Email string `json:"email,omitempty"`
-	Scope string `json:"scope,omitempty"`
+	Email    string `json:"email,omitempty"`
+	Scope    string `json:"scope,omitempty"`
+	Services string `json:"services,omitempty"`
 }
