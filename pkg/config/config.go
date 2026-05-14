@@ -20,6 +20,15 @@ import (
 	"github.com/spf13/viper"
 )
 
+// AuthMode names the active protection provider. Exactly one provider
+// gates /auth/* per process.
+const (
+	AuthModeCloudflare = "cloudflare"
+	AuthModeBasic      = "basic"
+	AuthModeAny        = "any"
+	AuthModeGitHub     = "github"
+)
+
 // Config is the resolved, validated, derivation-applied configuration of the
 // authenticatoor service.
 type Config struct {
@@ -27,26 +36,98 @@ type Config struct {
 	Issuer      string `yaml:"issuer" mapstructure:"issuer"`
 	ExternalURL string `yaml:"externalURL" mapstructure:"externalURL"`
 
+	// AuthMode names the active protection provider. Defaults to
+	// "cloudflare" so existing configs keep working unchanged.
+	AuthMode string `yaml:"authMode" mapstructure:"authMode"`
+
 	Audience     []string      `yaml:"audience" mapstructure:"audience"`
 	ScopePattern string        `yaml:"scopePattern" mapstructure:"scopePattern"`
 	TokenTTL     time.Duration `yaml:"tokenTTL" mapstructure:"tokenTTL"`
 
+	// UserHeader is a deprecated alias for cloudflareAccess.userHeader.
+	// When the latter is unset, this value is folded in by applyDerived.
 	UserHeader         string   `yaml:"userHeader" mapstructure:"userHeader"`
 	AllowedReturnHosts []string `yaml:"allowedReturnHosts" mapstructure:"allowedReturnHosts"`
 
 	CloudflareAccess CloudflareAccessConfig `yaml:"cloudflareAccess" mapstructure:"cloudflareAccess"`
+	BasicAuth        BasicAuthConfig        `yaml:"basicAuth" mapstructure:"basicAuth"`
+	AnyAuth          AnyAuthConfig          `yaml:"anyAuth" mapstructure:"anyAuth"`
+	GitHubOAuth      GitHubOAuthConfig      `yaml:"githubOAuth" mapstructure:"githubOAuth"`
 	CORS             CORSConfig             `yaml:"cors" mapstructure:"cors"`
 	Signing          SigningConfig          `yaml:"signing" mapstructure:"signing"`
 	Logging          LoggingConfig          `yaml:"logging" mapstructure:"logging"`
 	Metrics          MetricsConfig          `yaml:"metrics" mapstructure:"metrics"`
+
+	// DeprecationWarnings collects messages about deprecated config
+	// fields encountered during Load. The entrypoint logs each at
+	// startup; tests can inspect this slice directly.
+	DeprecationWarnings []string `yaml:"-" mapstructure:"-"`
 }
 
-// CloudflareAccessConfig configures CF Access JWT verification.
+// CloudflareAccessConfig configures the cloudflare protection provider.
 type CloudflareAccessConfig struct {
 	VerifyJWT  bool   `yaml:"verifyJWT" mapstructure:"verifyJWT"`
 	TeamDomain string `yaml:"teamDomain" mapstructure:"teamDomain"`
 	AudTag     string `yaml:"audTag" mapstructure:"audTag"`
 	JwtHeader  string `yaml:"jwtHeader" mapstructure:"jwtHeader"`
+	// UserHeader is the request header carrying the authenticated email.
+	// Defaults to "Cf-Access-Authenticated-User-Email". This is the
+	// canonical location; the top-level userHeader field is kept as a
+	// deprecated alias.
+	UserHeader string `yaml:"userHeader" mapstructure:"userHeader"`
+}
+
+// BasicAuthConfig configures the basic protection provider.
+type BasicAuthConfig struct {
+	// HtpasswdFile is the path to the htpasswd password file. Required
+	// when authMode is "basic".
+	HtpasswdFile string `yaml:"htpasswdFile" mapstructure:"htpasswdFile"`
+	// Realm is the value sent in WWW-Authenticate. Defaults to
+	// "authenticatoor".
+	Realm string `yaml:"realm" mapstructure:"realm"`
+}
+
+// AnyAuthConfig configures the anyauth (dev-only) protection provider.
+// All fields are optional; the provider falls back to sensible defaults.
+type AnyAuthConfig struct {
+	// CookieName overrides the username cookie name. Defaults to
+	// "authenticatoor_anyauth_user".
+	CookieName string `yaml:"cookieName" mapstructure:"cookieName"`
+	// LoginPath overrides the login form path. Defaults to
+	// "/auth/anyauth/login".
+	LoginPath string `yaml:"loginPath" mapstructure:"loginPath"`
+	// CookieTTL overrides the cookie lifetime. Defaults to "12h".
+	CookieTTL time.Duration `yaml:"cookieTTL" mapstructure:"cookieTTL"`
+}
+
+// GitHubOAuthConfig configures the github protection provider.
+type GitHubOAuthConfig struct {
+	// ClientID is the OAuth app client_id. Required.
+	ClientID string `yaml:"clientId" mapstructure:"clientId"`
+	// ClientSecret takes precedence over ClientSecretFile when set
+	// (typically via env-var injection). Either must be supplied.
+	ClientSecret     string `yaml:"clientSecret" mapstructure:"clientSecret"`
+	ClientSecretFile string `yaml:"clientSecretFile" mapstructure:"clientSecretFile"`
+
+	// SessionSecret signs the session cookie. SessionSecret takes
+	// precedence over SessionSecretFile. Must be at least 16 bytes.
+	SessionSecret     string `yaml:"sessionSecret" mapstructure:"sessionSecret"`
+	SessionSecretFile string `yaml:"sessionSecretFile" mapstructure:"sessionSecretFile"`
+
+	// CallbackPath is the path of the OAuth redirect URI registered
+	// publicly. Default "/auth/oauth/callback".
+	CallbackPath string `yaml:"callbackPath" mapstructure:"callbackPath"`
+	// SessionCookieName is the name of the session cookie. Default
+	// "authenticatoor_session".
+	SessionCookieName string `yaml:"sessionCookieName" mapstructure:"sessionCookieName"`
+	// StateCookieName is the name of the OAuth state cookie. Default
+	// "authenticatoor_oauth_state".
+	StateCookieName string `yaml:"stateCookieName" mapstructure:"stateCookieName"`
+	// SessionTTL is the cookie lifetime. Default "12h".
+	SessionTTL time.Duration `yaml:"sessionTTL" mapstructure:"sessionTTL"`
+	// AllowedOrgs lists the GitHub orgs whose members may authenticate.
+	// At least one is required. Comparison is case-insensitive.
+	AllowedOrgs []string `yaml:"allowedOrgs" mapstructure:"allowedOrgs"`
 }
 
 // CORSConfig configures the CORS middleware.
@@ -125,6 +206,11 @@ func Load(path string) (*Config, error) {
 func setDefaults(v *viper.Viper) {
 	v.SetDefault("listen", ":8080")
 	v.SetDefault("tokenTTL", "30m")
+	v.SetDefault("authMode", AuthModeCloudflare)
+
+	// Deprecated top-level alias. Kept defaulted so existing configs
+	// continue to populate cloudflareAccess.userHeader via applyDerived
+	// without explicit migration.
 	v.SetDefault("userHeader", "Cf-Access-Authenticated-User-Email")
 
 	v.SetDefault("cloudflareAccess.verifyJWT", true)
@@ -144,6 +230,10 @@ func setDefaults(v *viper.Viper) {
 // of the issuer host: e.g. "https://auth.example.com" → "example.com",
 // which becomes the default audience and the suffix of the default scope
 // pattern and allow-lists.
+//
+// applyDerived also folds the deprecated top-level userHeader into
+// cloudflareAccess.userHeader and records a deprecation warning when both
+// are set to non-default values.
 func (c *Config) applyDerived() error {
 	if c.Issuer == "" {
 		return errors.New("issuer is required")
@@ -168,6 +258,20 @@ func (c *Config) applyDerived() error {
 	if len(c.CORS.AllowedOrigins) == 0 {
 		c.CORS.AllowedOrigins = c.AllowedReturnHosts
 	}
+
+	if c.AuthMode == "" {
+		c.AuthMode = AuthModeCloudflare
+	}
+
+	const defaultCFUserHeader = "Cf-Access-Authenticated-User-Email"
+	switch {
+	case c.CloudflareAccess.UserHeader == "":
+		c.CloudflareAccess.UserHeader = c.UserHeader
+	case c.UserHeader != "" && c.UserHeader != defaultCFUserHeader && c.UserHeader != c.CloudflareAccess.UserHeader:
+		c.DeprecationWarnings = append(c.DeprecationWarnings,
+			"top-level userHeader is set alongside cloudflareAccess.userHeader; the top-level value is ignored. The top-level userHeader field is deprecated — move it under cloudflareAccess.")
+	}
+	c.UserHeader = c.CloudflareAccess.UserHeader
 	return nil
 }
 
@@ -203,9 +307,6 @@ func (c *Config) Validate() error {
 	if c.TokenTTL <= 0 {
 		return errors.New("tokenTTL must be positive")
 	}
-	if c.UserHeader == "" {
-		return errors.New("userHeader is required")
-	}
 	if len(c.Audience) == 0 {
 		return errors.New("audience is required")
 	}
@@ -219,10 +320,35 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("signing.mode: unsupported value %q (only rs256 is supported)", c.Signing.Mode)
 	}
 
-	if c.CloudflareAccess.VerifyJWT {
-		if c.CloudflareAccess.TeamDomain == "" {
+	switch c.AuthMode {
+	case AuthModeCloudflare:
+		if c.CloudflareAccess.UserHeader == "" {
+			return errors.New("cloudflareAccess.userHeader is required")
+		}
+		if c.CloudflareAccess.VerifyJWT && c.CloudflareAccess.TeamDomain == "" {
 			return errors.New("cloudflareAccess.teamDomain is required when verifyJWT is true")
 		}
+	case AuthModeBasic:
+		if c.BasicAuth.HtpasswdFile == "" {
+			return errors.New("basicAuth.htpasswdFile is required when authMode is basic")
+		}
+	case AuthModeAny:
+		// no required fields
+	case AuthModeGitHub:
+		if c.GitHubOAuth.ClientID == "" {
+			return errors.New("githubOAuth.clientId is required when authMode is github")
+		}
+		if c.GitHubOAuth.ClientSecret == "" && c.GitHubOAuth.ClientSecretFile == "" {
+			return errors.New("githubOAuth.clientSecret or githubOAuth.clientSecretFile is required")
+		}
+		if c.GitHubOAuth.SessionSecret == "" && c.GitHubOAuth.SessionSecretFile == "" {
+			return errors.New("githubOAuth.sessionSecret or githubOAuth.sessionSecretFile is required")
+		}
+		if len(c.GitHubOAuth.AllowedOrgs) == 0 {
+			return errors.New("githubOAuth.allowedOrgs must list at least one org")
+		}
+	default:
+		return fmt.Errorf("authMode: unsupported value %q", c.AuthMode)
 	}
 
 	if slices.Contains(c.AllowedReturnHosts, "") {
@@ -242,6 +368,7 @@ func (c *Config) String() string {
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "listen=%s ", c.Listen)
 	fmt.Fprintf(&sb, "issuer=%s ", c.Issuer)
+	fmt.Fprintf(&sb, "authMode=%s ", c.AuthMode)
 	fmt.Fprintf(&sb, "audience=%v ", c.Audience)
 	fmt.Fprintf(&sb, "scope=%s ", c.ScopePattern)
 	fmt.Fprintf(&sb, "tokenTTL=%s ", c.TokenTTL)

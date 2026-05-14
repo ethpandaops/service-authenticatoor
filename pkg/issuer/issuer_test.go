@@ -36,7 +36,7 @@ func newTestIssuer(t *testing.T, ttl time.Duration) (*RS256Issuer, *rsa.PrivateK
 func TestIssuer_IssueAndParse(t *testing.T) {
 	iss, key := newTestIssuer(t, 30*time.Minute)
 
-	tok, claims, err := iss.Issue("alice@example.com", nil)
+	tok, claims, err := iss.Issue("alice@example.com", "alice@example.com", nil)
 	if err != nil {
 		t.Fatalf("issue: %v", err)
 	}
@@ -77,7 +77,7 @@ func TestIssuer_IssueAndParse(t *testing.T) {
 
 func TestIssuer_AudienceOverride(t *testing.T) {
 	iss, _ := newTestIssuer(t, 30*time.Minute)
-	_, claims, err := iss.Issue("alice@example.com", []string{"app.test.example"})
+	_, claims, err := iss.Issue("alice@example.com", "alice@example.com", []string{"app.test.example"})
 	if err != nil {
 		t.Fatalf("issue: %v", err)
 	}
@@ -92,7 +92,7 @@ func TestIssuer_AudienceOverride(t *testing.T) {
 func TestIssuer_KidInHeader(t *testing.T) {
 	iss, _ := newTestIssuer(t, 30*time.Minute)
 
-	tok, _, err := iss.Issue("alice@example.com", nil)
+	tok, _, err := iss.Issue("alice@example.com", "alice@example.com", nil)
 	if err != nil {
 		t.Fatalf("issue: %v", err)
 	}
@@ -173,7 +173,7 @@ func TestIssuer_RejectsZeroTTL(t *testing.T) {
 
 func TestIssuer_RejectsEmptySubject(t *testing.T) {
 	iss, _ := newTestIssuer(t, time.Hour)
-	_, _, err := iss.Issue("", nil)
+	_, _, err := iss.Issue("", "", nil)
 	if err == nil {
 		t.Error("expected error for empty subject")
 	}

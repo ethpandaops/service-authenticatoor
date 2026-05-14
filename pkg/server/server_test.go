@@ -11,33 +11,66 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gorilla/mux"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/sirupsen/logrus"
 
-	"github.com/ethpandaops/service-authenticatoor/pkg/cfaccess"
 	"github.com/ethpandaops/service-authenticatoor/pkg/config"
 	"github.com/ethpandaops/service-authenticatoor/pkg/issuer"
+	"github.com/ethpandaops/service-authenticatoor/pkg/protection"
 )
 
-// newTestServer builds a Server with reasonable defaults for testing,
-// including a fresh issuer key and CF JWT verification disabled.
-func newTestServer(t *testing.T) (*Server, *issuer.RS256Issuer) {
+// fakeProvider is a minimal protection.Provider used by server tests. It
+// reads an email out of a configurable header — same trust model as the
+// CF Access provider with VerifyJWT disabled, but without the CF imports.
+// VerifyHeader, when non-empty, must also be present (any non-empty
+// value) for authentication to succeed; this lets tests exercise the
+// "missing assertion" path that the real CF provider enforces via JWKS.
+type fakeProvider struct {
+	emailHeader  string
+	verifyHeader string
+}
+
+func (p *fakeProvider) Name() string                  { return "fake" }
+func (p *fakeProvider) Start(_ context.Context) error { return nil }
+func (p *fakeProvider) Stop() error                   { return nil }
+func (p *fakeProvider) RegisterRoutes(_ *mux.Router)  {}
+func (p *fakeProvider) Logout(w http.ResponseWriter, _ *http.Request) {
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(`{"loggedOut":true}`))
+}
+
+func (p *fakeProvider) Authenticate(_ context.Context, r *http.Request) (protection.Outcome, error) {
+	if p.verifyHeader != "" && r.Header.Get(p.verifyHeader) == "" {
+		return protection.Outcome{Status: http.StatusUnauthorized}, nil
+	}
+	email := r.Header.Get(p.emailHeader)
+	if email == "" {
+		return protection.Outcome{Status: http.StatusUnauthorized}, nil
+	}
+	return protection.Outcome{Identity: &protection.Identity{
+		Subject: email,
+		Email:   email,
+	}}, nil
+}
+
+// newTestServer builds a Server with a fake provider that reads identity
+// from X-Test-Email — the same trust model the previous CF-with-verify-off
+// setup had, without any CF-specific machinery in tests.
+func newTestServer(t *testing.T) (*Server, *issuer.RS256Issuer, *fakeProvider) {
 	t.Helper()
 
 	cfg := &config.Config{
 		Listen:             ":0",
 		Issuer:             "https://auth.test.example",
 		ExternalURL:        "https://auth.test.example",
+		AuthMode:           config.AuthModeCloudflare,
 		Audience:           []string{"test.example"},
 		ScopePattern:       "*.test.example",
 		TokenTTL:           30 * time.Minute,
-		UserHeader:         "X-Test-Email",
 		AllowedReturnHosts: []string{"*.test.example"},
 		CORS: config.CORSConfig{
 			AllowedOrigins: []string{"*.test.example"},
-		},
-		CloudflareAccess: config.CloudflareAccessConfig{
-			VerifyJWT: false,
 		},
 		Signing: config.SigningConfig{Mode: "rs256"},
 	}
@@ -60,21 +93,22 @@ func newTestServer(t *testing.T) (*Server, *issuer.RS256Issuer) {
 	log := logrus.New()
 	log.SetOutput(io.Discard)
 
+	prov := &fakeProvider{emailHeader: "X-Test-Email"}
 	s, err := New(Options{
-		Config:     cfg,
-		Issuer:     iss,
-		CFVerifier: cfaccess.NoopVerifier{},
-		Log:        log,
-		Registry:   prometheus.NewRegistry(),
+		Config:   cfg,
+		Issuer:   iss,
+		Provider: prov,
+		Log:      log,
+		Registry: prometheus.NewRegistry(),
 	})
 	if err != nil {
 		t.Fatalf("new server: %v", err)
 	}
-	return s, iss
+	return s, iss, prov
 }
 
 func TestHandleHealth(t *testing.T) {
-	s, _ := newTestServer(t)
+	s, _, _ := newTestServer(t)
 
 	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
 	rr := httptest.NewRecorder()
@@ -89,7 +123,7 @@ func TestHandleHealth(t *testing.T) {
 }
 
 func TestHandleJWKS(t *testing.T) {
-	s, _ := newTestServer(t)
+	s, _, _ := newTestServer(t)
 
 	req := httptest.NewRequest(http.MethodGet, "/jwks.json", nil)
 	rr := httptest.NewRecorder()
@@ -108,7 +142,7 @@ func TestHandleJWKS(t *testing.T) {
 }
 
 func TestHandleOIDCConfig(t *testing.T) {
-	s, _ := newTestServer(t)
+	s, _, _ := newTestServer(t)
 
 	req := httptest.NewRequest(http.MethodGet, "/.well-known/openid-configuration", nil)
 	rr := httptest.NewRecorder()
@@ -137,7 +171,7 @@ func TestHandleOIDCConfig(t *testing.T) {
 }
 
 func TestHandleToken_Success(t *testing.T) {
-	s, _ := newTestServer(t)
+	s, _, _ := newTestServer(t)
 
 	req := httptest.NewRequest(http.MethodGet, "/auth/token", nil)
 	req.Header.Set("X-Test-Email", "alice@example.com")
@@ -163,7 +197,7 @@ func TestHandleToken_Success(t *testing.T) {
 }
 
 func TestHandleToken_NoEmail(t *testing.T) {
-	s, _ := newTestServer(t)
+	s, _, _ := newTestServer(t)
 
 	req := httptest.NewRequest(http.MethodGet, "/auth/token", nil)
 	rr := httptest.NewRecorder()
@@ -175,7 +209,7 @@ func TestHandleToken_NoEmail(t *testing.T) {
 }
 
 func TestHandleToken_AudienceFiltering(t *testing.T) {
-	s, _ := newTestServer(t)
+	s, _, _ := newTestServer(t)
 
 	// Allowed audience
 	req := httptest.NewRequest(http.MethodGet, "/auth/token?aud=test.example", nil)
@@ -197,7 +231,7 @@ func TestHandleToken_AudienceFiltering(t *testing.T) {
 }
 
 func TestHandleLogin_Success(t *testing.T) {
-	s, _ := newTestServer(t)
+	s, _, _ := newTestServer(t)
 
 	q := url.Values{"return_to": {"https://app.test.example/foo"}}
 	req := httptest.NewRequest(http.MethodGet, "/auth/login?"+q.Encode(), nil)
@@ -224,7 +258,7 @@ func TestHandleLogin_Success(t *testing.T) {
 }
 
 func TestHandleLogin_DisallowedReturnTo(t *testing.T) {
-	s, _ := newTestServer(t)
+	s, _, _ := newTestServer(t)
 
 	cases := []string{
 		"https://evil.com/",
@@ -256,7 +290,7 @@ func TestHandleLogin_DisallowedReturnTo(t *testing.T) {
 }
 
 func TestHandleLogin_MissingReturnTo(t *testing.T) {
-	s, _ := newTestServer(t)
+	s, _, _ := newTestServer(t)
 
 	req := httptest.NewRequest(http.MethodGet, "/auth/login", nil)
 	req.Header.Set("X-Test-Email", "alice@example.com")
@@ -269,7 +303,7 @@ func TestHandleLogin_MissingReturnTo(t *testing.T) {
 }
 
 func TestHandleUserinfo_Success(t *testing.T) {
-	s, _ := newTestServer(t)
+	s, _, _ := newTestServer(t)
 
 	req := httptest.NewRequest(http.MethodGet, "/auth/userinfo", nil)
 	req.Header.Set("X-Test-Email", "alice@example.com")
@@ -294,24 +328,37 @@ func TestHandleUserinfo_Success(t *testing.T) {
 	}
 }
 
-func TestCFAccessMiddleware_RejectsMissingJWT(t *testing.T) {
-	s, _ := newTestServer(t)
-	s.cfg.CloudflareAccess.VerifyJWT = true
-	s.cfg.CloudflareAccess.JwtHeader = "Cf-Access-Jwt-Assertion"
+// TestAuthMiddleware_ProviderRequiresExtraHeader exercises the path where
+// a provider returns 401 even though identity is present in some other
+// header — analogous to the real CF Access provider rejecting a request
+// because the assertion JWT is missing.
+func TestAuthMiddleware_ProviderRequiresExtraHeader(t *testing.T) {
+	s, _, prov := newTestServer(t)
+	prov.verifyHeader = "X-Test-Assertion"
 
 	req := httptest.NewRequest(http.MethodGet, "/auth/token", nil)
 	req.Header.Set("X-Test-Email", "alice@example.com") // header present
-	// CF JWT header NOT present
+	// X-Test-Assertion NOT present — provider rejects.
 	rr := httptest.NewRecorder()
 	s.routes().ServeHTTP(rr, req)
 
 	if rr.Code != http.StatusUnauthorized {
-		t.Errorf("status: got %d, want 401 (CF JWT missing)", rr.Code)
+		t.Errorf("status: got %d, want 401 (provider rejected)", rr.Code)
+	}
+
+	// With the assertion header set, the same request succeeds.
+	req = httptest.NewRequest(http.MethodGet, "/auth/token", nil)
+	req.Header.Set("X-Test-Email", "alice@example.com")
+	req.Header.Set("X-Test-Assertion", "anything-non-empty")
+	rr = httptest.NewRecorder()
+	s.routes().ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Errorf("status: got %d, want 200 with assertion present", rr.Code)
 	}
 }
 
 func TestCORS_PreflightAllowed(t *testing.T) {
-	s, _ := newTestServer(t)
+	s, _, _ := newTestServer(t)
 
 	req := httptest.NewRequest(http.MethodOptions, "/auth/token", nil)
 	req.Header.Set("Origin", "https://app.test.example")
@@ -331,7 +378,7 @@ func TestCORS_PreflightAllowed(t *testing.T) {
 }
 
 func TestCORS_PreflightDisallowedOrigin(t *testing.T) {
-	s, _ := newTestServer(t)
+	s, _, _ := newTestServer(t)
 
 	req := httptest.NewRequest(http.MethodOptions, "/auth/token", nil)
 	req.Header.Set("Origin", "https://evil.com")
@@ -350,9 +397,44 @@ func TestCORS_PreflightDisallowedOrigin(t *testing.T) {
 	}
 }
 
+func TestHandleLogout_RunsWithoutIdentity(t *testing.T) {
+	s, _, _ := newTestServer(t)
+
+	// Logout endpoint must work even without authentication — fakeProvider
+	// has a no-op Logout that writes 200, so we expect 200 with no email
+	// header set.
+	req := httptest.NewRequest(http.MethodPost, "/auth/logout", nil)
+	rr := httptest.NewRecorder()
+	s.routes().ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Errorf("status: got %d, want 200", rr.Code)
+	}
+	if !strings.Contains(rr.Body.String(), `"loggedOut":true`) {
+		t.Errorf("body: %q", rr.Body.String())
+	}
+}
+
+func TestHandleLogout_CORSPreflightAllowed(t *testing.T) {
+	s, _, _ := newTestServer(t)
+
+	req := httptest.NewRequest(http.MethodOptions, "/auth/logout", nil)
+	req.Header.Set("Origin", "https://app.test.example")
+	req.Header.Set("Access-Control-Request-Method", "POST")
+	rr := httptest.NewRecorder()
+	s.routes().ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusNoContent {
+		t.Errorf("status: got %d, want 204", rr.Code)
+	}
+	if got := rr.Header().Get("Access-Control-Allow-Origin"); got != "https://app.test.example" {
+		t.Errorf("ACAO: %q", got)
+	}
+}
+
 // TestServer_Lifecycle verifies the Start/Stop lifecycle.
 func TestServer_Lifecycle(t *testing.T) {
-	s, _ := newTestServer(t)
+	s, _, _ := newTestServer(t)
 	s.cfg.Listen = "127.0.0.1:0" // ephemeral port
 	// Rebuild s.main with the new addr.
 	s.main.Addr = s.cfg.Listen

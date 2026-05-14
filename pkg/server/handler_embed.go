@@ -20,8 +20,8 @@ import (
 // with a login page whose own X-Frame-Options blocks rendering, postMessage
 // never fires, and the parent's timeout falls through to the redirect.
 func (s *Server) handleEmbed(w http.ResponseWriter, r *http.Request) {
-	email := emailFromContext(r.Context())
-	if email == "" {
+	id := identityFromContext(r.Context())
+	if id == nil || id.Subject == "" {
 		http.Error(w, "no authenticated user", http.StatusUnauthorized)
 		return
 	}
@@ -39,7 +39,7 @@ func (s *Server) handleEmbed(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	tok, claims, err := s.issuer.Issue(email, nil)
+	tok, claims, err := s.issuer.Issue(id.Subject, id.Email, nil)
 	if err != nil {
 		s.tokenIssueErrors.WithLabelValues("issue").Inc()
 		s.log.WithError(err).Error("issue token")
@@ -47,16 +47,20 @@ func (s *Server) handleEmbed(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.tokensIssued.Inc()
-	s.log.WithField("email", email).WithField("jti", claims.ID).Info("embed token")
+	s.log.WithField("sub", id.Subject).WithField("jti", claims.ID).Info("embed token")
 
 	// Canonical origin (scheme + host[:port], no path/query/fragment).
 	canonicalOrigin := parsed.Scheme + "://" + parsed.Host
 
+	user := id.Email
+	if user == "" {
+		user = id.Subject
+	}
 	payload := map[string]any{
 		"type":  "authenticatoor.token",
 		"token": tok,
 		"exp":   claims.ExpiresAt.Unix(),
-		"user":  email,
+		"user":  user,
 	}
 	payloadBytes, _ := json.Marshal(payload)
 	payloadHTML := htmlSafeJSON(payloadBytes)

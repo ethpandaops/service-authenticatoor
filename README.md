@@ -7,7 +7,7 @@ no shared secrets, no per-service SSO configuration.
 
 ## What it does
 
-Behind the upstream proxy (`/auth/*`):
+Behind the active protection provider (`/auth/*`):
 
 - `GET /auth/token` — issue a JWT for the authenticated user (JSON
   response, CORS-enabled, accepts `credentials: include`).
@@ -19,6 +19,8 @@ Behind the upstream proxy (`/auth/*`):
   parent window via `postMessage`, restricted to the validated origin.
   This is the silent token-acquisition path (loaded via an invisible
   iframe).
+- `POST /auth/logout` — provider-dispatched logout. Always reachable,
+  regardless of authentication state.
 
 Public (no upstream auth — reachable by JWKS verifiers and browser JS):
 
@@ -127,15 +129,16 @@ Run:
 authenticatoor --config /etc/authenticatoor/config.yaml
 ```
 
-For local development without an upstream SSO:
+For local development without an upstream SSO, switch to the `any`
+provider — every HTTP Basic credential is accepted and the supplied
+username becomes the identity:
 
 ```yaml
-cloudflareAccess:
-  verifyJWT: false
+authMode: any
 ```
 
-The service will warn that CF JWT verification is disabled and trust the
-`Cf-Access-Authenticated-User-Email` header. Don't do this in production.
+See [`docs/config.md`](docs/config.md#protection-modes) for the full
+reference and the alternatives (`basic`, `github`).
 
 ## Dev quickstart
 
@@ -176,6 +179,19 @@ curl http://127.0.0.1:18080/.well-known/openid-configuration
 go test ./...
 ```
 
+## Protection modes
+
+`authMode` selects who is allowed to mint tokens. One provider per process:
+
+- **`cloudflare`** (default): trust headers from a Cloudflare Access (or
+  similar) reverse-proxy SSO; optionally verify the assertion JWT.
+- **`basic`**: HTTP Basic auth backed by an htpasswd file. Self-contained.
+- **`any`**: dev-only — any Basic credential is accepted, username = identity.
+- **`github`**: GitHub OAuth with org-membership gating; signed session cookie.
+
+See [`docs/config.md`](docs/config.md#protection-modes) for the per-mode
+config blocks and trade-offs.
+
 ## Repo layout
 
 ```
@@ -185,6 +201,7 @@ pkg/issuer/           issuer-side: RSA keys, RS256 signing, JWKS marshaling
 pkg/cors/             CORS middleware with strict allow-list
 pkg/cfaccess/         Cf-Access-Jwt-Assertion verification
 pkg/config/           YAML + env config loader, derivation, validation
+pkg/protection/       Provider interface; sub-packages cloudflare/basic/anyauth/github
 pkg/server/           HTTP server: routes, handlers, lifecycle
 Dockerfile            multi-stage source build
 Dockerfile-stub       packages a pre-built binary into a distroless image (used by CI)

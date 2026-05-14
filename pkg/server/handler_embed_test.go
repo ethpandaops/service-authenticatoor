@@ -9,7 +9,7 @@ import (
 )
 
 func TestHandleEmbed_Success(t *testing.T) {
-	s, _ := newTestServer(t)
+	s, _, _ := newTestServer(t)
 
 	q := url.Values{"target_origin": {"https://app.test.example/"}}
 	req := httptest.NewRequest(http.MethodGet, "/auth/embed?"+q.Encode(), nil)
@@ -43,7 +43,7 @@ func TestHandleEmbed_Success(t *testing.T) {
 }
 
 func TestHandleEmbed_RejectsDisallowedTarget(t *testing.T) {
-	s, _ := newTestServer(t)
+	s, _, _ := newTestServer(t)
 
 	cases := []string{
 		"https://evil.com/",
@@ -67,7 +67,7 @@ func TestHandleEmbed_RejectsDisallowedTarget(t *testing.T) {
 }
 
 func TestHandleEmbed_RejectsMissingEmail(t *testing.T) {
-	s, _ := newTestServer(t)
+	s, _, _ := newTestServer(t)
 
 	q := url.Values{"target_origin": {"https://app.test.example/"}}
 	req := httptest.NewRequest(http.MethodGet, "/auth/embed?"+q.Encode(), nil)
@@ -81,7 +81,7 @@ func TestHandleEmbed_RejectsMissingEmail(t *testing.T) {
 }
 
 func TestHandleEmbed_TargetOriginIsStrippedToOrigin(t *testing.T) {
-	s, _ := newTestServer(t)
+	s, _, _ := newTestServer(t)
 
 	// Path/query/fragment in target_origin must not appear in the postMessage
 	// target — postMessage uses scheme+host only.
@@ -104,7 +104,7 @@ func TestHandleEmbed_TargetOriginIsStrippedToOrigin(t *testing.T) {
 }
 
 func TestHandleEmbed_HTMLEscapesPayload(t *testing.T) {
-	s, _ := newTestServer(t)
+	s, _, _ := newTestServer(t)
 
 	q := url.Values{"target_origin": {"https://app.test.example"}}
 	req := httptest.NewRequest(http.MethodGet, "/auth/embed?"+q.Encode(), nil)

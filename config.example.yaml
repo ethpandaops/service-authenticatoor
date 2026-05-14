@@ -36,12 +36,6 @@ issuer: "https://auth.example.com"
 # Token lifetime. Default: "30m".
 tokenTTL: "30m"
 
-# ─── identity source ──────────────────────────────────────────────────────────
-
-# HTTP header carrying the authenticated user's email. CF Access forwards this
-# automatically. Default: "Cf-Access-Authenticated-User-Email".
-userHeader: "Cf-Access-Authenticated-User-Email"
-
 # ─── browser-callback / CORS allow-list ───────────────────────────────────────
 
 # Hosts that the /auth/login endpoint will redirect to via `return_to`.
@@ -56,7 +50,13 @@ userHeader: "Cf-Access-Authenticated-User-Email"
 #   allowedOrigins:
 #     - "*.example.com"
 
-# ─── Cloudflare Access JWT verification (defense in depth) ────────────────────
+# ─── auth mode ────────────────────────────────────────────────────────────────
+
+# Names the active protection provider. Default: "cloudflare".
+# Other modes (basic, any, github) are configured by their own blocks below.
+authMode: cloudflare
+
+# ─── Cloudflare Access (authMode: cloudflare) ─────────────────────────────────
 
 # When enabled (default), the service verifies the Cf-Access-Jwt-Assertion
 # header against Cloudflare's JWKS, in addition to trusting the user-email
@@ -71,6 +71,52 @@ cloudflareAccess:
   # to the team). Useful when you can't easily look up the AUD per deployment.
   audTag: ""
   jwtHeader: "Cf-Access-Jwt-Assertion"
+  # HTTP header carrying the authenticated user's email. CF Access forwards
+  # this automatically. Default: "Cf-Access-Authenticated-User-Email".
+  # The top-level userHeader field is a deprecated alias for this one.
+  userHeader: "Cf-Access-Authenticated-User-Email"
+
+# ─── HTTP Basic auth (authMode: basic) ────────────────────────────────────────
+
+# Self-contained alternative to a reverse-proxy SSO. The browser handles the
+# credential dialog; credentials are validated against an htpasswd file.
+# basicAuth:
+#   htpasswdFile: "/etc/authenticatoor/htpasswd"
+#   realm: "authenticatoor"
+
+# ─── any auth (authMode: any) ─────────────────────────────────────────────────
+
+# DEV ONLY. Unauthenticated /auth/* requests redirect to a small form where
+# the user picks any username. The picked name is stored in a clearable
+# cookie and reused as the identity until POST /auth/logout. Defaults are
+# sensible — no anyAuth: block is needed unless you want to override the
+# cookie name, login path, or TTL.
+# anyAuth:
+#   cookieName: "authenticatoor_anyauth_user"
+#   loginPath:  "/auth/anyauth/login"
+#   cookieTTL:  "12h"
+
+# ─── GitHub OAuth (authMode: github) ──────────────────────────────────────────
+
+# Authenticates users through GitHub OAuth, gated on org membership. The
+# clientId / clientSecret come from a "GitHub OAuth App" created at
+# https://github.com/settings/developers (or under your org's settings).
+# Register the redirect URI as <issuer>/auth/oauth/callback (or whatever
+# githubOAuth.callbackPath you configure).
+#
+# Mount clientSecret + sessionSecret from a Kubernetes Secret in production;
+# either field accepts an inline value (typically supplied via env var) for
+# ad-hoc deployments.
+# githubOAuth:
+#   clientId: "Iv1.…"
+#   clientSecretFile: "/etc/authenticatoor/gh-secret"
+#   sessionSecretFile: "/etc/authenticatoor/session-secret"  # ≥16 bytes
+#   sessionTTL: "12h"
+#   allowedOrgs:
+#     - "ethpandaops"
+#   # callbackPath: "/auth/oauth/callback"
+#   # sessionCookieName: "authenticatoor_session"
+#   # stateCookieName: "authenticatoor_oauth_state"
 
 # ─── signing keys ─────────────────────────────────────────────────────────────
 

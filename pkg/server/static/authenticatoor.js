@@ -24,8 +24,10 @@
 //     next checkLogin() picks up.
 //
 //   logout(): void
-//     Clears the locally stored token. The CF Access cookie is unaffected
-//     (use the upstream provider's logout to clear that).
+//     Clears the locally stored token and pokes the server's /auth/logout
+//     via a hidden iframe so the provider's session cookie is cleared at
+//     the auth origin (CF Access cookies are owned by the proxy and must
+//     be cleared via the upstream's own logout flow).
 //
 //   getToken(): string | null
 //     Returns the cached bearer token for use in API calls. Null if no
@@ -253,6 +255,41 @@
 
   function logout() {
     clearStored();
+    // Best-effort server-side logout via a hidden iframe. Cross-origin
+    // fetch can't reliably clear the auth cookie — preflight needs POST
+    // in the CORS allow-list, and even then the Set-Cookie response
+    // tends to be ignored by third-party cookie heuristics. An iframe
+    // load is treated as a normal navigation: the response's Set-Cookie
+    // is honored against the auth-service origin and clears the
+    // session cookie. The endpoint never returns a 401 challenge, so
+    // the (invisible) iframe doesn't trigger a credential dialog.
+    try {
+      var iframe = document.createElement('iframe');
+      iframe.style.display = 'none';
+      iframe.setAttribute('aria-hidden', 'true');
+      iframe.referrerPolicy = 'no-referrer';
+      iframe.src = AUTH_SERVICE_URL + '/auth/logout';
+
+      var done = false;
+      function cleanup() {
+        if (done) return;
+        done = true;
+        if (iframe.parentNode) iframe.parentNode.removeChild(iframe);
+      }
+      // Give the browser a tick after load to commit Set-Cookie before
+      // tearing the iframe down, then a 5s failsafe in case load never
+      // fires (network blip, ad blocker, etc).
+      iframe.addEventListener('load', function () { setTimeout(cleanup, 100); });
+      setTimeout(cleanup, 5000);
+
+      if (document.body) {
+        document.body.appendChild(iframe);
+      } else {
+        document.addEventListener('DOMContentLoaded', function () {
+          if (!done) document.body.appendChild(iframe);
+        });
+      }
+    } catch (e) {}
   }
 
   function getToken() {

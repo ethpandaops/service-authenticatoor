@@ -14,15 +14,20 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 
-	"github.com/ethpandaops/service-authenticatoor/pkg/cfaccess"
 	"github.com/ethpandaops/service-authenticatoor/pkg/config"
 	"github.com/ethpandaops/service-authenticatoor/pkg/issuer"
+	"github.com/ethpandaops/service-authenticatoor/pkg/protection"
+	"github.com/ethpandaops/service-authenticatoor/pkg/protection/anyauth"
+	"github.com/ethpandaops/service-authenticatoor/pkg/protection/basic"
+	"github.com/ethpandaops/service-authenticatoor/pkg/protection/cloudflare"
+	"github.com/ethpandaops/service-authenticatoor/pkg/protection/github"
 	"github.com/ethpandaops/service-authenticatoor/pkg/server"
 )
 
@@ -82,29 +87,75 @@ func run(ctx context.Context, cfgPath string) error {
 		return fmt.Errorf("init logger: %w", err)
 	}
 	log.WithField("config", cfg.String()).Info("starting authenticatoor")
+	for _, w := range cfg.DeprecationWarnings {
+		log.Warn(w)
+	}
 
 	iss, err := buildIssuer(log, cfg)
 	if err != nil {
 		return fmt.Errorf("build issuer: %w", err)
 	}
 
-	cfVerifier, err := buildCFVerifier(ctx, log, cfg)
+	prov, err := buildProvider(log, cfg)
 	if err != nil {
-		return fmt.Errorf("build cf verifier: %w", err)
+		return fmt.Errorf("build provider: %w", err)
 	}
 
 	srv, err := server.New(server.Options{
-		Config:     cfg,
-		Issuer:     iss,
-		CFVerifier: cfVerifier,
-		Log:        log,
-		Registry:   prometheus.NewRegistry(),
+		Config:   cfg,
+		Issuer:   iss,
+		Provider: prov,
+		Log:      log,
+		Registry: prometheus.NewRegistry(),
 	})
 	if err != nil {
 		return fmt.Errorf("build server: %w", err)
 	}
 
 	return srv.Start(ctx)
+}
+
+// buildProvider constructs the protection.Provider named by cfg.AuthMode.
+// Provider.Start (heavy initialization) is deferred to server.Start.
+func buildProvider(log logrus.FieldLogger, cfg *config.Config) (protection.Provider, error) {
+	switch cfg.AuthMode {
+	case config.AuthModeCloudflare:
+		return cloudflare.New(log, cloudflare.Config{
+			VerifyJWT:  cfg.CloudflareAccess.VerifyJWT,
+			TeamDomain: cfg.CloudflareAccess.TeamDomain,
+			AudTag:     cfg.CloudflareAccess.AudTag,
+			JwtHeader:  cfg.CloudflareAccess.JwtHeader,
+			UserHeader: cfg.CloudflareAccess.UserHeader,
+		}), nil
+	case config.AuthModeBasic:
+		return basic.New(log, basic.Config{
+			HtpasswdFile: cfg.BasicAuth.HtpasswdFile,
+			Realm:        cfg.BasicAuth.Realm,
+		}), nil
+	case config.AuthModeAny:
+		return anyauth.New(log, anyauth.Config{
+			CookieName: cfg.AnyAuth.CookieName,
+			LoginPath:  cfg.AnyAuth.LoginPath,
+			CookieTTL:  cfg.AnyAuth.CookieTTL,
+			Secure:     strings.HasPrefix(cfg.ExternalURL, "https://"),
+		}), nil
+	case config.AuthModeGitHub:
+		return github.New(log, github.Config{
+			ClientID:          cfg.GitHubOAuth.ClientID,
+			ClientSecret:      cfg.GitHubOAuth.ClientSecret,
+			ClientSecretFile:  cfg.GitHubOAuth.ClientSecretFile,
+			SessionSecret:     cfg.GitHubOAuth.SessionSecret,
+			SessionSecretFile: cfg.GitHubOAuth.SessionSecretFile,
+			CallbackPath:      cfg.GitHubOAuth.CallbackPath,
+			PublicURL:         cfg.ExternalURL,
+			SessionCookieName: cfg.GitHubOAuth.SessionCookieName,
+			StateCookieName:   cfg.GitHubOAuth.StateCookieName,
+			SessionTTL:        cfg.GitHubOAuth.SessionTTL,
+			AllowedOrgs:       cfg.GitHubOAuth.AllowedOrgs,
+		}), nil
+	default:
+		return nil, fmt.Errorf("authMode %q not implemented", cfg.AuthMode)
+	}
 }
 
 // buildIssuer loads (or generates) the active RSA key, loads any previous
@@ -177,29 +228,6 @@ func loadOrGeneratePrivateKey(log logrus.FieldLogger, path string, genIfMissing 
 		return nil, fmt.Errorf("write %s: %w", path, err)
 	}
 	return k, nil
-}
-
-// buildCFVerifier returns a NoopVerifier when CF JWT verification is off,
-// otherwise constructs a real JWKSVerifier pointing at the team's certs.
-func buildCFVerifier(ctx context.Context, log logrus.FieldLogger, cfg *config.Config) (cfaccess.Verifier, error) {
-	if !cfg.CloudflareAccess.VerifyJWT {
-		log.Warn("CF Access JWT verification is DISABLED — only safe when the service is unreachable outside the trusted ingress")
-		return cfaccess.NoopVerifier{}, nil
-	}
-	v, err := cfaccess.NewJWKSVerifier(ctx, log, cfaccess.Config{
-		TeamDomain: cfg.CloudflareAccess.TeamDomain,
-		AudTag:     cfg.CloudflareAccess.AudTag,
-	})
-	if err != nil {
-		return nil, err
-	}
-	entry := log.WithField("team", cfg.CloudflareAccess.TeamDomain)
-	if cfg.CloudflareAccess.AudTag == "" {
-		entry.Warn("cf access verifier ready — audTag not set, accepting assertions from any application in the team")
-	} else {
-		entry.WithField("aud", cfg.CloudflareAccess.AudTag).Info("cf access verifier ready")
-	}
-	return v, nil
 }
 
 // newLogger builds the application logger from the logging config.

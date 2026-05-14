@@ -13,19 +13,19 @@ type tokenResponse struct {
 	Now   int64  `json:"now"`
 }
 
-// handleToken issues a JWT for the authenticated user. The user identity is
-// supplied by cfAccessMiddleware.
+// handleToken issues a JWT for the authenticated user. The user identity
+// is supplied by authMiddleware.
 //
 // The optional `aud` query parameter overrides the default audience; every
 // requested aud must appear in the configured audience list, otherwise the
 // request is rejected. This prevents callers from minting tokens for
 // audiences the service isn't authoritative for.
 func (s *Server) handleToken(w http.ResponseWriter, r *http.Request) {
-	email := emailFromContext(r.Context())
-	if email == "" {
-		// cfAccessMiddleware enforces this; defense in depth so a future
+	id := identityFromContext(r.Context())
+	if id == nil || id.Subject == "" {
+		// authMiddleware enforces this; defense in depth so a future
 		// refactor cannot create an anonymous-token path by accident.
-		s.tokenIssueErrors.WithLabelValues("no_email").Inc()
+		s.tokenIssueErrors.WithLabelValues("no_identity").Inc()
 		http.Error(w, "no authenticated user", http.StatusUnauthorized)
 		return
 	}
@@ -37,7 +37,7 @@ func (s *Server) handleToken(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	tok, claims, err := s.issuer.Issue(email, requested)
+	tok, claims, err := s.issuer.Issue(id.Subject, id.Email, requested)
 	if err != nil {
 		s.tokenIssueErrors.WithLabelValues("issue").Inc()
 		s.log.WithError(err).Error("issue token")
@@ -45,11 +45,15 @@ func (s *Server) handleToken(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.tokensIssued.Inc()
-	s.log.WithField("email", email).WithField("jti", claims.ID).Info("issued token")
+	s.log.WithField("sub", id.Subject).WithField("jti", claims.ID).Info("issued token")
 
+	user := id.Email
+	if user == "" {
+		user = id.Subject
+	}
 	resp := tokenResponse{
 		Token: tok,
-		User:  email,
+		User:  user,
 		Expr:  claims.ExpiresAt.Unix(),
 		Now:   claims.IssuedAt.Unix(),
 	}

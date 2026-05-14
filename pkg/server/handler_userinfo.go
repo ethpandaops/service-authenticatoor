@@ -17,19 +17,19 @@ type userinfoResponse struct {
 	Now   int64    `json:"now"`
 }
 
-// handleUserinfo returns identity & scope details for the CF-authenticated
+// handleUserinfo returns identity & scope details for the authenticated
 // caller. Unlike /auth/token it does not mint a JWT — it's a cheap "who am
 // I" probe that frontends can call any time.
 func (s *Server) handleUserinfo(w http.ResponseWriter, r *http.Request) {
-	email := emailFromContext(r.Context())
-	if email == "" {
+	id := identityFromContext(r.Context())
+	if id == nil || id.Subject == "" {
 		http.Error(w, "no authenticated user", http.StatusUnauthorized)
 		return
 	}
 
 	resp := userinfoResponse{
-		Email: email,
-		Sub:   email,
+		Email: id.Email,
+		Sub:   id.Subject,
 		Aud:   s.cfg.Audience,
 		Scope: s.cfg.ScopePattern,
 		Exp:   time.Now().Add(s.cfg.TokenTTL).Unix(),

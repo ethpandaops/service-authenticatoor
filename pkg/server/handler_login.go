@@ -17,8 +17,8 @@ import (
 // https://victim.example.com.attacker.com and userinfo-tricks like
 // https://victim.example.com@attacker.com.
 func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
-	email := emailFromContext(r.Context())
-	if email == "" {
+	id := identityFromContext(r.Context())
+	if id == nil || id.Subject == "" {
 		http.Error(w, "no authenticated user", http.StatusUnauthorized)
 		return
 	}
@@ -36,7 +36,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	tok, claims, err := s.issuer.Issue(email, nil)
+	tok, claims, err := s.issuer.Issue(id.Subject, id.Email, nil)
 	if err != nil {
 		s.tokenIssueErrors.WithLabelValues("issue").Inc()
 		s.log.WithError(err).Error("issue token")
@@ -45,7 +45,12 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	}
 	s.tokensIssued.Inc()
 	s.loginRedirects.Inc()
-	s.log.WithField("email", email).WithField("jti", claims.ID).Info("login redirect")
+	s.log.WithField("sub", id.Subject).WithField("jti", claims.ID).Info("login redirect")
+
+	user := id.Email
+	if user == "" {
+		user = id.Subject
+	}
 
 	// Build the redirect URL manually rather than going through
 	// dest.Fragment / dest.RawFragment — url.URL.String() re-percent-encodes
@@ -57,7 +62,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	encoded := url.Values{
 		"auth_token": {tok},
 		"exp":        {strconv.FormatInt(claims.ExpiresAt.Unix(), 10)},
-		"user":       {email},
+		"user":       {user},
 	}.Encode()
 
 	w.Header().Set("Cache-Control", "no-store")

@@ -46,7 +46,7 @@ func TestVerifier_RoundtripValid(t *testing.T) {
 	iss, jwksBase, teardown := servedIssuer(t)
 	defer teardown()
 
-	tok, _, err := iss.Issue("alice@example.com", nil)
+	tok, _, err := iss.Issue("alice@example.com", "alice@example.com", nil)
 	if err != nil {
 		t.Fatalf("issue: %v", err)
 	}
@@ -74,7 +74,7 @@ func TestVerifier_RejectsWrongIssuer(t *testing.T) {
 	iss, jwksBase, teardown := servedIssuer(t)
 	defer teardown()
 
-	tok, _, err := iss.Issue("alice@example.com", nil)
+	tok, _, err := iss.Issue("alice@example.com", "alice@example.com", nil)
 	if err != nil {
 		t.Fatalf("issue: %v", err)
 	}
@@ -96,7 +96,7 @@ func TestVerifier_RejectsWrongAudience(t *testing.T) {
 	iss, jwksBase, teardown := servedIssuer(t)
 	defer teardown()
 
-	tok, _, err := iss.Issue("alice@example.com", nil)
+	tok, _, err := iss.Issue("alice@example.com", "alice@example.com", nil)
 	if err != nil {
 		t.Fatalf("issue: %v", err)
 	}
@@ -133,7 +133,7 @@ func TestVerifier_RejectsExpired(t *testing.T) {
 		t.Fatalf("newissuer: %v", err)
 	}
 
-	tok, _, err := iss.Issue("alice@example.com", nil)
+	tok, _, err := iss.Issue("alice@example.com", "alice@example.com", nil)
 	if err != nil {
 		t.Fatalf("issue: %v", err)
 	}
@@ -164,7 +164,7 @@ func TestVerifier_HostBinding(t *testing.T) {
 	iss, jwksBase, teardown := servedIssuer(t)
 	defer teardown()
 
-	tok, _, err := iss.Issue("alice@example.com", nil)
+	tok, _, err := iss.Issue("alice@example.com", "alice@example.com", nil)
 	if err != nil {
 		t.Fatalf("issue: %v", err)
 	}
@@ -209,7 +209,7 @@ func TestVerifier_HostBindingRequiresScope(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newissuer: %v", err)
 	}
-	tok, _, err := iss.Issue("alice@example.com", nil)
+	tok, _, err := iss.Issue("alice@example.com", "alice@example.com", nil)
 	if err != nil {
 		t.Fatalf("issue: %v", err)
 	}
@@ -253,7 +253,7 @@ func TestVerifier_ServiceACL(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newissuer: %v", err)
 	}
-	tok, _, err := iss.Issue("alice@example.com", nil)
+	tok, _, err := iss.Issue("alice@example.com", "alice@example.com", nil)
 	if err != nil {
 		t.Fatalf("issue: %v", err)
 	}
@@ -297,7 +297,7 @@ func TestVerifier_ServiceACLNoClaim(t *testing.T) {
 	iss, jwksBase, teardown := servedIssuer(t)
 	defer teardown()
 
-	tok, _, err := iss.Issue("alice@example.com", nil)
+	tok, _, err := iss.Issue("alice@example.com", "alice@example.com", nil)
 	if err != nil {
 		t.Fatalf("issue: %v", err)
 	}

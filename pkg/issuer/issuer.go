@@ -20,9 +20,13 @@ import (
 // Issuer mints signed JWTs and exposes the public key material verifiers
 // need to validate them.
 type Issuer interface {
-	// Issue mints a token for the supplied subject. If audience is non-nil
-	// it overrides the issuer's default audience for this token.
-	Issue(subject string, audience []string) (token string, claims *auth.Claims, err error)
+	// Issue mints a token for the supplied subject and email. If audience
+	// is non-nil it overrides the issuer's default audience for this
+	// token. Subject and email are kept separate so providers like the
+	// GitHub OAuth provider can put a stable login in "sub" while still
+	// emitting a "email" claim — downstream services pick whichever
+	// fits their model.
+	Issue(subject, email string, audience []string) (token string, claims *auth.Claims, err error)
 	// JWKS returns the set of public keys (active + previous) as serialized
 	// JSON.
 	JWKS() ([]byte, error)
@@ -104,8 +108,8 @@ func NewRS256Issuer(cfg Config) (*RS256Issuer, error) {
 	return &RS256Issuer{cfg: cfg, jwks: out, activeKid: kid}, nil
 }
 
-// Issue mints and signs a JWT for the supplied subject.
-func (i *RS256Issuer) Issue(subject string, audience []string) (string, *auth.Claims, error) {
+// Issue mints and signs a JWT for the supplied subject and email.
+func (i *RS256Issuer) Issue(subject, email string, audience []string) (string, *auth.Claims, error) {
 	if subject == "" {
 		return "", nil, fmt.Errorf("issuer: subject is required")
 	}
@@ -131,7 +135,7 @@ func (i *RS256Issuer) Issue(subject string, audience []string) (string, *auth.Cl
 			ExpiresAt: jwt.NewNumericDate(now.Add(i.cfg.TTL)),
 			ID:        jti,
 		},
-		Email:    subject,
+		Email:    email,
 		Scope:    i.cfg.Scope,
 		Services: i.cfg.Services,
 	}

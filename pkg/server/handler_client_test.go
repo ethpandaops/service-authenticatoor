@@ -8,7 +8,7 @@ import (
 )
 
 func TestHandleClientJS(t *testing.T) {
-	s, _ := newTestServer(t)
+	s, _, _ := newTestServer(t)
 
 	req := httptest.NewRequest(http.MethodGet, "/client.js", nil)
 	rr := httptest.NewRecorder()
@@ -53,18 +53,17 @@ func TestHandleClientJS(t *testing.T) {
 }
 
 func TestHandleClientJS_PublicNoAuthRequired(t *testing.T) {
-	s, _ := newTestServer(t)
-	// Even with CF JWT verification on, /client.js must be reachable without
-	// any CF assertion — it's a public path outside /auth/*.
-	s.cfg.CloudflareAccess.VerifyJWT = true
-	s.cfg.CloudflareAccess.JwtHeader = "Cf-Access-Jwt-Assertion"
+	s, _, prov := newTestServer(t)
+	// Even with the active provider configured to reject every request,
+	// /client.js must be reachable — it's a public path outside /auth/*.
+	prov.verifyHeader = "X-Test-Assertion"
 
 	req := httptest.NewRequest(http.MethodGet, "/client.js", nil)
-	// no CF JWT, no email
+	// no email, no assertion
 	rr := httptest.NewRecorder()
 	s.routes().ServeHTTP(rr, req)
 
 	if rr.Code != http.StatusOK {
-		t.Errorf("status: got %d, want 200 (public path must skip CF middleware)", rr.Code)
+		t.Errorf("status: got %d, want 200 (public path must skip auth middleware)", rr.Code)
 	}
 }

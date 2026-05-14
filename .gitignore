@@ -1,6 +1,7 @@
 /bin/
 /dist/
 /authenticatoor
+/temp-*
 *.test
 *.out
 *.pem

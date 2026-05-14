@@ -163,6 +163,138 @@ cloudflareAccess:
 	}
 }
 
+func TestLoad_AuthModeDefaultsToCloudflare(t *testing.T) {
+	p := writeTempConfig(t, `
+issuer: "https://auth.foo.example"
+signing:
+  rs256:
+    privateKeyFile: "/etc/keys/private.pem"
+cloudflareAccess:
+  verifyJWT: false
+`)
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.AuthMode != AuthModeCloudflare {
+		t.Errorf("authMode: got %q want %q", cfg.AuthMode, AuthModeCloudflare)
+	}
+}
+
+func TestLoad_RejectsUnknownAuthMode(t *testing.T) {
+	p := writeTempConfig(t, `
+authMode: "bogus"
+issuer: "https://auth.foo.example"
+signing:
+  rs256:
+    privateKeyFile: "/etc/keys/private.pem"
+cloudflareAccess:
+  verifyJWT: false
+`)
+	if _, err := Load(p); err == nil {
+		t.Error("expected error for unknown authMode")
+	}
+}
+
+func TestLoad_TopLevelUserHeaderFoldsIntoCloudflareAccess(t *testing.T) {
+	p := writeTempConfig(t, `
+issuer: "https://auth.foo.example"
+userHeader: "X-Custom-Email"
+signing:
+  rs256:
+    privateKeyFile: "/etc/keys/private.pem"
+cloudflareAccess:
+  verifyJWT: false
+`)
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.CloudflareAccess.UserHeader != "X-Custom-Email" {
+		t.Errorf("cloudflareAccess.userHeader: got %q want %q",
+			cfg.CloudflareAccess.UserHeader, "X-Custom-Email")
+	}
+	// Default top-level value (no explicit override) → no warning.
+	if len(cfg.DeprecationWarnings) != 0 {
+		t.Errorf("expected no deprecation warnings, got %v", cfg.DeprecationWarnings)
+	}
+}
+
+func TestLoad_CloudflareAccessUserHeaderOverridesTopLevel(t *testing.T) {
+	p := writeTempConfig(t, `
+issuer: "https://auth.foo.example"
+userHeader: "X-Old-Email"
+signing:
+  rs256:
+    privateKeyFile: "/etc/keys/private.pem"
+cloudflareAccess:
+  verifyJWT: false
+  userHeader: "X-New-Email"
+`)
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.CloudflareAccess.UserHeader != "X-New-Email" {
+		t.Errorf("cloudflareAccess.userHeader: got %q", cfg.CloudflareAccess.UserHeader)
+	}
+	if len(cfg.DeprecationWarnings) == 0 {
+		t.Error("expected deprecation warning when both forms are set")
+	}
+}
+
+func TestLoad_BasicMode_RequiresHtpasswdFile(t *testing.T) {
+	p := writeTempConfig(t, `
+authMode: basic
+issuer: "https://auth.foo.example"
+signing:
+  rs256:
+    privateKeyFile: "/etc/keys/private.pem"
+`)
+	if _, err := Load(p); err == nil {
+		t.Error("expected error for missing basicAuth.htpasswdFile")
+	}
+}
+
+func TestLoad_BasicMode_AcceptsHtpasswdFile(t *testing.T) {
+	p := writeTempConfig(t, `
+authMode: basic
+issuer: "https://auth.foo.example"
+signing:
+  rs256:
+    privateKeyFile: "/etc/keys/private.pem"
+basicAuth:
+  htpasswdFile: "/etc/htpasswd"
+`)
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.AuthMode != AuthModeBasic {
+		t.Errorf("authMode: got %q", cfg.AuthMode)
+	}
+	if cfg.BasicAuth.HtpasswdFile != "/etc/htpasswd" {
+		t.Errorf("htpasswdFile: got %q", cfg.BasicAuth.HtpasswdFile)
+	}
+}
+
+func TestLoad_AnyMode_NoRequiredFields(t *testing.T) {
+	p := writeTempConfig(t, `
+authMode: any
+issuer: "https://auth.foo.example"
+signing:
+  rs256:
+    privateKeyFile: "/etc/keys/private.pem"
+`)
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.AuthMode != AuthModeAny {
+		t.Errorf("authMode: got %q", cfg.AuthMode)
+	}
+}
+
 func TestLoad_EnvOverride(t *testing.T) {
 	p := writeTempConfig(t, `
 issuer: "https://auth.foo.example"
