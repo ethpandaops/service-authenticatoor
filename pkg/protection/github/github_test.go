@@ -18,27 +18,31 @@ import (
 // stubGitHub stands in for github.com + api.github.com. Tests configure the
 // fixed responses and inspect what was sent.
 type stubGitHub struct {
-	server        *httptest.Server
-	gotCode       string
-	tokenResp     tokenResponse
-	user          githubUser
-	emails        []githubEmail
-	orgs          []githubOrg
-	tokenStatus   int
-	userStatus    int
-	emailsStatus  int
-	orgsStatus    int
-	authzReceived url.Values
+	server            *httptest.Server
+	gotCode           string
+	tokenResp         tokenResponse
+	user              githubUser
+	emails            []githubEmail
+	orgs              []githubOrg
+	publicOrgs        []githubOrg
+	tokenStatus       int
+	userStatus        int
+	emailsStatus      int
+	orgsStatus        int
+	publicOrgsStatus  int
+	publicOrgsForUser string // login captured from the most recent /users/{login}/orgs call
+	authzReceived     url.Values
 }
 
 func newStubGitHub(t *testing.T) *stubGitHub {
 	t.Helper()
 	s := &stubGitHub{
-		tokenStatus:  200,
-		userStatus:   200,
-		emailsStatus: 200,
-		orgsStatus:   200,
-		tokenResp:    tokenResponse{AccessToken: "stub-access", TokenType: "bearer"},
+		tokenStatus:      200,
+		userStatus:       200,
+		emailsStatus:     200,
+		orgsStatus:       200,
+		publicOrgsStatus: 200,
+		tokenResp:        tokenResponse{AccessToken: "stub-access", TokenType: "bearer"},
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/login/oauth/authorize", func(w http.ResponseWriter, r *http.Request) {
@@ -66,6 +70,13 @@ func newStubGitHub(t *testing.T) *stubGitHub {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(s.orgsStatus)
 		_ = json.NewEncoder(w).Encode(s.orgs)
+	})
+	// /users/{login}/orgs — Go 1.22+ ServeMux wildcard pattern.
+	mux.HandleFunc("/users/{login}/orgs", func(w http.ResponseWriter, r *http.Request) {
+		s.publicOrgsForUser = r.PathValue("login")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(s.publicOrgsStatus)
+		_ = json.NewEncoder(w).Encode(s.publicOrgs)
 	})
 	s.server = httptest.NewServer(mux)
 	t.Cleanup(s.server.Close)
@@ -267,6 +278,73 @@ func TestGitHub_Callback_RejectsUserNotInAllowedOrg(t *testing.T) {
 
 	if rr.Code != http.StatusForbidden {
 		t.Errorf("status: got %d, want 403", rr.Code)
+	}
+}
+
+// Public-org membership is enough to pass even when /user/orgs hides
+// the org (e.g. the OAuth App hasn't been approved for an org that has
+// third-party app restrictions enabled).
+func TestGitHub_Callback_PublicOrgMembershipSatisfiesAllowList(t *testing.T) {
+	gh := newStubGitHub(t)
+	gh.user = githubUser{Login: "octocat", Email: "octo@example.com"}
+	// /user/orgs returns nothing — simulating the OAuth-App-not-approved case.
+	gh.orgs = []githubOrg{}
+	// But the user has publicized the membership, so /users/octocat/orgs sees it.
+	gh.publicOrgs = []githubOrg{{Login: "ethpandaops"}}
+
+	p := newTestProvider(t, gh, "ethpandaops")
+
+	state := "rand"
+	stateTok, _ := signState(p.sessionSecret, state, "/", p.cfg.Now(), DefaultStateTTL)
+
+	r := mux.NewRouter()
+	p.RegisterRoutes(r)
+	req := httptest.NewRequest(http.MethodGet, p.cfg.CallbackPath+"?code=stub-code&state="+state, nil)
+	req.AddCookie(&http.Cookie{Name: DefaultStateCookieName, Value: stateTok})
+	rr := httptest.NewRecorder()
+	r.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusFound {
+		t.Fatalf("status: %d body: %s", rr.Code, rr.Body.String())
+	}
+	if gh.publicOrgsForUser != "octocat" {
+		t.Errorf("public orgs queried for %q, want %q", gh.publicOrgsForUser, "octocat")
+	}
+}
+
+// When the OAuth App's per-org grant is missing, /user/orgs returns at
+// most other orgs, but /users/{login}/orgs is still authoritative for
+// public membership. The merged view must dedupe so the same org isn't
+// reported twice in diagnostic output.
+func TestGitHub_Callback_MergesPrivateAndPublicOrgsDeduped(t *testing.T) {
+	gh := newStubGitHub(t)
+	gh.user = githubUser{Login: "octocat", Email: "octo@example.com"}
+	// Both endpoints report ethpandaops — must not appear twice in the merged set.
+	gh.orgs = []githubOrg{{Login: "ethpandaops"}, {Login: "secret-org"}}
+	gh.publicOrgs = []githubOrg{{Login: "EthPandaOps"}, {Login: "public-org"}}
+
+	p := newTestProvider(t, gh, "ethpandaops")
+	profile, err := p.fetchProfile(context.Background(), "stub-access")
+	if err != nil {
+		t.Fatalf("fetchProfile: %v", err)
+	}
+
+	wantSet := map[string]bool{"ethpandaops": false, "secret-org": false, "public-org": false}
+	for _, o := range profile.Orgs {
+		key := strings.ToLower(o)
+		if _, ok := wantSet[key]; !ok {
+			t.Errorf("unexpected org in merged list: %q", o)
+			continue
+		}
+		if wantSet[key] {
+			t.Errorf("duplicate org in merged list: %q", o)
+		}
+		wantSet[key] = true
+	}
+	for k, seen := range wantSet {
+		if !seen {
+			t.Errorf("missing org in merged list: %q", k)
+		}
 	}
 }
 

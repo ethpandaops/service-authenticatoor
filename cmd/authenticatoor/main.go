@@ -14,7 +14,6 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
-	"strings"
 	"syscall"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -137,7 +136,6 @@ func buildProvider(log logrus.FieldLogger, cfg *config.Config) (protection.Provi
 			CookieName: cfg.AnyAuth.CookieName,
 			LoginPath:  cfg.AnyAuth.LoginPath,
 			CookieTTL:  cfg.AnyAuth.CookieTTL,
-			Secure:     strings.HasPrefix(cfg.ExternalURL, "https://"),
 		}), nil
 	case config.AuthModeGitHub:
 		return github.New(log, github.Config{

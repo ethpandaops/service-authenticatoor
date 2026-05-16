@@ -177,7 +177,9 @@ func TestHandleLoginSubmit_SetsCookieAndRedirects(t *testing.T) {
 	if len(cookies) != 1 || cookies[0].Name != DefaultCookieName || cookies[0].Value != "alice" {
 		t.Errorf("cookie: got %+v", cookies)
 	}
-	if !cookies[0].HttpOnly || cookies[0].SameSite != http.SameSiteLaxMode {
+	// SameSite=None + Secure is required so the iframe-based logout can
+	// later overwrite this cookie from a cross-site context.
+	if !cookies[0].HttpOnly || !cookies[0].Secure || cookies[0].SameSite != http.SameSiteNoneMode {
 		t.Errorf("cookie attributes: got %+v", cookies[0])
 	}
 }

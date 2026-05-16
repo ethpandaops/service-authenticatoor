@@ -24,6 +24,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gorilla/mux"
@@ -300,39 +301,44 @@ func (p *Provider) handleCallback(w http.ResponseWriter, r *http.Request) {
 		MaxAge: -1, HttpOnly: true, SameSite: http.SameSiteLaxMode,
 	})
 
-	token, err := p.exchangeCode(r.Context(), code)
+	token, scope, err := p.exchangeCode(r.Context(), code)
 	if err != nil {
 		p.log.WithError(err).Warn("oauth code exchange failed")
 		http.Error(w, "code exchange failed", http.StatusBadGateway)
 		return
 	}
+	p.log.WithField("scope", scope).Debug("github oauth code exchanged")
 
-	user, err := p.fetchUser(r.Context(), token)
+	profile, err := p.fetchProfile(r.Context(), token)
 	if err != nil {
-		p.log.WithError(err).Warn("github user fetch failed")
-		http.Error(w, "user lookup failed", http.StatusBadGateway)
+		p.log.WithError(err).Warn("github profile fetch failed")
+		http.Error(w, "profile lookup failed", http.StatusBadGateway)
 		return
 	}
 
-	orgs, err := p.fetchOrgs(r.Context(), token)
-	if err != nil {
-		p.log.WithError(err).Warn("github orgs fetch failed")
-		http.Error(w, "orgs lookup failed", http.StatusBadGateway)
-		return
-	}
-	if !p.orgAllowed(orgs) {
-		p.log.WithField("login", user.Login).Warn("user not in any allowed org")
-		http.Error(w, "your GitHub account is not a member of any allowed org", http.StatusForbidden)
+	if !p.orgAllowed(profile.Orgs) {
+		p.log.WithFields(logrus.Fields{
+			"login":       profile.Login,
+			"orgs":        strings.Join(profile.Orgs, ", "),
+			"allowedOrgs": strings.Join(p.cfg.AllowedOrgs, ", "),
+			"scope":       scope,
+		}).Warn("user not in any allowed org")
+		http.Error(w, fmt.Sprintf(
+			"your GitHub account %q is not in any allowed org.\n"+
+				"  allowed: [%s]\n"+
+				"  your visible memberships: [%s]\n"+
+				"  granted oauth scopes: [%s]\n"+
+				"if an expected org is missing, the OAuth App may not have been granted access to it — review at https://github.com/settings/connections/applications/%s",
+			profile.Login,
+			strings.Join(p.cfg.AllowedOrgs, ", "),
+			strings.Join(profile.Orgs, ", "),
+			scope,
+			p.cfg.ClientID,
+		), http.StatusForbidden)
 		return
 	}
 
-	email := user.Email
-	if email == "" {
-		// Fall back to the verified primary from /user/emails.
-		email, _ = p.fetchPrimaryEmail(r.Context(), token)
-	}
-
-	cookie, err := p.signSessionCookie(user.Login, email)
+	cookie, err := p.signSessionCookie(profile.Login, profile.Email)
 	if err != nil {
 		p.log.WithError(err).Error("session cookie signing failed")
 		http.Error(w, "session error", http.StatusInternalServerError)
@@ -347,19 +353,151 @@ func (p *Provider) handleCallback(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, returnTo, http.StatusFound)
 }
 
-// orgAllowed reports whether any of the supplied orgs is in the allow-list.
-// Comparison is case-insensitive.
-func (p *Provider) orgAllowed(orgs []githubOrg) bool {
+// orgAllowed reports whether any of the supplied org logins is in the
+// allow-list. Comparison is case-insensitive.
+func (p *Provider) orgAllowed(orgs []string) bool {
 	for _, o := range orgs {
-		if _, ok := p.allowedOrgsSet[strings.ToLower(o.Login)]; ok {
+		if _, ok := p.allowedOrgsSet[strings.ToLower(o)]; ok {
 			return true
 		}
 	}
 	return false
 }
 
+// userProfile is the merged view of a GitHub user fetched in handleCallback.
+// Orgs unions /user/orgs (private memberships) and /users/{login}/orgs
+// (public memberships), case-insensitively deduplicated.
+type userProfile struct {
+	Login string
+	Email string
+	Orgs  []string
+}
+
+// fetchProfile fans out the four GitHub API calls needed to gate the
+// session: /user (login + maybe email), /user/orgs (private memberships,
+// requires the OAuth App to be approved by the org if it has third-party
+// app restrictions), /users/{login}/orgs (public memberships, never
+// subject to those restrictions — same data anyone could see), and
+// /user/emails (fallback when the user keeps their primary email
+// private). The public-orgs call depends on the login returned by /user,
+// so it's chained off a 1-buffered channel; the other three start
+// immediately.
+//
+// Only /user is fatal — if either orgs source fails we proceed with what
+// we got, which is what makes the public/private union valuable: a
+// transient failure of one endpoint doesn't lock everyone out as long as
+// the other succeeds.
+func (p *Provider) fetchProfile(ctx context.Context, token string) (*userProfile, error) {
+	var (
+		user        *githubUser
+		userErr     error
+		privateOrgs []githubOrg
+		privateErr  error
+		publicOrgs  []githubOrg
+		publicErr   error
+		primary     string
+		primaryErr  error
+	)
+
+	loginCh := make(chan string, 1)
+
+	var wg sync.WaitGroup
+	wg.Add(4)
+
+	go func() {
+		defer wg.Done()
+		defer close(loginCh)
+		user, userErr = p.fetchUser(ctx, token)
+		if userErr == nil && user != nil {
+			loginCh <- user.Login
+		}
+	}()
+
+	go func() {
+		defer wg.Done()
+		privateOrgs, privateErr = p.fetchOrgs(ctx, token)
+	}()
+
+	go func() {
+		defer wg.Done()
+		primary, primaryErr = p.fetchPrimaryEmail(ctx, token)
+	}()
+
+	go func() {
+		defer wg.Done()
+		login, ok := <-loginCh
+		if !ok {
+			return
+		}
+		publicOrgs, publicErr = p.fetchPublicOrgs(ctx, token, login)
+	}()
+
+	wg.Wait()
+
+	if userErr != nil {
+		return nil, fmt.Errorf("github user fetch: %w", userErr)
+	}
+	if user == nil {
+		return nil, errors.New("github user fetch: empty response")
+	}
+
+	if privateErr != nil {
+		p.log.WithError(privateErr).Warn("/user/orgs fetch failed; falling back to public memberships only")
+	}
+	if publicErr != nil {
+		p.log.WithError(publicErr).Warn("/users/{login}/orgs fetch failed; falling back to private memberships only")
+	}
+	if privateErr != nil && publicErr != nil {
+		return nil, fmt.Errorf("github orgs fetch: private=%v public=%w", privateErr, publicErr)
+	}
+	if primaryErr != nil {
+		p.log.WithError(primaryErr).Debug("/user/emails fetch failed (only matters if /user.email is empty)")
+	}
+
+	email := user.Email
+	if email == "" {
+		email = primary
+	}
+
+	return &userProfile{
+		Login: user.Login,
+		Email: email,
+		Orgs:  mergeOrgLogins(privateOrgs, publicOrgs),
+	}, nil
+}
+
+// mergeOrgLogins concatenates org-login slices and deduplicates
+// case-insensitively while preserving original casing of the first
+// occurrence (which lets diagnostic logs render the same casing GitHub
+// returned).
+func mergeOrgLogins(lists ...[]githubOrg) []string {
+	total := 0
+	for _, l := range lists {
+		total += len(l)
+	}
+	seen := make(map[string]struct{}, total)
+	out := make([]string, 0, total)
+	for _, l := range lists {
+		for _, o := range l {
+			key := strings.ToLower(o.Login)
+			if _, dup := seen[key]; dup {
+				continue
+			}
+			seen[key] = struct{}{}
+			out = append(out, o.Login)
+		}
+	}
+	return out
+}
+
 // signSessionCookie builds the HttpOnly session cookie for the
 // authenticated user.
+//
+// SameSite=None + Secure is required so the cross-site iframe flows
+// (`/auth/embed` for silent token, `/auth/logout` for clearing) can
+// read and overwrite the cookie. Browsers treat *.localhost as a
+// secure context, so Secure=true works for HTTP local dev too —
+// non-localhost plain HTTP isn't a supported deployment.
 func (p *Provider) signSessionCookie(login, email string) (*http.Cookie, error) {
 	signed, err := signSession(p.sessionSecret, login, email, p.cfg.SessionTTL, p.cfg.Now())
 	if err != nil {
@@ -371,13 +509,15 @@ func (p *Provider) signSessionCookie(login, email string) (*http.Cookie, error) 
 		Path:     "/",
 		MaxAge:   int(p.cfg.SessionTTL.Seconds()),
 		HttpOnly: true,
-		Secure:   strings.HasPrefix(p.cfg.PublicURL, "https://"),
-		SameSite: http.SameSiteLaxMode,
+		Secure:   true,
+		SameSite: http.SameSiteNoneMode,
 	}, nil
 }
 
 // ClearSessionCookie returns a cookie that clears the session. Used by
-// the logout endpoint.
+// the logout endpoint. Path / Secure / SameSite must match
+// signSessionCookie so the browser treats the two as the same cookie
+// and overwrites the live session.
 func (p *Provider) ClearSessionCookie() *http.Cookie {
 	return &http.Cookie{
 		Name:     p.cfg.SessionCookieName,
@@ -385,8 +525,8 @@ func (p *Provider) ClearSessionCookie() *http.Cookie {
 		Path:     "/",
 		MaxAge:   -1,
 		HttpOnly: true,
-		Secure:   strings.HasPrefix(p.cfg.PublicURL, "https://"),
-		SameSite: http.SameSiteLaxMode,
+		Secure:   true,
+		SameSite: http.SameSiteNoneMode,
 	}
 }
 
@@ -425,7 +565,11 @@ type tokenResponse struct {
 	ErrorDesc   string `json:"error_description"`
 }
 
-func (p *Provider) exchangeCode(ctx context.Context, code string) (string, error) {
+// exchangeCode swaps the authorization code for an access token, returning
+// both the token and the granted scope (so callers can surface it for
+// diagnostics — e.g. when the org check fails for what looks like a
+// missing read:org grant).
+func (p *Provider) exchangeCode(ctx context.Context, code string) (accessToken, scope string, err error) {
 	form := url.Values{}
 	form.Set("client_id", p.cfg.ClientID)
 	form.Set("client_secret", string(p.clientSecret))
@@ -434,31 +578,31 @@ func (p *Provider) exchangeCode(ctx context.Context, code string) (string, error
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, p.tokenURL, strings.NewReader(form.Encode()))
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("Accept", "application/json")
 
 	resp, err := p.httpClient.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("token request: %w", err)
+		return "", "", fmt.Errorf("token request: %w", err)
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode/100 != 2 {
-		return "", fmt.Errorf("token request: status %d: %s", resp.StatusCode, body)
+		return "", "", fmt.Errorf("token request: status %d: %s", resp.StatusCode, body)
 	}
 	var tr tokenResponse
 	if err := json.Unmarshal(body, &tr); err != nil {
-		return "", fmt.Errorf("token decode: %w (body=%s)", err, body)
+		return "", "", fmt.Errorf("token decode: %w (body=%s)", err, body)
 	}
 	if tr.Error != "" {
-		return "", fmt.Errorf("token error: %s: %s", tr.Error, tr.ErrorDesc)
+		return "", "", fmt.Errorf("token error: %s: %s", tr.Error, tr.ErrorDesc)
 	}
 	if tr.AccessToken == "" {
-		return "", errors.New("token response missing access_token")
+		return "", "", errors.New("token response missing access_token")
 	}
-	return tr.AccessToken, nil
+	return tr.AccessToken, tr.Scope, nil
 }
 
 func (p *Provider) fetchUser(ctx context.Context, token string) (*githubUser, error) {
@@ -488,6 +632,22 @@ func (p *Provider) fetchPrimaryEmail(ctx context.Context, token string) (string,
 func (p *Provider) fetchOrgs(ctx context.Context, token string) ([]githubOrg, error) {
 	var orgs []githubOrg
 	if err := p.apiGet(ctx, token, "/user/orgs", &orgs); err != nil {
+		return nil, err
+	}
+	return orgs, nil
+}
+
+// fetchPublicOrgs returns the user's publicly-visible org memberships via
+// /users/{login}/orgs. This endpoint exposes the same data anyone can see
+// on the user's profile page and is therefore *not* subject to per-org
+// "third-party OAuth App access" restrictions — which means an org that
+// hides itself from /user/orgs (because this OAuth App hasn't been
+// approved there) still shows up here, provided the user has publicized
+// their membership. Used as a complement to fetchOrgs so that public
+// membership is sufficient to pass the allow-list check.
+func (p *Provider) fetchPublicOrgs(ctx context.Context, token, login string) ([]githubOrg, error) {
+	var orgs []githubOrg
+	if err := p.apiGet(ctx, token, "/users/"+url.PathEscape(login)+"/orgs", &orgs); err != nil {
 		return nil, err
 	}
 	return orgs, nil

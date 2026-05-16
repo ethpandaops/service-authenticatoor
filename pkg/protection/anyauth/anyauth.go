@@ -46,9 +46,6 @@ type Config struct {
 	LoginPath string
 	// CookieTTL is the cookie lifetime. Defaults to 12h.
 	CookieTTL time.Duration
-	// Secure marks the cookie as Secure (HTTPS-only). Set true when the
-	// service is served over HTTPS.
-	Secure bool
 }
 
 // Provider implements protection.Provider as a username-only passthrough
@@ -172,6 +169,12 @@ func (p *Provider) handleLoginSubmit(w http.ResponseWriter, r *http.Request) {
 }
 
 // userCookie packs the chosen username into the session cookie.
+//
+// SameSite=None + Secure is required so the iframe-based logout (which
+// hits /auth/logout cross-site from the consumer app's origin) can apply
+// the clearing Set-Cookie. Browsers treat *.localhost as a secure
+// context, so Secure=true works for HTTP local dev too — non-localhost
+// plain HTTP isn't a supported deployment.
 func (p *Provider) userCookie(user string) *http.Cookie {
 	return &http.Cookie{
 		Name:     p.cfg.CookieName,
@@ -179,12 +182,14 @@ func (p *Provider) userCookie(user string) *http.Cookie {
 		Path:     "/",
 		MaxAge:   int(p.cfg.CookieTTL.Seconds()),
 		HttpOnly: true,
-		Secure:   p.cfg.Secure,
-		SameSite: http.SameSiteLaxMode,
+		Secure:   true,
+		SameSite: http.SameSiteNoneMode,
 	}
 }
 
-// clearCookie returns a cookie that deletes the session cookie.
+// clearCookie returns a cookie that deletes the session cookie. Must
+// match userCookie's Path / Secure / SameSite so the browser treats it
+// as the same cookie and overwrites it.
 func (p *Provider) clearCookie() *http.Cookie {
 	return &http.Cookie{
 		Name:     p.cfg.CookieName,
@@ -192,8 +197,8 @@ func (p *Provider) clearCookie() *http.Cookie {
 		Path:     "/",
 		MaxAge:   -1,
 		HttpOnly: true,
-		Secure:   p.cfg.Secure,
-		SameSite: http.SameSiteLaxMode,
+		Secure:   true,
+		SameSite: http.SameSiteNoneMode,
 	}
 }
 

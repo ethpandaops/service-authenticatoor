@@ -8,4 +8,9 @@ cd "$(dirname "$0")"
 
 REPO_ROOT="$(cd ../.. && pwd)"
 
-exec go run "$REPO_ROOT/cmd/authenticatoor" --config ./config.yaml
+CONFIG_FILE="./config.yaml"
+if [ -f "./custom-config.yaml" ]; then
+    CONFIG_FILE="./custom-config.yaml"
+fi
+
+exec go run "$REPO_ROOT/cmd/authenticatoor" --config "$CONFIG_FILE"
