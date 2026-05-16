@@ -80,6 +80,7 @@ cloudflareAccess:
 
 # Self-contained alternative to a reverse-proxy SSO. The browser handles the
 # credential dialog; credentials are validated against an htpasswd file.
+
 # basicAuth:
 #   htpasswdFile: "/etc/authenticatoor/htpasswd"
 #   realm: "authenticatoor"
@@ -91,6 +92,7 @@ cloudflareAccess:
 # cookie and reused as the identity until POST /auth/logout. Defaults are
 # sensible — no anyAuth: block is needed unless you want to override the
 # cookie name, login path, or TTL.
+
 # anyAuth:
 #   cookieName: "authenticatoor_anyauth_user"
 #   loginPath:  "/auth/anyauth/login"
@@ -104,19 +106,54 @@ cloudflareAccess:
 # Register the redirect URI as <issuer>/auth/oauth/callback (or whatever
 # githubOAuth.callbackPath you configure).
 #
-# Mount clientSecret + sessionSecret from a Kubernetes Secret in production;
-# either field accepts an inline value (typically supplied via env var) for
-# ad-hoc deployments.
+# Mount clientSecret from a Kubernetes Secret in production; the inline
+# variant accepts the value directly via env var for ad-hoc deployments.
+
 # githubOAuth:
 #   clientId: "Iv1.…"
 #   clientSecretFile: "/etc/authenticatoor/gh-secret"
-#   sessionSecretFile: "/etc/authenticatoor/session-secret"  # ≥16 bytes
 #   sessionTTL: "12h"
 #   allowedOrgs:
 #     - "ethpandaops"
 #   # callbackPath: "/auth/oauth/callback"
 #   # sessionCookieName: "authenticatoor_session"
 #   # stateCookieName: "authenticatoor_oauth_state"
+
+# ─── OIDC (authMode: oidc) ────────────────────────────────────────────────────
+
+# Standard OIDC against any IdP (designed against the central ethpandaops
+# dex). One shared confidential client at the IdP; per-instance redirect
+# URI registration is avoided by routing the callback through a stateless
+# relay (platform/applications/oidc-relay) that extracts the originating
+# authenticatoor host from the state parameter.
+#
+# State contract:  state = "<externalURL>~<base64url-signed-blob>"
+# Group membership is checked against the id_token's `groups` claim — for
+# dex's GitHub connector that's org names (and optionally `<org>:<team>`).
+#
+# callbackURL is what the IdP redirects to after authentication. With a
+# relay in front: the relay's URL (shared across every authenticatoor).
+# Direct (no relay): <externalURL>/auth/oidc/callback, registered with
+# the IdP as this client's redirect_uri.
+#
+# Mount clientSecret from a Kubernetes Secret in production; the inline
+# variant works for ad-hoc setups via env var. The session HMAC key is
+# derived from the JWT signing key — no separate session secret to manage.
+
+# oidc:
+#   issuerURL: "https://dex.primary.production.platform.ethpandaops.io"
+#   callbackURL: "https://oidc-relay.primary.production.platform.ethpandaops.io/oidc/callback"
+#   clientId: "authenticatoor"
+#   clientSecretFile: "/etc/authenticatoor/oidc-client-secret"
+#   sessionTTL: "12h"
+#   allowedGroups:
+#     - "ethpandaops"
+#     - "EthDevOpsAccess:validatorops"
+#     - "sigp"
+#   # callbackPath: "/auth/oidc/callback"
+#   # sessionCookieName: "authenticatoor_oidc_session"
+#   # stateCookieName: "authenticatoor_oidc_state"
+#   # scopes: ["openid", "email", "groups"]
 
 # ─── signing keys ─────────────────────────────────────────────────────────────
 

@@ -27,6 +27,7 @@ const (
 	AuthModeBasic      = "basic"
 	AuthModeAny        = "any"
 	AuthModeGitHub     = "github"
+	AuthModeOIDC       = "oidc"
 )
 
 // Config is the resolved, validated, derivation-applied configuration of the
@@ -53,6 +54,7 @@ type Config struct {
 	BasicAuth        BasicAuthConfig        `yaml:"basicAuth" mapstructure:"basicAuth"`
 	AnyAuth          AnyAuthConfig          `yaml:"anyAuth" mapstructure:"anyAuth"`
 	GitHubOAuth      GitHubOAuthConfig      `yaml:"githubOAuth" mapstructure:"githubOAuth"`
+	OIDC             OIDCConfig             `yaml:"oidc" mapstructure:"oidc"`
 	CORS             CORSConfig             `yaml:"cors" mapstructure:"cors"`
 	Signing          SigningConfig          `yaml:"signing" mapstructure:"signing"`
 	Logging          LoggingConfig          `yaml:"logging" mapstructure:"logging"`
@@ -109,10 +111,9 @@ type GitHubOAuthConfig struct {
 	ClientSecret     string `yaml:"clientSecret" mapstructure:"clientSecret"`
 	ClientSecretFile string `yaml:"clientSecretFile" mapstructure:"clientSecretFile"`
 
-	// SessionSecret signs the session cookie. SessionSecret takes
-	// precedence over SessionSecretFile. Must be at least 16 bytes.
-	SessionSecret     string `yaml:"sessionSecret" mapstructure:"sessionSecret"`
-	SessionSecretFile string `yaml:"sessionSecretFile" mapstructure:"sessionSecretFile"`
+	// The session cookie HMAC key is derived from the JWT signing key
+	// (see issuer.DeriveHMACKey), so there's no separate secret to
+	// configure here.
 
 	// CallbackPath is the path of the OAuth redirect URI registered
 	// publicly. Default "/auth/oauth/callback".
@@ -128,6 +129,48 @@ type GitHubOAuthConfig struct {
 	// AllowedOrgs lists the GitHub orgs whose members may authenticate.
 	// At least one is required. Comparison is case-insensitive.
 	AllowedOrgs []string `yaml:"allowedOrgs" mapstructure:"allowedOrgs"`
+}
+
+// OIDCConfig configures the oidc protection provider.
+type OIDCConfig struct {
+	// IssuerURL is the IdP issuer (e.g. dex). The provider fetches
+	// <IssuerURL>/.well-known/openid-configuration at startup to resolve
+	// the authorize / token / jwks endpoints. Required.
+	IssuerURL string `yaml:"issuerURL" mapstructure:"issuerURL"`
+	// CallbackURL is the absolute URL registered at the IdP as this
+	// client's redirect_uri. In a relay-fronted deployment that's the
+	// relay's URL (shared across every authenticatoor instance); in a
+	// direct deployment that's <externalURL>/auth/oidc/callback. Required.
+	CallbackURL string `yaml:"callbackURL" mapstructure:"callbackURL"`
+
+	// ClientID is the OAuth client_id registered at the IdP. Required.
+	ClientID string `yaml:"clientId" mapstructure:"clientId"`
+	// ClientSecret takes precedence over ClientSecretFile when set.
+	// Either must be supplied (the shared client is confidential, not
+	// public).
+	ClientSecret     string `yaml:"clientSecret" mapstructure:"clientSecret"`
+	ClientSecretFile string `yaml:"clientSecretFile" mapstructure:"clientSecretFile"`
+
+	// CallbackPath is the local path the relay forwards to. Default
+	// "/auth/oidc/callback".
+	CallbackPath string `yaml:"callbackPath" mapstructure:"callbackPath"`
+	// SessionCookieName overrides the session cookie name. Default
+	// "authenticatoor_oidc_session".
+	SessionCookieName string `yaml:"sessionCookieName" mapstructure:"sessionCookieName"`
+	// StateCookieName overrides the OAuth state cookie name. Default
+	// "authenticatoor_oidc_state".
+	StateCookieName string `yaml:"stateCookieName" mapstructure:"stateCookieName"`
+	// SessionTTL is the session cookie lifetime. Default "12h".
+	SessionTTL time.Duration `yaml:"sessionTTL" mapstructure:"sessionTTL"`
+
+	// AllowedGroups lists groups (as emitted by the IdP) whose members
+	// may authenticate. For dex's GitHub connector that's org names like
+	// "ethpandaops" and (when teams are configured) "<org>:<team>".
+	// Case-insensitive. At least one is required.
+	AllowedGroups []string `yaml:"allowedGroups" mapstructure:"allowedGroups"`
+	// Scopes overrides the OIDC scopes requested. Defaults to
+	// ["openid", "email", "groups"]. `openid` is required.
+	Scopes []string `yaml:"scopes" mapstructure:"scopes"`
 }
 
 // CORSConfig configures the CORS middleware.
@@ -341,12 +384,25 @@ func (c *Config) Validate() error {
 		if c.GitHubOAuth.ClientSecret == "" && c.GitHubOAuth.ClientSecretFile == "" {
 			return errors.New("githubOAuth.clientSecret or githubOAuth.clientSecretFile is required")
 		}
-		if c.GitHubOAuth.SessionSecret == "" && c.GitHubOAuth.SessionSecretFile == "" {
-			return errors.New("githubOAuth.sessionSecret or githubOAuth.sessionSecretFile is required")
-		}
 		if len(c.GitHubOAuth.AllowedOrgs) == 0 {
 			return errors.New("githubOAuth.allowedOrgs must list at least one org")
 		}
+	case AuthModeOIDC:
+		if c.OIDC.IssuerURL == "" {
+			return errors.New("oidc.issuerURL is required when authMode is oidc")
+		}
+		if c.OIDC.CallbackURL == "" {
+			return errors.New("oidc.callbackURL is required when authMode is oidc")
+		}
+		if c.OIDC.ClientID == "" {
+			return errors.New("oidc.clientId is required when authMode is oidc")
+		}
+		if c.OIDC.ClientSecret == "" && c.OIDC.ClientSecretFile == "" {
+			return errors.New("oidc.clientSecret or oidc.clientSecretFile is required when authMode is oidc")
+		}
+		// oidc.allowedGroups is optional: empty means "trust the IdP's
+		// own gating" (e.g. dex's connector orgs allow-list). Set it
+		// to narrow further on a per-instance basis.
 	default:
 		return fmt.Errorf("authMode: unsupported value %q", c.AuthMode)
 	}

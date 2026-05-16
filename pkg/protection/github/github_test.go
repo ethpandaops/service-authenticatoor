@@ -13,6 +13,8 @@ import (
 
 	"github.com/gorilla/mux"
 	"github.com/sirupsen/logrus"
+
+	"github.com/ethpandaops/service-authenticatoor/pkg/session"
 )
 
 // stubGitHub stands in for github.com + api.github.com. Tests configure the
@@ -89,15 +91,15 @@ func newTestProvider(t *testing.T, gh *stubGitHub, allowedOrgs ...string) *Provi
 	log.SetOutput(io.Discard)
 	now := time.Date(2026, 5, 9, 12, 0, 0, 0, time.UTC)
 	p := New(log, Config{
-		ClientID:      "client-id",
-		ClientSecret:  "client-secret",
-		SessionSecret: "0123456789abcdef0123456789abcdef", // 32 bytes
-		PublicURL:     "http://auth.localhost:18080",
-		AllowedOrgs:   allowedOrgs,
-		AuthorizeURL:  gh.server.URL + "/login/oauth/authorize",
-		TokenURL:      gh.server.URL + "/login/oauth/access_token",
-		APIBaseURL:    gh.server.URL,
-		Now:           func() time.Time { return now },
+		ClientID:     "client-id",
+		ClientSecret: "client-secret",
+		SessionKey:   []byte("0123456789abcdef0123456789abcdef"), // 32 bytes
+		PublicURL:    "http://auth.localhost:18080",
+		AllowedOrgs:  allowedOrgs,
+		AuthorizeURL: gh.server.URL + "/login/oauth/authorize",
+		TokenURL:     gh.server.URL + "/login/oauth/access_token",
+		APIBaseURL:   gh.server.URL,
+		Now:          func() time.Time { return now },
 	})
 	if err := p.Start(context.Background()); err != nil {
 		t.Fatalf("start: %v", err)
@@ -199,7 +201,7 @@ func TestGitHub_Callback_HappyPath(t *testing.T) {
 
 	// Build a state cookie that matches the URL state.
 	state := "rand-state-value"
-	stateTok, err := signState(p.sessionSecret, state, "/auth/token?aud=foo", p.cfg.Now(), DefaultStateTTL)
+	stateTok, err := session.SignState(p.sessionSecret, state, "/auth/token?aud=foo", p.cfg.Now(), DefaultStateTTL)
 	if err != nil {
 		t.Fatalf("sign state: %v", err)
 	}
@@ -219,17 +221,17 @@ func TestGitHub_Callback_HappyPath(t *testing.T) {
 		t.Errorf("location: %q", got)
 	}
 	cookies := rr.Result().Cookies()
-	var session *http.Cookie
+	var sessionCookie *http.Cookie
 	for _, c := range cookies {
 		if c.Name == DefaultSessionCookieName {
-			session = c
+			sessionCookie = c
 			break
 		}
 	}
-	if session == nil {
+	if sessionCookie == nil {
 		t.Fatal("session cookie not set")
 	}
-	login, email, err := parseSession(p.sessionSecret, session.Value, p.cfg.Now())
+	login, email, err := session.Parse(p.sessionSecret, sessionCookie.Value, p.cfg.Now())
 	if err != nil {
 		t.Fatalf("parse session: %v", err)
 	}
@@ -245,7 +247,7 @@ func TestGitHub_Callback_RejectsStateMismatch(t *testing.T) {
 
 	p := newTestProvider(t, gh, "ethpandaops")
 
-	stateTok, _ := signState(p.sessionSecret, "expected-state", "/", p.cfg.Now(), DefaultStateTTL)
+	stateTok, _ := session.SignState(p.sessionSecret, "expected-state", "/", p.cfg.Now(), DefaultStateTTL)
 
 	r := mux.NewRouter()
 	p.RegisterRoutes(r)
@@ -267,7 +269,7 @@ func TestGitHub_Callback_RejectsUserNotInAllowedOrg(t *testing.T) {
 	p := newTestProvider(t, gh, "ethpandaops")
 
 	state := "rand-state-value"
-	stateTok, _ := signState(p.sessionSecret, state, "/auth/token", p.cfg.Now(), DefaultStateTTL)
+	stateTok, _ := session.SignState(p.sessionSecret, state, "/auth/token", p.cfg.Now(), DefaultStateTTL)
 
 	r := mux.NewRouter()
 	p.RegisterRoutes(r)
@@ -295,7 +297,7 @@ func TestGitHub_Callback_PublicOrgMembershipSatisfiesAllowList(t *testing.T) {
 	p := newTestProvider(t, gh, "ethpandaops")
 
 	state := "rand"
-	stateTok, _ := signState(p.sessionSecret, state, "/", p.cfg.Now(), DefaultStateTTL)
+	stateTok, _ := session.SignState(p.sessionSecret, state, "/", p.cfg.Now(), DefaultStateTTL)
 
 	r := mux.NewRouter()
 	p.RegisterRoutes(r)
@@ -361,7 +363,7 @@ func TestGitHub_Callback_FallsBackToPrimaryEmail(t *testing.T) {
 	p := newTestProvider(t, gh, "ethpandaops")
 
 	state := "rand"
-	stateTok, _ := signState(p.sessionSecret, state, "/", p.cfg.Now(), DefaultStateTTL)
+	stateTok, _ := session.SignState(p.sessionSecret, state, "/", p.cfg.Now(), DefaultStateTTL)
 
 	r := mux.NewRouter()
 	p.RegisterRoutes(r)
@@ -374,16 +376,16 @@ func TestGitHub_Callback_FallsBackToPrimaryEmail(t *testing.T) {
 		t.Fatalf("status: %d body: %s", rr.Code, rr.Body.String())
 	}
 	cookies := rr.Result().Cookies()
-	var session *http.Cookie
+	var sessionCookie *http.Cookie
 	for _, c := range cookies {
 		if c.Name == DefaultSessionCookieName {
-			session = c
+			sessionCookie = c
 		}
 	}
-	if session == nil {
+	if sessionCookie == nil {
 		t.Fatal("session cookie not set")
 	}
-	_, email, err := parseSession(p.sessionSecret, session.Value, p.cfg.Now())
+	_, email, err := session.Parse(p.sessionSecret, sessionCookie.Value, p.cfg.Now())
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
@@ -392,18 +394,18 @@ func TestGitHub_Callback_FallsBackToPrimaryEmail(t *testing.T) {
 	}
 }
 
-func TestGitHub_Start_RejectsShortSessionSecret(t *testing.T) {
+func TestGitHub_Start_RejectsShortSessionKey(t *testing.T) {
 	log := logrus.New()
 	log.SetOutput(io.Discard)
 	p := New(log, Config{
-		ClientID:      "x",
-		ClientSecret:  "x",
-		SessionSecret: "tooshort",
-		PublicURL:     "http://x",
-		AllowedOrgs:   []string{"x"},
+		ClientID:     "x",
+		ClientSecret: "x",
+		SessionKey:   []byte("tooshort"),
+		PublicURL:    "http://x",
+		AllowedOrgs:  []string{"x"},
 	})
 	if err := p.Start(context.Background()); err == nil {
-		t.Error("expected error for short session secret")
+		t.Error("expected error for short session key")
 	}
 }
 
@@ -411,10 +413,10 @@ func TestGitHub_Start_RejectsMissingAllowedOrgs(t *testing.T) {
 	log := logrus.New()
 	log.SetOutput(io.Discard)
 	p := New(log, Config{
-		ClientID:      "x",
-		ClientSecret:  "x",
-		SessionSecret: "0123456789abcdef0123456789abcdef",
-		PublicURL:     "http://x",
+		ClientID:     "x",
+		ClientSecret: "x",
+		SessionKey:   []byte("0123456789abcdef0123456789abcdef"),
+		PublicURL:    "http://x",
 	})
 	if err := p.Start(context.Background()); err == nil {
 		t.Error("expected error for missing AllowedOrgs")

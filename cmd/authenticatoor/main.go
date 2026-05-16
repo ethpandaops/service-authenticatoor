@@ -27,6 +27,7 @@ import (
 	"github.com/ethpandaops/service-authenticatoor/pkg/protection/basic"
 	"github.com/ethpandaops/service-authenticatoor/pkg/protection/cloudflare"
 	"github.com/ethpandaops/service-authenticatoor/pkg/protection/github"
+	"github.com/ethpandaops/service-authenticatoor/pkg/protection/oidc"
 	"github.com/ethpandaops/service-authenticatoor/pkg/server"
 )
 
@@ -90,12 +91,27 @@ func run(ctx context.Context, cfgPath string) error {
 		log.Warn(w)
 	}
 
-	iss, err := buildIssuer(log, cfg)
+	priv, err := loadOrGeneratePrivateKey(log, cfg.Signing.RS256.PrivateKeyFile, cfg.Signing.RS256.GenerateIfMissing)
+	if err != nil {
+		return fmt.Errorf("load signing key: %w", err)
+	}
+
+	iss, err := buildIssuer(log, cfg, priv)
 	if err != nil {
 		return fmt.Errorf("build issuer: %w", err)
 	}
 
-	prov, err := buildProvider(log, cfg)
+	// Derive the protection-provider session key from the signing key so
+	// cookie-shaped providers (github / oidc) don't need a separate
+	// secret. Rotating the signing key invalidates active sessions —
+	// users re-authenticate on the next request, which is the expected
+	// posture for a security-key rotation.
+	sessionKey, err := issuer.DeriveHMACKey(priv, "authenticatoor session v1")
+	if err != nil {
+		return fmt.Errorf("derive session key: %w", err)
+	}
+
+	prov, err := buildProvider(log, cfg, sessionKey)
 	if err != nil {
 		return fmt.Errorf("build provider: %w", err)
 	}
@@ -115,8 +131,9 @@ func run(ctx context.Context, cfgPath string) error {
 }
 
 // buildProvider constructs the protection.Provider named by cfg.AuthMode.
+// sessionKey is the derived HMAC key passed to cookie-shaped providers.
 // Provider.Start (heavy initialization) is deferred to server.Start.
-func buildProvider(log logrus.FieldLogger, cfg *config.Config) (protection.Provider, error) {
+func buildProvider(log logrus.FieldLogger, cfg *config.Config, sessionKey []byte) (protection.Provider, error) {
 	switch cfg.AuthMode {
 	case config.AuthModeCloudflare:
 		return cloudflare.New(log, cloudflare.Config{
@@ -142,8 +159,7 @@ func buildProvider(log logrus.FieldLogger, cfg *config.Config) (protection.Provi
 			ClientID:          cfg.GitHubOAuth.ClientID,
 			ClientSecret:      cfg.GitHubOAuth.ClientSecret,
 			ClientSecretFile:  cfg.GitHubOAuth.ClientSecretFile,
-			SessionSecret:     cfg.GitHubOAuth.SessionSecret,
-			SessionSecretFile: cfg.GitHubOAuth.SessionSecretFile,
+			SessionKey:        sessionKey,
 			CallbackPath:      cfg.GitHubOAuth.CallbackPath,
 			PublicURL:         cfg.ExternalURL,
 			SessionCookieName: cfg.GitHubOAuth.SessionCookieName,
@@ -151,20 +167,31 @@ func buildProvider(log logrus.FieldLogger, cfg *config.Config) (protection.Provi
 			SessionTTL:        cfg.GitHubOAuth.SessionTTL,
 			AllowedOrgs:       cfg.GitHubOAuth.AllowedOrgs,
 		}), nil
+	case config.AuthModeOIDC:
+		return oidc.New(log, oidc.Config{
+			IssuerURL:         cfg.OIDC.IssuerURL,
+			CallbackURL:       cfg.OIDC.CallbackURL,
+			PublicURL:         cfg.ExternalURL,
+			ClientID:          cfg.OIDC.ClientID,
+			ClientSecret:      cfg.OIDC.ClientSecret,
+			ClientSecretFile:  cfg.OIDC.ClientSecretFile,
+			SessionKey:        sessionKey,
+			CallbackPath:      cfg.OIDC.CallbackPath,
+			SessionCookieName: cfg.OIDC.SessionCookieName,
+			StateCookieName:   cfg.OIDC.StateCookieName,
+			SessionTTL:        cfg.OIDC.SessionTTL,
+			AllowedGroups:     cfg.OIDC.AllowedGroups,
+			Scopes:            cfg.OIDC.Scopes,
+		}), nil
 	default:
 		return nil, fmt.Errorf("authMode %q not implemented", cfg.AuthMode)
 	}
 }
 
-// buildIssuer loads (or generates) the active RSA key, loads any previous
-// public keys for rotation, and constructs an RS256Issuer.
-func buildIssuer(log logrus.FieldLogger, cfg *config.Config) (issuer.Issuer, error) {
+// buildIssuer loads any previous public keys for rotation and constructs
+// an RS256Issuer around the supplied private key.
+func buildIssuer(log logrus.FieldLogger, cfg *config.Config, priv *rsa.PrivateKey) (issuer.Issuer, error) {
 	rs256 := cfg.Signing.RS256
-
-	priv, err := loadOrGeneratePrivateKey(log, rs256.PrivateKeyFile, rs256.GenerateIfMissing)
-	if err != nil {
-		return nil, err
-	}
 
 	previous := make([]issuer.PreviousKey, 0, len(rs256.PreviousKeys))
 	for _, p := range rs256.PreviousKeys {

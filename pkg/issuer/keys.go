@@ -1,6 +1,7 @@
 package issuer
 
 import (
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
@@ -127,6 +128,40 @@ func MarshalRSAPrivateKeyPEM(key *rsa.PrivateKey) ([]byte, error) {
 // GenerateRSAKey returns a fresh RSA-2048 keypair.
 func GenerateRSAKey() (*rsa.PrivateKey, error) {
 	return rsa.GenerateKey(rand.Reader, MinRSAKeyBits)
+}
+
+// DeriveHMACKey returns a 32-byte HMAC-SHA256 key derived from an RSA
+// private key, suitable for signing HS256 session/state cookies in the
+// protection providers. The label is the HMAC message and acts as a
+// domain separator — different labels produce different keys from the
+// same private key, so a single signing key safely supplies multiple
+// derived secrets (e.g., session vs. state, or per-provider variants).
+//
+// Security: HMAC(privKey_PKCS8_bytes, label). The PKCS#8 marshaling
+// includes the private exponent and CRT params, so the HMAC key has
+// full RSA private-key entropy. Anyone without the private key cannot
+// compute the derived secret.
+//
+// Operational property: rotating the signing key rotates the derived
+// secrets too. Existing sessions are invalidated, forcing users to
+// re-authenticate. Ops who want to rotate the signing key without
+// invalidating sessions should set the corresponding sessionSecret /
+// sessionSecretFile config field, which takes precedence over the
+// derived value.
+func DeriveHMACKey(priv *rsa.PrivateKey, label string) ([]byte, error) {
+	if priv == nil {
+		return nil, errors.New("derive: nil private key")
+	}
+	if label == "" {
+		return nil, errors.New("derive: label must not be empty")
+	}
+	keyBytes, err := x509.MarshalPKCS8PrivateKey(priv)
+	if err != nil {
+		return nil, fmt.Errorf("derive: marshal PKCS#8: %w", err)
+	}
+	mac := hmac.New(sha256.New, keyBytes)
+	mac.Write([]byte(label))
+	return mac.Sum(nil), nil
 }
 
 // DeriveKeyID returns a deterministic kid for an RSA public key: the first

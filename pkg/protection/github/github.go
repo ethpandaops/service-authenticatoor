@@ -14,15 +14,12 @@ package github
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
-	"os"
 	"strings"
 	"sync"
 	"time"
@@ -31,6 +28,7 @@ import (
 	"github.com/sirupsen/logrus"
 
 	"github.com/ethpandaops/service-authenticatoor/pkg/protection"
+	"github.com/ethpandaops/service-authenticatoor/pkg/session"
 )
 
 // Defaults applied when corresponding Config fields are empty.
@@ -54,11 +52,11 @@ type Config struct {
 	// is read at Start. Either must be supplied.
 	ClientSecret     string
 	ClientSecretFile string
-	// SessionSecret takes precedence when set; otherwise SessionSecretFile
-	// is read at Start. The secret signs the session cookie and (with a
-	// derived subkey) the OAuth state cookie.
-	SessionSecret     string
-	SessionSecretFile string
+	// SessionKey is the HMAC key for the session and state cookies. Derived
+	// in main.go from the JWT signing key via issuer.DeriveHMACKey so
+	// there's no separate secret to manage. Must be at least 16 bytes.
+	// Required.
+	SessionKey []byte
 	// CallbackPath is the path of the OAuth redirect URI, registered on
 	// the public router. Defaults to "/auth/oauth/callback". Must match
 	// the redirect_uri configured in the GitHub OAuth app.
@@ -172,20 +170,16 @@ func (p *Provider) Start(_ context.Context) error {
 	if len(p.allowedOrgsSet) == 0 {
 		return errors.New("github: AllowedOrgs must list at least one org")
 	}
-	cs, err := loadSecret(p.cfg.ClientSecret, p.cfg.ClientSecretFile, "ClientSecret")
+	cs, err := session.LoadSecret(p.cfg.ClientSecret, p.cfg.ClientSecretFile, "ClientSecret")
 	if err != nil {
-		return err
+		return fmt.Errorf("github: %w", err)
 	}
 	p.clientSecret = cs
 
-	ss, err := loadSecret(p.cfg.SessionSecret, p.cfg.SessionSecretFile, "SessionSecret")
-	if err != nil {
-		return err
+	if len(p.cfg.SessionKey) < 16 {
+		return errors.New("github: SessionKey must be at least 16 bytes")
 	}
-	if len(ss) < 16 {
-		return errors.New("github: SessionSecret must be at least 16 bytes")
-	}
-	p.sessionSecret = ss
+	p.sessionSecret = p.cfg.SessionKey
 
 	p.log.WithField("orgs", p.cfg.AllowedOrgs).
 		WithField("callback", p.cfg.CallbackPath).
@@ -209,7 +203,7 @@ func (p *Provider) RegisterRoutes(r *mux.Router) {
 // callback can complete the round-trip.
 func (p *Provider) Authenticate(_ context.Context, r *http.Request) (protection.Outcome, error) {
 	if c, err := r.Cookie(p.cfg.SessionCookieName); err == nil {
-		login, email, perr := parseSession(p.sessionSecret, c.Value, p.cfg.Now())
+		login, email, perr := session.Parse(p.sessionSecret, c.Value, p.cfg.Now())
 		if perr == nil {
 			return protection.Outcome{Identity: &protection.Identity{
 				Subject: login,
@@ -219,7 +213,7 @@ func (p *Provider) Authenticate(_ context.Context, r *http.Request) (protection.
 		p.log.WithError(perr).Debug("session cookie invalid; redirecting to github")
 	}
 
-	state, err := newState()
+	state, err := session.NewNonce()
 	if err != nil {
 		return protection.Outcome{}, fmt.Errorf("github: state: %w", err)
 	}
@@ -250,7 +244,7 @@ func (p *Provider) redirectURI() string {
 // URL into a signed JWT and returns it as a short-lived cookie scoped to
 // the callback path.
 func (p *Provider) signedStateCookie(state, returnTo string) *http.Cookie {
-	tok, err := signState(p.sessionSecret, state, returnTo, p.cfg.Now(), DefaultStateTTL)
+	tok, err := session.SignState(p.sessionSecret, state, returnTo, p.cfg.Now(), DefaultStateTTL)
 	if err != nil {
 		// signing only fails on a misconfigured secret which Start would
 		// have rejected; falling back to plain state means the callback
@@ -285,7 +279,7 @@ func (p *Provider) handleCallback(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "missing state cookie", http.StatusBadRequest)
 		return
 	}
-	expectedState, returnTo, err := parseState(p.sessionSecret, stateCookie.Value, p.cfg.Now())
+	expectedState, returnTo, err := session.ParseState(p.sessionSecret, stateCookie.Value, p.cfg.Now())
 	if err != nil {
 		http.Error(w, "invalid state cookie", http.StatusBadRequest)
 		return
@@ -499,7 +493,7 @@ func mergeOrgLogins(lists ...[]githubOrg) []string {
 // secure context, so Secure=true works for HTTP local dev too —
 // non-localhost plain HTTP isn't a supported deployment.
 func (p *Provider) signSessionCookie(login, email string) (*http.Cookie, error) {
-	signed, err := signSession(p.sessionSecret, login, email, p.cfg.SessionTTL, p.cfg.Now())
+	signed, err := session.Sign(p.sessionSecret, login, email, p.cfg.SessionTTL, p.cfg.Now())
 	if err != nil {
 		return nil, err
 	}
@@ -680,28 +674,3 @@ func (p *Provider) apiGet(ctx context.Context, token, path string, out any) erro
 }
 
 // ─── helpers ─────────────────────────────────────────────────────────────────
-
-// loadSecret returns inline if non-empty, else reads the file. One of the
-// two must be supplied.
-func loadSecret(inline, file, name string) ([]byte, error) {
-	if inline != "" {
-		return []byte(inline), nil
-	}
-	if file == "" {
-		return nil, fmt.Errorf("github: %s or %sFile is required", name, name)
-	}
-	data, err := os.ReadFile(file)
-	if err != nil {
-		return nil, fmt.Errorf("github: read %s: %w", file, err)
-	}
-	return []byte(strings.TrimSpace(string(data))), nil
-}
-
-// newState returns a 128-bit random base64url-encoded value.
-func newState() (string, error) {
-	b := make([]byte, 16)
-	if _, err := rand.Read(b); err != nil {
-		return "", err
-	}
-	return base64.RawURLEncoding.EncodeToString(b), nil
-}

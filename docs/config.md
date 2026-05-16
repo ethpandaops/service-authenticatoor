@@ -50,7 +50,7 @@ allow-list, CORS origins) or covered by sensible defaults.
 | `audience`                             | string list | parent zone of `issuer` host         | JWT `aud`.                                                            |
 | `scopePattern`                         | string      | `*.<parent zone>`                    | JWT `scope` (host wildcard).                                          |
 | `tokenTTL`                             | duration    | `30m`                                | JWT lifetime.                                                         |
-| `authMode`                             | string      | `cloudflare`                         | `cloudflare`, `basic`, `any`, or `github`. See **Protection modes** below. |
+| `authMode`                             | string      | `cloudflare`                         | `cloudflare`, `basic`, `any`, `github`, or `oidc`. See **Protection modes** below. |
 | `userHeader`                           | string      | `Cf-Access-Authenticated-User-Email` | **Deprecated** alias for `cloudflareAccess.userHeader`. Folded in by Load when the new field is empty; emits a startup warning when both are set. |
 | `allowedReturnHosts`                   | string list | `["*.<parent zone>"]`                | Hosts allowed in `/auth/login?return_to=…`.                           |
 | `cors.allowedOrigins`                  | string list | = `allowedReturnHosts`               | Browsers allowed to call `/auth/*` with credentials.                  |
@@ -67,13 +67,22 @@ allow-list, CORS origins) or covered by sensible defaults.
 | `githubOAuth.clientId`                 | string      | (required for `github`)              | OAuth app client ID.                                                  |
 | `githubOAuth.clientSecret`             | string      | (required for `github`)              | OAuth app client secret. Inline alternative to `clientSecretFile`.    |
 | `githubOAuth.clientSecretFile`         | string      |                                      | File path holding the OAuth app secret.                               |
-| `githubOAuth.sessionSecret`            | string      | (required for `github`)              | HMAC secret signing the session cookie. ≥16 bytes. Inline alternative. |
-| `githubOAuth.sessionSecretFile`        | string      |                                      | File path holding the HMAC secret.                                    |
 | `githubOAuth.callbackPath`             | string      | `/auth/oauth/callback`               | Must match the redirect URI registered with the GitHub OAuth app.    |
 | `githubOAuth.sessionCookieName`        | string      | `authenticatoor_session`             | Browser cookie name for the session.                                  |
 | `githubOAuth.stateCookieName`          | string      | `authenticatoor_oauth_state`         | Browser cookie name for the OAuth CSRF state.                         |
 | `githubOAuth.sessionTTL`               | duration    | `12h`                                | Session cookie lifetime.                                              |
 | `githubOAuth.allowedOrgs`              | string list | (required for `github`)              | GitHub orgs whose members may authenticate. Case-insensitive.         |
+| `oidc.issuerURL`                       | string      | (required for `oidc`)                | IdP issuer URL. Discovery doc fetched from `<issuerURL>/.well-known/openid-configuration` at startup. |
+| `oidc.callbackURL`                     | string      | (required for `oidc`)                | Absolute callback URL registered at the IdP as this client's `redirect_uri`. Use the shared relay URL for relay-fronted deployments, or `<externalURL>/auth/oidc/callback` for direct ones. |
+| `oidc.clientId`                        | string      | (required for `oidc`)                | OAuth client_id registered at the IdP.                                |
+| `oidc.clientSecret`                    | string      | (required for `oidc`)                | OAuth client secret. Inline alternative to `clientSecretFile`.        |
+| `oidc.clientSecretFile`                | string      |                                      | File path holding the OAuth client secret.                            |
+| `oidc.callbackPath`                    | string      | `/auth/oidc/callback`                | Local path the relay forwards the callback to.                        |
+| `oidc.sessionCookieName`               | string      | `authenticatoor_oidc_session`        | Browser cookie name for the session.                                  |
+| `oidc.stateCookieName`                 | string      | `authenticatoor_oidc_state`          | Browser cookie name for the OAuth CSRF / OIDC nonce state.            |
+| `oidc.sessionTTL`                      | duration    | `12h`                                | Session cookie lifetime.                                              |
+| `oidc.allowedGroups`                   | string list | `[]` (inherit IdP gating)            | Groups (as emitted by the IdP) whose members may authenticate. For dex's GitHub connector each group is `<org>` or `<org>:<team>`. Case-insensitive. A bare `<org>` entry matches both `<org>` and any `<org>:<team>` (useful because dex emits `<org>:<team>` for orgs even without a `teams:` filter). An `<org>:<team>` entry matches that exact team only. Empty list = trust the IdP's own gating. |
+| `oidc.scopes`                          | string list | `[openid, email, groups]`            | OIDC scopes requested. `openid` is required.                          |
 | `signing.mode`                         | string      | `rs256`                              | Only `rs256` is supported.                                            |
 | `signing.rs256.privateKeyFile`         | string      | (required)                           | PEM-encoded RSA-2048+ private key (PKCS#1 or PKCS#8).                 |
 | `signing.rs256.keyId`                  | string      | hash of public key                   | `kid` put in JWT header.                                              |
@@ -158,15 +167,70 @@ authMode: github
 githubOAuth:
   clientId: "Iv1.…"
   clientSecretFile: "/etc/authenticatoor/gh-secret"
-  sessionSecretFile: "/etc/authenticatoor/session-secret"
   allowedOrgs:
     - "ethpandaops"
 ```
 
-For Kubernetes deployments, mount `clientSecretFile` and
-`sessionSecretFile` from a Secret. For ad-hoc deployments, the `Inline`
-variants (`clientSecret`, `sessionSecret`) accept the value directly via
-env var, e.g. `AUTHENTICATOOR_GITHUBOAUTH_CLIENTSECRET=…`.
+For Kubernetes deployments, mount `clientSecretFile` from a Secret. For
+ad-hoc deployments, the `clientSecret` inline variant accepts the value
+directly via env var, e.g. `AUTHENTICATOOR_GITHUBOAUTH_CLIENTSECRET=…`.
+
+The session-cookie HMAC key is derived from the JWT signing key (see
+`issuer.DeriveHMACKey`) — no separate session secret to manage. Rotating
+the signing key invalidates active sessions.
+
+### `oidc`
+
+Standard OIDC against any IdP (designed against the ethpandaops central
+dex but works against Google, Keycloak, etc.). Group membership gating is
+done against the `groups` claim in the id_token — for dex's GitHub
+connector that's the user's GitHub org list (and `<org>:<team>` entries
+when teams are configured in the dex connector).
+
+Unlike the `github` mode, every authenticatoor instance shares **one**
+confidential client at the IdP. To avoid registering a per-instance
+redirect URI with the IdP, the redirect target is a stateless
+**callback relay** (see `platform/applications/oidc-relay`) that
+forwards each callback to the originating authenticatoor based on the
+host encoded in the OAuth `state` parameter. The state contract:
+
+```
+state = "<our-public-url>~<base64url-signed-blob>"
+```
+
+where `<our-public-url>` is this instance's `externalURL` (the relay's
+regex constrains it to `*.ethpandaops.io` / `localhost` / `127.0.0.1`)
+and the signed blob is HMAC-signed against a key derived from the JWT
+signing key. The relay never inspects the signed blob — only the
+originating instance can verify it.
+
+The provider also works **without** a relay: register
+`<externalURL>/auth/oidc/callback` directly at the IdP as the
+`redirect_uri` and set `oidc.callbackURL` to the same value.
+
+```yaml
+authMode: oidc
+externalURL: "https://auth.<devnet>.ethpandaops.io"
+oidc:
+  issuerURL: "https://dex.primary.production.platform.ethpandaops.io"
+  callbackURL: "https://oidc-relay.primary.production.platform.ethpandaops.io/oidc/callback"
+  clientId: "authenticatoor"
+  clientSecretFile: "/etc/authenticatoor/oidc-client-secret"
+  allowedGroups:
+    - "ethpandaops"
+    - "EthDevOpsAccess:validatorops"
+    - "sigp"
+    # ...
+```
+
+Per-instance setup is purely on the authenticatoor side: the IdP and
+relay are deployed once globally; new devnet authenticatoors just need
+their own `externalURL`, `clientSecret` mount, and `allowedGroups`.
+
+For Kubernetes, mount the client secret from a Kubernetes Secret. The
+inline `oidc.clientSecret` variant works for ad-hoc deployments via
+`AUTHENTICATOOR_OIDC_CLIENTSECRET=…`. The session HMAC key is derived
+from the JWT signing key — no separate session secret to configure.
 
 ### Logout (`/auth/logout`)
 
@@ -176,6 +240,7 @@ behavior:
 - **cloudflare**: 302 to `/cdn-cgi/access/logout`. CF Access intercepts that path on the protected origin and clears the `CF_Authorization` cookie.
 - **any**: clears the username cookie (`authenticatoor_anyauth_user` by default). The next `/auth/*` request redirects back to the login form.
 - **github**: clears the session cookie. The next `/auth/*` request kicks off a fresh OAuth round-trip.
+- **oidc**: clears the session cookie. The next `/auth/*` request kicks off a fresh OIDC round-trip via dex. The IdP session is left intact (dex 2.x has no robust RP-initiated logout).
 - **basic**: 200 with a "close the tab" hint. HTTP Basic credentials are cached by the browser and the server has no reliable way to invalidate them — deliberately no `WWW-Authenticate` challenge so the iframe-based client logout doesn't pop a credential dialog.
 
 The bundled `client.js` calls `/auth/logout` from `logout()` via a hidden
