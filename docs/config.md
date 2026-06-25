@@ -59,6 +59,7 @@ allow-list, CORS origins) or covered by sensible defaults.
 | `cloudflareAccess.audTag`              | string      | `""`                                 | AUD tag of the CF Access application. When empty the audience claim is not checked — signature + issuer still pin the assertion to the team. |
 | `cloudflareAccess.jwtHeader`           | string      | `Cf-Access-Jwt-Assertion`            |                                                                       |
 | `cloudflareAccess.userHeader`          | string      | `Cf-Access-Authenticated-User-Email` | Header carrying the authenticated email. Replaces top-level `userHeader`. |
+| `cloudflareAccess.allowServiceTokens`  | bool        | `true`                               | Allow non-identity CF Access service tokens, using the token's `common_name` (client ID) as the identity subject. Still gated by the app's CF Access policy. Requires `verifyJWT`. |
 | `basicAuth.htpasswdFile`               | string      | (required for `basic`)               | Path to the htpasswd password file.                                   |
 | `basicAuth.realm`                      | string      | `authenticatoor`                     | Sent in `WWW-Authenticate: Basic realm="…"`.                          |
 | `anyAuth.cookieName`                   | string      | `authenticatoor_anyauth_user`        | Cookie holding the chosen username for the dev-only any-auth provider. |

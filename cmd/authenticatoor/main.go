@@ -137,11 +137,12 @@ func buildProvider(log logrus.FieldLogger, cfg *config.Config, sessionKey []byte
 	switch cfg.AuthMode {
 	case config.AuthModeCloudflare:
 		return cloudflare.New(log, cloudflare.Config{
-			VerifyJWT:  cfg.CloudflareAccess.VerifyJWT,
-			TeamDomain: cfg.CloudflareAccess.TeamDomain,
-			AudTag:     cfg.CloudflareAccess.AudTag,
-			JwtHeader:  cfg.CloudflareAccess.JwtHeader,
-			UserHeader: cfg.CloudflareAccess.UserHeader,
+			VerifyJWT:          cfg.CloudflareAccess.VerifyJWT,
+			TeamDomain:         cfg.CloudflareAccess.TeamDomain,
+			AudTag:             cfg.CloudflareAccess.AudTag,
+			JwtHeader:          cfg.CloudflareAccess.JwtHeader,
+			UserHeader:         cfg.CloudflareAccess.UserHeader,
+			AllowServiceTokens: cfg.CloudflareAccess.AllowServiceTokens,
 		}), nil
 	case config.AuthModeBasic:
 		return basic.New(log, basic.Config{
