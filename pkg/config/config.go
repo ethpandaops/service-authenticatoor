@@ -77,6 +77,11 @@ type CloudflareAccessConfig struct {
 	// canonical location; the top-level userHeader field is kept as a
 	// deprecated alias.
 	UserHeader string `yaml:"userHeader" mapstructure:"userHeader"`
+	// AllowServiceTokens permits non-identity CF Access service tokens to
+	// authenticate, using the token's common_name (client ID) as the
+	// identity subject. Whether a service token can reach the app at all is
+	// still gated by the app's CF Access policy. Defaults to true.
+	AllowServiceTokens bool `yaml:"allowServiceTokens" mapstructure:"allowServiceTokens"`
 }
 
 // BasicAuthConfig configures the basic protection provider.
@@ -257,6 +262,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("userHeader", "Cf-Access-Authenticated-User-Email")
 
 	v.SetDefault("cloudflareAccess.verifyJWT", true)
+	v.SetDefault("cloudflareAccess.allowServiceTokens", true)
 	v.SetDefault("cloudflareAccess.jwtHeader", "Cf-Access-Jwt-Assertion")
 
 	v.SetDefault("signing.mode", "rs256")

@@ -50,6 +50,12 @@ type Config struct {
 	// UserHeader is the header carrying the authenticated email.
 	// Defaults to "Cf-Access-Authenticated-User-Email".
 	UserHeader string
+	// AllowServiceTokens permits non-identity Cloudflare Access service
+	// tokens to authenticate. Such requests carry no email; the service
+	// token's common_name (its client ID) is used as the identity subject.
+	// Requires VerifyJWT, since common_name is only available from the
+	// verified assertion, not the trust-the-header path. Defaults to false.
+	AllowServiceTokens bool
 }
 
 // Provider implements protection.Provider for Cloudflare Access.
@@ -131,6 +137,7 @@ func (p *Provider) Logout(w http.ResponseWriter, r *http.Request) {
 // properly enforcing CF Access ingress.
 func (p *Provider) Authenticate(ctx context.Context, r *http.Request) (protection.Outcome, error) {
 	email := r.Header.Get(p.cfg.UserHeader)
+	commonName := ""
 
 	if p.cfg.VerifyJWT {
 		cfJWT := r.Header.Get(p.cfg.JwtHeader)
@@ -143,15 +150,26 @@ func (p *Provider) Authenticate(ctx context.Context, r *http.Request) (protectio
 			return protection.Outcome{Status: http.StatusUnauthorized}, nil
 		}
 		email = claims.Email
+		commonName = claims.CommonName
 	}
 
-	if email == "" {
-		return protection.Outcome{Status: http.StatusUnauthorized}, nil
+	if email != "" {
+		return protection.Outcome{Identity: &protection.Identity{
+			Subject: email,
+			Email:   email,
+		}}, nil
 	}
-	return protection.Outcome{Identity: &protection.Identity{
-		Subject: email,
-		Email:   email,
-	}}, nil
+
+	// No email means a Cloudflare Access service token (non-identity)
+	// request. When opted in, authenticate it using the token's common_name
+	// (its client ID) as the subject; there is no email to populate.
+	if p.cfg.AllowServiceTokens && commonName != "" {
+		return protection.Outcome{Identity: &protection.Identity{
+			Subject: commonName,
+		}}, nil
+	}
+
+	return protection.Outcome{Status: http.StatusUnauthorized}, nil
 }
 
 // SetVerifier overrides the JWT verifier; intended for tests.

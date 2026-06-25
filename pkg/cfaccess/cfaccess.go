@@ -28,6 +28,10 @@ type Claims struct {
 	jwt.RegisteredClaims
 
 	Email string `json:"email,omitempty"`
+	// CommonName is set by Cloudflare Access for non-identity service-token
+	// requests and carries the service token's client ID. Such assertions
+	// have no email, so it is the only identity signal available for them.
+	CommonName string `json:"common_name,omitempty"`
 	// Identity URL is sometimes useful for debugging, kept for completeness.
 	Identity string `json:"identity_nonce,omitempty"`
 }
@@ -112,8 +116,11 @@ func (v *JWKSVerifier) Verify(ctx context.Context, tokenString string) (*Claims,
 	if !tok.Valid {
 		return nil, errors.New("cfaccess: token not valid")
 	}
-	if claims.Email == "" {
-		return nil, errors.New("cfaccess: assertion missing email claim")
+	// A normal identity assertion carries an email; a service-token
+	// (non-identity) assertion carries a common_name instead. Require at
+	// least one — the provider decides whether a service token is allowed.
+	if claims.Email == "" && claims.CommonName == "" {
+		return nil, errors.New("cfaccess: assertion missing both email and common_name claims")
 	}
 	return claims, nil
 }

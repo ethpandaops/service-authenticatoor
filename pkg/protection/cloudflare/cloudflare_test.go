@@ -16,15 +16,16 @@ import (
 // stubVerifier lets tests substitute the JWT verifier without standing up a
 // real CF JWKS endpoint.
 type stubVerifier struct {
-	email string
-	err   error
+	email      string
+	commonName string
+	err        error
 }
 
 func (s stubVerifier) Verify(_ context.Context, _ string) (*cfaccess.Claims, error) {
 	if s.err != nil {
 		return nil, s.err
 	}
-	return &cfaccess.Claims{Email: s.email}, nil
+	return &cfaccess.Claims{Email: s.email, CommonName: s.commonName}, nil
 }
 
 func newTestProvider(t *testing.T, cfg Config) *Provider {
@@ -114,6 +115,68 @@ func TestProvider_VerifyOn_TrustsAssertionOverHeader(t *testing.T) {
 	}
 	if out.Identity.Email != "verified@example.com" {
 		t.Errorf("email: got %q want %q (verified must win)", out.Identity.Email, "verified@example.com")
+	}
+}
+
+func TestProvider_VerifyOn_ServiceToken_AllowedUsesCommonName(t *testing.T) {
+	p := newTestProvider(t, Config{VerifyJWT: true, TeamDomain: "team.test", AllowServiceTokens: true})
+	// A service token assertion carries no email, only a common_name.
+	p.SetVerifier(stubVerifier{commonName: "ci-bot.access"})
+
+	r := httptest.NewRequest(http.MethodGet, "/auth/token", nil)
+	r.Header.Set(cfaccess.DefaultJWTHeader, "non-empty")
+
+	out, err := p.Authenticate(context.Background(), r)
+	if err != nil {
+		t.Fatalf("auth: %v", err)
+	}
+	if out.Identity == nil {
+		t.Fatalf("expected identity for service token, got status %d", out.Status)
+	}
+	if out.Identity.Subject != "ci-bot.access" {
+		t.Errorf("subject: got %q want %q (service token common_name)", out.Identity.Subject, "ci-bot.access")
+	}
+	if out.Identity.Email != "" {
+		t.Errorf("email: got %q want empty (service tokens have no email)", out.Identity.Email)
+	}
+}
+
+func TestProvider_VerifyOn_ServiceToken_DeniedWhenDisabled(t *testing.T) {
+	p := newTestProvider(t, Config{VerifyJWT: true, TeamDomain: "team.test", AllowServiceTokens: false})
+	p.SetVerifier(stubVerifier{commonName: "ci-bot.access"})
+
+	r := httptest.NewRequest(http.MethodGet, "/auth/token", nil)
+	r.Header.Set(cfaccess.DefaultJWTHeader, "non-empty")
+
+	out, err := p.Authenticate(context.Background(), r)
+	if err != nil {
+		t.Fatalf("auth: %v", err)
+	}
+	if out.Identity != nil {
+		t.Fatal("expected no identity when service tokens are disabled")
+	}
+	if out.Status != http.StatusUnauthorized {
+		t.Errorf("status: got %d, want 401", out.Status)
+	}
+}
+
+func TestProvider_VerifyOn_ServiceToken_EmailWinsOverCommonName(t *testing.T) {
+	p := newTestProvider(t, Config{VerifyJWT: true, TeamDomain: "team.test", AllowServiceTokens: true})
+	// When both are present the email identity must win.
+	p.SetVerifier(stubVerifier{email: "alice@example.com", commonName: "ci-bot.access"})
+
+	r := httptest.NewRequest(http.MethodGet, "/auth/token", nil)
+	r.Header.Set(cfaccess.DefaultJWTHeader, "non-empty")
+
+	out, err := p.Authenticate(context.Background(), r)
+	if err != nil {
+		t.Fatalf("auth: %v", err)
+	}
+	if out.Identity == nil {
+		t.Fatalf("expected identity, got status %d", out.Status)
+	}
+	if out.Identity.Subject != "alice@example.com" || out.Identity.Email != "alice@example.com" {
+		t.Errorf("expected email identity to win, got subject=%q email=%q", out.Identity.Subject, out.Identity.Email)
 	}
 }
 

@@ -75,6 +75,11 @@ cloudflareAccess:
   # this automatically. Default: "Cf-Access-Authenticated-User-Email".
   # The top-level userHeader field is a deprecated alias for this one.
   userHeader: "Cf-Access-Authenticated-User-Email"
+  # Allow non-identity CF Access service tokens to authenticate, using the
+  # token's common_name (its client ID) as the identity subject. Whether a
+  # service token can reach the app at all is still gated by the app's CF
+  # Access policy. Requires verifyJWT. Default: true.
+  allowServiceTokens: true
 
 # ─── HTTP Basic auth (authMode: basic) ────────────────────────────────────────
 
