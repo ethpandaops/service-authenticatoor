@@ -92,7 +92,7 @@
       var s = JSON.parse(raw);
       if (s && typeof s.token === 'string' && typeof s.exp === 'number') return s;
     } catch (e) {}
-    // Unparseable garbage — remove it so it can't wedge every frame.
+    // Unparsable garbage — remove it so it can't wedge every frame.
     try { localStorage.removeItem(KEY_SESSION); } catch (e) {}
     return null;
   }
