@@ -26,13 +26,82 @@ Public (no upstream auth — reachable by JWKS verifiers and browser JS):
 
 - `GET /jwks.json` — RS256 public keys.
 - `GET /.well-known/openid-configuration` — minimal OIDC discovery doc.
-- `GET /client.js` — drop-in browser client library. Exposes
-  `window.ethpandaops.authenticatoor.{checkLogin, login, logout,
-  getToken, isLoggedIn}`. Auth service URL is templated in at serve time.
+- `GET /client-v{n}.js` — drop-in browser client library, exposed as
+  `window.ethpandaops.authenticatoor`. `client-v1.js` is the
+  polling-style API (`{checkLogin, login, logout, getToken, isLoggedIn}`);
+  `client-v2.js` is the shared-session, event-emitting API described
+  below. Auth service URL is templated in at serve time. Served minified
+  with an external source map at `/client-v{n}.js.map`; set
+  `devMode: true` to serve the readable source instead. The legacy
+  `/client.js` path keeps serving v1 for existing consumers.
+- `GET /clientFrame?v=2&origin=…` — HTML shell for the hidden
+  shared-session iframe mounted by the v2 client, with the frame script
+  inlined. The `origin` param must match `allowedReturnHosts` and is
+  pinned via CSP `frame-ancestors`; script execution is pinned to the
+  exact inlined script via a CSP `sha256` hash source.
 - `GET /healthz` — liveness probe.
 - `GET /` — landing page.
 
-## Browser integration
+## Browser integration (v2 — shared session)
+
+```html
+<script src="https://auth.<devnet>.ethpandaops.io/client-v2.js"></script>
+<script>
+  const auth = window.ethpandaops.authenticatoor;
+
+  // Fires on every session change: "unauthenticated" | "authenticated"
+  // | "refreshing". Fired once with the current state right after
+  // subscribing (asynchronously), so it can drive the whole auth UI.
+  auth.addEventListener('status', (info) => {
+    // info = { status, authenticated, user, exp }
+    if (info.authenticated) renderAuthedUI(info);
+    else renderLoginButton();
+  });
+
+  // Bearer token for API calls — resolves to a token with comfortable
+  // remaining validity (refreshed behind the scenes), or null when
+  // unauthenticated.
+  async function callAPI() {
+    const token = await auth.getToken();
+    return fetch('/api/thing', { headers: { Authorization: `Bearer ${token}` } });
+  }
+
+  // login(): resolves true if already authenticated, otherwise runs the
+  // full-page /auth/login redirect flow.
+  document.querySelector('#login').addEventListener('click', () => auth.login());
+
+  // logout(): logs out everywhere — every app and tab converges to
+  // "unauthenticated".
+  document.querySelector('#logout').addEventListener('click', () => auth.logout());
+</script>
+```
+
+How v2 works: the client mounts a hidden iframe on the auth-service
+origin (`/clientFrame`). The frame owns the session — it keeps the token
+in auth-origin `localStorage` (shared by every app's frame), refreshes it
+before expiry with exactly one elected refresher across all tabs (Web
+Locks API), and pushes status changes to each app over origin-checked
+`postMessage`. The raw token never touches app-origin storage.
+
+Because browsers partition third-party-iframe storage **and cookies** by
+top-level site (eTLD+1), the full v2 behavior requires apps and the auth
+service to share a **registrable domain** (e.g. `*.<devnet>.ethpandaops.io`).
+On a foreign-domain app the frame cannot see the auth session cookie
+(Firefox's Total Cookie Protection partitions it for every cross-site
+embed), so silent refresh is unavailable there: the token captured from
+the `/auth/login` redirect is kept until it expires, then the user goes
+through the full-page login again.
+
+Local-dev pitfall: `localhost` is itself the effective TLD, so
+`auth.localhost` and `app.localhost` (or `localhost:<port>`) are
+*different sites* and Firefox will not send the cookie from the frame.
+Either run everything on plain `localhost:<port>`s, or give every host a
+shared parent zone (`auth.dev.localhost` + `app.dev.localhost`).
+
+v1 remains available (and the default) for existing consumers; it is
+unchanged.
+
+## Browser integration (v1)
 
 ```html
 <script src="https://auth.<devnet>.ethpandaops.io/client.js"></script>

@@ -41,7 +41,8 @@ const indexHTML = `<!doctype html>
 <li><code>/auth/logout</code> — provider-dispatched logout (clears session cookie / rotates Basic realm / etc.)</li>
 <li><code>/jwks.json</code> — public keys (for verifiers)</li>
 <li><code>/.well-known/openid-configuration</code> — discovery</li>
-<li><code>/client.js</code> — drop-in browser client (<code>window.ethpandaops.authenticatoor</code>)</li>
+<li><code>/client-v{1|2}.js</code> — drop-in browser client (<code>window.ethpandaops.authenticatoor</code>); v2 adds shared-session token management. <code>/client.js</code> stays as the legacy v1 path</li>
+<li><code>/clientFrame?v=2&amp;origin=…</code> — hidden shared-session iframe page mounted by the v2 client (frame script inlined, hash-pinned CSP)</li>
 </ul>
 </body>
 </html>

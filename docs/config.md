@@ -51,6 +51,7 @@ allow-list, CORS origins) or covered by sensible defaults.
 | `scopePattern`                         | string      | `*.<parent zone>`                    | JWT `scope` (host wildcard).                                          |
 | `tokenTTL`                             | duration    | `30m`                                | JWT lifetime.                                                         |
 | `authMode`                             | string      | `cloudflare`                         | `cloudflare`, `basic`, `any`, `github`, or `oidc`. See **Protection modes** below. |
+| `devMode`                              | bool        | `false`                              | Serve client scripts unminified for local development (no source maps generated). |
 | `userHeader`                           | string      | `Cf-Access-Authenticated-User-Email` | **Deprecated** alias for `cloudflareAccess.userHeader`. Folded in by Load when the new field is empty; emits a startup warning when both are set. |
 | `allowedReturnHosts`                   | string list | `["*.<parent zone>"]`                | Hosts allowed in `/auth/login?return_to=…`.                           |
 | `cors.allowedOrigins`                  | string list | = `allowedReturnHosts`               | Browsers allowed to call `/auth/*` with credentials.                  |
