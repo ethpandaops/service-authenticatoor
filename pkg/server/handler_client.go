@@ -30,7 +30,8 @@ type builtClientAsset struct {
 // Templating runs BEFORE minification so generated source maps line up
 // with the served bytes. Outside dev mode the script is minified
 // (comments stripped, whitespace collapsed, local identifiers mangled —
-// the scripts are IIFEs, so nearly every identifier is local); a
+// the scripts are immediately-invoked function expressions, so nearly
+// every identifier is local); a
 // non-empty sourceURL additionally generates an external source map
 // embedding the templated source. sourceURL must be the script's own
 // public URL (relative to the map's URL, e.g. "client-v2.js") — that
