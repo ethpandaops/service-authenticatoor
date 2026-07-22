@@ -169,6 +169,8 @@ func (s *Server) routes() http.Handler {
 	r.HandleFunc("/jwks.json", s.handleJWKS).Methods(http.MethodGet)
 	r.HandleFunc("/.well-known/openid-configuration", s.handleOIDCConfig).Methods(http.MethodGet)
 	r.HandleFunc("/client.js", s.handleClientJS).Methods(http.MethodGet)
+	r.HandleFunc("/client.frame.js", s.handleClientFrameJS).Methods(http.MethodGet)
+	r.HandleFunc("/clientFrame", s.handleClientFrame).Methods(http.MethodGet)
 	r.HandleFunc("/", s.handleIndex).Methods(http.MethodGet)
 
 	// Provider-owned auxiliary routes (e.g. /auth/oauth/callback). These

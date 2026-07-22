@@ -163,6 +163,34 @@ cloudflareAccess:
 	}
 }
 
+func TestLoad_SingleLabelIssuerWithExplicitFields(t *testing.T) {
+	// A parent-zone-less issuer host (local dev on plain localhost) must
+	// load as long as every zone-derived field is set explicitly.
+	p := writeTempConfig(t, `
+issuer: "http://localhost:18080"
+audience:
+  - "localhost"
+scopePattern: "localhost"
+allowedReturnHosts:
+  - "localhost"
+signing:
+  rs256:
+    privateKeyFile: "/etc/keys/private.pem"
+cloudflareAccess:
+  verifyJWT: false
+`)
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.ExternalURL != "http://localhost:18080" {
+		t.Errorf("externalURL: got %q", cfg.ExternalURL)
+	}
+	if got, want := cfg.CORS.AllowedOrigins[0], "localhost"; got != want {
+		t.Errorf("corsOrigins: got %q want %q", got, want)
+	}
+}
+
 func TestLoad_AuthModeDefaultsToCloudflare(t *testing.T) {
 	p := writeTempConfig(t, `
 issuer: "https://auth.foo.example"

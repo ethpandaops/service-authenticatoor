@@ -1,5 +1,6 @@
 /bin/
 /dist/
+/ai_plans/
 /authenticatoor
 /temp-*
 *.test

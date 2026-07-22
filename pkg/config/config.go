@@ -287,21 +287,38 @@ func (c *Config) applyDerived() error {
 	if c.Issuer == "" {
 		return errors.New("issuer is required")
 	}
-	parent, err := parentZone(c.Issuer)
-	if err != nil {
-		return err
+	// The parent zone is only needed to fill in unset defaults below. A
+	// single-label issuer host (e.g. http://localhost:18080 in local dev)
+	// has no parent zone, but is fine as long as every zone-derived field
+	// is set explicitly — so the error is deferred until a derivation
+	// actually needs it.
+	parent, parentErr := parentZone(c.Issuer)
+	needParent := func(field string) error {
+		if parentErr != nil {
+			return fmt.Errorf("%s not set and no default can be derived: %w", field, parentErr)
+		}
+		return nil
 	}
 
 	if c.ExternalURL == "" {
 		c.ExternalURL = c.Issuer
 	}
 	if len(c.Audience) == 0 {
+		if err := needParent("audience"); err != nil {
+			return err
+		}
 		c.Audience = []string{parent}
 	}
 	if c.ScopePattern == "" {
+		if err := needParent("scopePattern"); err != nil {
+			return err
+		}
 		c.ScopePattern = "*." + parent
 	}
 	if len(c.AllowedReturnHosts) == 0 {
+		if err := needParent("allowedReturnHosts"); err != nil {
+			return err
+		}
 		c.AllowedReturnHosts = []string{"*." + parent}
 	}
 	if len(c.CORS.AllowedOrigins) == 0 {
