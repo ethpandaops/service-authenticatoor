@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gorilla/mux"
@@ -40,6 +41,12 @@ type Server struct {
 
 	main    *http.Server
 	metrics *http.Server
+
+	// Built (templated + optionally minified/mapped) client scripts,
+	// keyed by embed path plus variant. Sources and cfg are immutable, so
+	// entries are built once on first use.
+	clientAssetMu    sync.Mutex
+	clientAssetCache map[string]*builtClientAsset
 
 	tokensIssued     prometheus.Counter
 	tokenIssueErrors *prometheus.CounterVec
@@ -76,10 +83,11 @@ func New(opts Options) (*Server, error) {
 	}
 
 	s := &Server{
-		cfg:      opts.Config,
-		issuer:   opts.Issuer,
-		provider: opts.Provider,
-		log:      opts.Log.WithField("package", "server"),
+		cfg:              opts.Config,
+		issuer:           opts.Issuer,
+		provider:         opts.Provider,
+		log:              opts.Log.WithField("package", "server"),
+		clientAssetCache: make(map[string]*builtClientAsset, 4),
 	}
 	s.registerMetrics(opts.Registry)
 	s.main = &http.Server{
@@ -169,7 +177,8 @@ func (s *Server) routes() http.Handler {
 	r.HandleFunc("/jwks.json", s.handleJWKS).Methods(http.MethodGet)
 	r.HandleFunc("/.well-known/openid-configuration", s.handleOIDCConfig).Methods(http.MethodGet)
 	r.HandleFunc("/client.js", s.handleClientJS).Methods(http.MethodGet)
-	r.HandleFunc("/client.frame.js", s.handleClientFrameJS).Methods(http.MethodGet)
+	r.HandleFunc("/client-v{version:[0-9]{1,2}}.js", s.handleClientJSVersioned).Methods(http.MethodGet)
+	r.HandleFunc("/client-v{version:[0-9]{1,2}}.js.map", s.handleClientJSMap).Methods(http.MethodGet)
 	r.HandleFunc("/clientFrame", s.handleClientFrame).Methods(http.MethodGet)
 	r.HandleFunc("/", s.handleIndex).Methods(http.MethodGet)
 

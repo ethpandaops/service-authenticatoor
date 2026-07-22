@@ -40,7 +40,7 @@
 //
 // Load exactly one client version per page. The auth service URL is
 // templated into the file at serve time; load it as
-// `<script src="https://auth.<devnet>/client.js?v=2"></script>`.
+// `<script src="https://auth.<devnet>/client-v2.js"></script>`.
 
 (function () {
   'use strict';

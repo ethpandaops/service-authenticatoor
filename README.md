@@ -26,26 +26,26 @@ Public (no upstream auth — reachable by JWKS verifiers and browser JS):
 
 - `GET /jwks.json` — RS256 public keys.
 - `GET /.well-known/openid-configuration` — minimal OIDC discovery doc.
-- `GET /client.js?v=1|2` — drop-in browser client library, exposed as
-  `window.ethpandaops.authenticatoor`. `v=1` (the default) is the
+- `GET /client-v{n}.js` — drop-in browser client library, exposed as
+  `window.ethpandaops.authenticatoor`. `client-v1.js` is the
   polling-style API (`{checkLogin, login, logout, getToken, isLoggedIn}`);
-  `v=2` is the shared-session, event-emitting API described below. Auth
-  service URL is templated in at serve time.
+  `client-v2.js` is the shared-session, event-emitting API described
+  below. Auth service URL is templated in at serve time. Served minified
+  with an external source map at `/client-v{n}.js.map`; set
+  `devMode: true` to serve the readable source instead. The legacy
+  `/client.js` path keeps serving v1 for existing consumers.
 - `GET /clientFrame?v=2&origin=…` — HTML shell for the hidden
-  shared-session iframe mounted by the v2 client. The `origin` param must
-  match `allowedReturnHosts` and is pinned via CSP `frame-ancestors`.
-- `GET /client.frame.js?v=2` — the script running inside that iframe.
+  shared-session iframe mounted by the v2 client, with the frame script
+  inlined. The `origin` param must match `allowedReturnHosts` and is
+  pinned via CSP `frame-ancestors`; script execution is pinned to the
+  exact inlined script via a CSP `sha256` hash source.
 - `GET /healthz` — liveness probe.
 - `GET /` — landing page.
-
-When deploying behind an authenticating proxy, `/clientFrame` and
-`/client.frame.js` must be exempted from upstream auth exactly like
-`/client.js` — they are loaded before the user is authenticated.
 
 ## Browser integration (v2 — shared session)
 
 ```html
-<script src="https://auth.<devnet>.ethpandaops.io/client.js?v=2"></script>
+<script src="https://auth.<devnet>.ethpandaops.io/client-v2.js"></script>
 <script>
   const auth = window.ethpandaops.authenticatoor;
 

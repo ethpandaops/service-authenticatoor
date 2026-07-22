@@ -41,6 +41,11 @@ type Config struct {
 	// "cloudflare" so existing configs keep working unchanged.
 	AuthMode string `yaml:"authMode" mapstructure:"authMode"`
 
+	// DevMode disables production optimizations for local development:
+	// the client scripts are served unminified (readable as-is, so no
+	// source maps are generated or served).
+	DevMode bool `yaml:"devMode" mapstructure:"devMode"`
+
 	Audience     []string      `yaml:"audience" mapstructure:"audience"`
 	ScopePattern string        `yaml:"scopePattern" mapstructure:"scopePattern"`
 	TokenTTL     time.Duration `yaml:"tokenTTL" mapstructure:"tokenTTL"`
