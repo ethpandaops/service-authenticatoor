@@ -27,7 +27,7 @@ import (
 // Defaults applied when the corresponding Config field is empty.
 const (
 	DefaultCookieName = "authenticatoor_anyauth_user"
-	DefaultLoginPath  = "/auth/anyauth/login"
+	DefaultLoginPath  = "/anyauth/login"
 	DefaultCookieTTL  = 12 * time.Hour
 
 	// maxUsernameLen caps an accepted username. Keeps the cookie short
@@ -42,7 +42,7 @@ type Config struct {
 	CookieName string
 	// LoginPath is the path of the login form, registered on the parent
 	// router so it bypasses the auth middleware. Defaults to
-	// "/auth/anyauth/login".
+	// "/anyauth/login".
 	LoginPath string
 	// CookieTTL is the cookie lifetime. Defaults to 12h.
 	CookieTTL time.Duration
@@ -56,7 +56,10 @@ type Provider struct {
 	tmpl *template.Template
 }
 
-var _ protection.Provider = (*Provider)(nil)
+var (
+	_ protection.Provider       = (*Provider)(nil)
+	_ protection.SessionClearer = (*Provider)(nil)
+)
 
 // New constructs a Provider.
 func New(log logrus.FieldLogger, cfg Config) *Provider {
@@ -96,6 +99,19 @@ func (p *Provider) RegisterRoutes(r *mux.Router) {
 	r.HandleFunc(p.cfg.LoginPath, p.handleLoginSubmit).Methods(http.MethodPost)
 }
 
+// LoginURL returns the login form path carrying returnTo.
+func (p *Provider) LoginURL(returnTo string) string {
+	v := url.Values{}
+	v.Set("return_to", returnTo)
+	return p.cfg.LoginPath + "?" + v.Encode()
+}
+
+// ClearSessionCookie returns a cookie that clears the username cookie.
+// Used by the server's multi-provider logout.
+func (p *Provider) ClearSessionCookie() *http.Cookie {
+	return p.clearCookie()
+}
+
 // Logout clears the username cookie. Subsequent /auth/* requests redirect
 // to the login form.
 func (p *Provider) Logout(w http.ResponseWriter, _ *http.Request) {
@@ -117,10 +133,8 @@ func (p *Provider) Authenticate(_ context.Context, r *http.Request) (protection.
 			}}, nil
 		}
 	}
-	v := url.Values{}
-	v.Set("return_to", r.URL.RequestURI())
 	return protection.Outcome{
-		RedirectTo: p.cfg.LoginPath + "?" + v.Encode(),
+		RedirectTo: p.LoginURL(r.URL.RequestURI()),
 	}, nil
 }
 
@@ -128,10 +142,7 @@ func (p *Provider) Authenticate(_ context.Context, r *http.Request) (protection.
 // echoed back into a hidden field so the POST handler knows where to send
 // the user.
 func (p *Provider) handleLoginForm(w http.ResponseWriter, r *http.Request) {
-	returnTo := r.URL.Query().Get("return_to")
-	if !isSafeReturnTo(returnTo) {
-		returnTo = "/"
-	}
+	returnTo := protection.SafeReturnTo(r.URL.Query().Get("return_to"))
 	p.renderForm(w, http.StatusOK, formData{
 		Action:   p.cfg.LoginPath,
 		ReturnTo: returnTo,
@@ -147,10 +158,7 @@ func (p *Provider) handleLoginSubmit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	rawUser := r.PostForm.Get("user")
-	returnTo := r.PostForm.Get("return_to")
-	if !isSafeReturnTo(returnTo) {
-		returnTo = "/"
-	}
+	returnTo := protection.SafeReturnTo(r.PostForm.Get("return_to"))
 
 	user := sanitizeUsername(rawUser)
 	if user == "" {
@@ -233,19 +241,6 @@ func sanitizeUsername(in string) string {
 		}
 	}
 	return s
-}
-
-// isSafeReturnTo accepts only relative paths that don't trigger a
-// protocol-relative redirect (// or /\). Empty values are rejected so the
-// caller can fall back to "/".
-func isSafeReturnTo(s string) bool {
-	if s == "" || !strings.HasPrefix(s, "/") {
-		return false
-	}
-	if strings.HasPrefix(s, "//") || strings.HasPrefix(s, "/\\") {
-		return false
-	}
-	return true
 }
 
 const loginFormTmpl = `<!doctype html>

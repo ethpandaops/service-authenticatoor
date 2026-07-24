@@ -107,7 +107,7 @@ func newTestProvider(t *testing.T, gh *stubGitHub, allowedOrgs ...string) *Provi
 	return p
 }
 
-func TestGitHub_Authenticate_NoSession_RedirectsToAuthorize(t *testing.T) {
+func TestGitHub_Authenticate_NoSession_RedirectsToLogin(t *testing.T) {
 	gh := newStubGitHub(t)
 	p := newTestProvider(t, gh, "ethpandaops")
 
@@ -116,13 +116,33 @@ func TestGitHub_Authenticate_NoSession_RedirectsToAuthorize(t *testing.T) {
 	if err != nil {
 		t.Fatalf("auth: %v", err)
 	}
-	if out.RedirectTo == "" {
-		t.Fatal("expected redirect")
+	if !strings.HasPrefix(out.RedirectTo, DefaultLoginPath+"?") {
+		t.Errorf("redirect: got %q, want %s?...", out.RedirectTo, DefaultLoginPath)
 	}
-	if !strings.HasPrefix(out.RedirectTo, gh.server.URL+"/login/oauth/authorize") {
-		t.Errorf("redirect: %q", out.RedirectTo)
+	if !strings.Contains(out.RedirectTo, "return_to=%2Fauth%2Ftoken%3Faud%3Dfoo") {
+		t.Errorf("redirect missing return_to: %q", out.RedirectTo)
 	}
-	u, err := url.Parse(out.RedirectTo)
+	if len(out.SetCookies) != 0 {
+		t.Errorf("passive Authenticate must not set cookies, got %d", len(out.SetCookies))
+	}
+}
+
+func TestGitHub_LoginStart_RedirectsToAuthorize(t *testing.T) {
+	gh := newStubGitHub(t)
+	p := newTestProvider(t, gh, "ethpandaops")
+
+	r := httptest.NewRequest(http.MethodGet, DefaultLoginPath+"?return_to=%2Fauth%2Ftoken", nil)
+	rr := httptest.NewRecorder()
+	p.handleLoginStart(rr, r)
+
+	if rr.Code != http.StatusFound {
+		t.Fatalf("status: got %d", rr.Code)
+	}
+	loc := rr.Header().Get("Location")
+	if !strings.HasPrefix(loc, gh.server.URL+"/login/oauth/authorize") {
+		t.Errorf("redirect: %q", loc)
+	}
+	u, err := url.Parse(loc)
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
@@ -135,13 +155,14 @@ func TestGitHub_Authenticate_NoSession_RedirectsToAuthorize(t *testing.T) {
 	if u.Query().Get("state") == "" {
 		t.Error("state empty")
 	}
-	if len(out.SetCookies) != 1 {
-		t.Fatalf("expected one state cookie, got %d", len(out.SetCookies))
+	cookies := rr.Result().Cookies()
+	if len(cookies) != 1 {
+		t.Fatalf("expected one state cookie, got %d", len(cookies))
 	}
-	if out.SetCookies[0].Name != DefaultStateCookieName {
-		t.Errorf("state cookie name: %q", out.SetCookies[0].Name)
+	if cookies[0].Name != DefaultStateCookieName {
+		t.Errorf("state cookie name: %q", cookies[0].Name)
 	}
-	if !out.SetCookies[0].HttpOnly {
+	if !cookies[0].HttpOnly {
 		t.Error("state cookie should be HttpOnly")
 	}
 }

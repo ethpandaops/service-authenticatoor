@@ -44,7 +44,8 @@ import (
 
 // Defaults applied when corresponding Config fields are empty.
 const (
-	DefaultCallbackPath      = "/auth/oidc/callback"
+	DefaultLoginPath         = "/oidc/login"
+	DefaultCallbackPath      = "/oidc/callback"
 	DefaultSessionCookieName = "authenticatoor_oidc_session"
 	DefaultStateCookieName   = "authenticatoor_oidc_state"
 	DefaultSessionTTL        = 12 * time.Hour
@@ -96,11 +97,15 @@ type Config struct {
 	// Required.
 	SessionKey []byte
 
+	// LoginPath is the interactive login entry: it sets the state cookie
+	// and redirects to the IdP's authorize endpoint. Defaults to
+	// "/oidc/login".
+	LoginPath string
 	// CallbackPath is the local path that handles the OIDC callback.
 	// In a relay-fronted deployment, the IdP only ever sees CallbackURL
 	// (the relay's URL) and the relay forwards to <PublicURL><CallbackPath>.
 	// In a direct deployment, CallbackURL should equal
-	// <PublicURL><CallbackPath>. Default "/auth/oidc/callback".
+	// <PublicURL><CallbackPath>. Default "/oidc/callback".
 	CallbackPath string
 	// SessionCookieName is the name of the session cookie. Default
 	// "authenticatoor_oidc_session".
@@ -156,11 +161,17 @@ type Provider struct {
 	cookieSecure  bool
 }
 
-var _ protection.Provider = (*Provider)(nil)
+var (
+	_ protection.Provider       = (*Provider)(nil)
+	_ protection.SessionClearer = (*Provider)(nil)
+)
 
 // New constructs a Provider. Defaults are filled in here; secret material,
 // discovery fetch, and JWKS load happen in Start.
 func New(log logrus.FieldLogger, cfg Config) *Provider {
+	if cfg.LoginPath == "" {
+		cfg.LoginPath = DefaultLoginPath
+	}
 	if cfg.CallbackPath == "" {
 		cfg.CallbackPath = DefaultCallbackPath
 	}
@@ -246,17 +257,23 @@ func (p *Provider) Start(ctx context.Context) error {
 // Stop is a no-op.
 func (p *Provider) Stop() error { return nil }
 
-// RegisterRoutes attaches the OIDC callback handler. It runs on the
-// parent router (not the /auth/* subrouter) so the auth middleware is
-// bypassed — the request IS the act of authenticating.
+// RegisterRoutes attaches the login entry and the OIDC callback handler.
+// They run on the parent router (not the /auth/* subrouter) so the auth
+// middleware is bypassed — the request IS the act of authenticating.
 func (p *Provider) RegisterRoutes(r *mux.Router) {
+	r.HandleFunc(p.cfg.LoginPath, p.handleLoginStart).Methods(http.MethodGet)
 	r.HandleFunc(p.cfg.CallbackPath, p.handleCallback).Methods(http.MethodGet)
 }
 
+// LoginURL returns the login entry path carrying returnTo.
+func (p *Provider) LoginURL(returnTo string) string {
+	v := url.Values{}
+	v.Set("return_to", returnTo)
+	return p.cfg.LoginPath + "?" + v.Encode()
+}
+
 // Authenticate looks for a valid session cookie. When absent or stale the
-// provider returns a redirect to the IdP's authorize endpoint, with a
-// signed state cookie that carries the OIDC nonce + the original request
-// URL so the callback can complete the round-trip.
+// outcome redirects to the login entry, which starts the OIDC flow.
 func (p *Provider) Authenticate(_ context.Context, r *http.Request) (protection.Outcome, error) {
 	if c, err := r.Cookie(p.cfg.SessionCookieName); err == nil {
 		sub, email, perr := session.Parse(p.sessionSecret, c.Value, p.cfg.Now())
@@ -266,18 +283,32 @@ func (p *Provider) Authenticate(_ context.Context, r *http.Request) (protection.
 				Email:   email,
 			}}, nil
 		}
-		p.log.WithError(perr).Debug("session cookie invalid; redirecting to IdP")
+		p.log.WithError(perr).Debug("session cookie invalid; redirecting to login")
 	}
 
+	return protection.Outcome{RedirectTo: p.LoginURL(r.URL.RequestURI())}, nil
+}
+
+// handleLoginStart begins the OIDC dance: mint the nonce, bind it to the
+// (sanitized) return_to in the signed state cookie, and redirect to the
+// IdP's authorize endpoint. The nonce doubles as the id_token `nonce`
+// claim (replay defense) — see the package comment for the state
+// encoding contract.
+func (p *Provider) handleLoginStart(w http.ResponseWriter, r *http.Request) {
 	nonce, err := session.NewNonce()
 	if err != nil {
-		return protection.Outcome{}, fmt.Errorf("oidc: nonce: %w", err)
+		p.log.WithError(err).Error("nonce generation failed")
+		http.Error(w, "state error", http.StatusInternalServerError)
+		return
 	}
-	stateBlob, err := session.SignState(p.sessionSecret, nonce, r.URL.RequestURI(), p.cfg.Now(), DefaultStateTTL)
+	returnTo := protection.SafeReturnTo(r.URL.Query().Get("return_to"))
+	stateBlob, err := session.SignState(p.sessionSecret, nonce, returnTo, p.cfg.Now(), DefaultStateTTL)
 	if err != nil {
-		return protection.Outcome{}, fmt.Errorf("oidc: sign state: %w", err)
+		p.log.WithError(err).Error("state signing failed")
+		http.Error(w, "state error", http.StatusInternalServerError)
+		return
 	}
-	stateCookie := &http.Cookie{
+	http.SetCookie(w, &http.Cookie{
 		Name:     p.cfg.StateCookieName,
 		Value:    stateBlob,
 		Path:     p.cfg.CallbackPath,
@@ -285,12 +316,9 @@ func (p *Provider) Authenticate(_ context.Context, r *http.Request) (protection.
 		HttpOnly: true,
 		Secure:   p.cookieSecure,
 		SameSite: http.SameSiteLaxMode,
-	}
-
-	return protection.Outcome{
-		RedirectTo: p.authorizeRedirect(nonce),
-		SetCookies: []*http.Cookie{stateCookie},
-	}, nil
+	})
+	w.Header().Set("Cache-Control", "no-store")
+	http.Redirect(w, r, p.authorizeRedirect(nonce), http.StatusFound)
 }
 
 // authorizeRedirect builds the IdP authorize URL. The state parameter

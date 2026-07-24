@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"regexp"
 	"slices"
 	"strings"
 	"time"
@@ -20,8 +21,9 @@ import (
 	"github.com/spf13/viper"
 )
 
-// AuthMode names the active protection provider. Exactly one provider
-// gates /auth/* per process.
+// AuthMode names a protection provider type. Providers are configured
+// via the providers list; the legacy top-level authMode field promotes
+// to a single-entry list.
 const (
 	AuthModeCloudflare = "cloudflare"
 	AuthModeBasic      = "basic"
@@ -30,6 +32,30 @@ const (
 	AuthModeOIDC       = "oidc"
 )
 
+// legacyProviderNames maps a provider type to the instance name used
+// when converting the legacy top-level blocks (authMode naming types)
+// into providers entries. Explicit providers entries must set their own
+// name. The name doubles as the provider's path prefix: /<name>/login,
+// /<name>/callback, /<name>/token.
+var legacyProviderNames = map[string]string{
+	AuthModeCloudflare: "cfaccess",
+	AuthModeBasic:      "htpasswd",
+	AuthModeAny:        "anyauth",
+	AuthModeGitHub:     "github",
+	AuthModeOIDC:       "oidc",
+}
+
+// reservedProviderNames are path segments already claimed by the server's
+// own routes; a provider name colliding with one would shadow them.
+var reservedProviderNames = map[string]struct{}{
+	"auth":        {},
+	"login":       {},
+	"healthz":     {},
+	"clientFrame": {},
+	"metrics":     {},
+	"cdn-cgi":     {},
+}
+
 // Config is the resolved, validated, derivation-applied configuration of the
 // authenticatoor service.
 type Config struct {
@@ -37,9 +63,28 @@ type Config struct {
 	Issuer      string `yaml:"issuer" mapstructure:"issuer"`
 	ExternalURL string `yaml:"externalURL" mapstructure:"externalURL"`
 
-	// AuthMode names the active protection provider. Defaults to
-	// "cloudflare" so existing configs keep working unchanged.
-	AuthMode string `yaml:"authMode" mapstructure:"authMode"`
+	// AuthMode names the provider(s) actively advertised to
+	// unauthenticated users — a single string or a list (viper also
+	// accepts a comma-separated env value). With one entry,
+	// unauthenticated /auth/* requests go straight into that provider's
+	// login flow; with several, they land on the /login provider
+	// selection page listing exactly these entries. ALL defined
+	// providers stay enabled regardless — they authenticate in the
+	// passive chain and their login routes remain reachable directly;
+	// authMode only controls what is advertised. Entries reference
+	// providers-list entries by name. When the providers list is empty,
+	// each entry instead names a provider type whose legacy top-level
+	// block is converted into a providers entry. Defaults to all
+	// configured providers (or "cloudflare" when nothing is configured
+	// at all).
+	AuthMode []string `yaml:"authMode" mapstructure:"authMode"`
+
+	// Providers configures the protection provider instances gating
+	// /auth/*. Each entry mounts its interactive routes under its own
+	// path prefix ("/<name>/login", ...). This is the canonical form;
+	// when empty, entries are converted from the authMode field and the
+	// legacy top-level provider blocks below.
+	Providers []ProviderConfig `yaml:"providers" mapstructure:"providers"`
 
 	// DevMode disables production optimizations for local development:
 	// the client scripts are served unminified (readable as-is, so no
@@ -71,9 +116,31 @@ type Config struct {
 	DeprecationWarnings []string `yaml:"-" mapstructure:"-"`
 }
 
+// ProviderConfig configures one protection provider instance. Exactly
+// the block matching Type is read; the others are ignored.
+type ProviderConfig struct {
+	// Name is the instance name, used as the path prefix for the
+	// provider's routes (/<name>/login, /<name>/callback, /<name>/token),
+	// as the label on the provider selector page, and as the reference
+	// key in authMode. Required; unique; lowercase [a-z0-9-].
+	Name string `yaml:"name" mapstructure:"name"`
+	// Type selects the provider implementation: cloudflare | basic |
+	// any | github | oidc. Required.
+	Type string `yaml:"type" mapstructure:"type"`
+
+	CloudflareAccess CloudflareAccessConfig `yaml:"cloudflareAccess" mapstructure:"cloudflareAccess"`
+	BasicAuth        BasicAuthConfig        `yaml:"basicAuth" mapstructure:"basicAuth"`
+	AnyAuth          AnyAuthConfig          `yaml:"anyAuth" mapstructure:"anyAuth"`
+	GitHubOAuth      GitHubOAuthConfig      `yaml:"githubOAuth" mapstructure:"githubOAuth"`
+	OIDC             OIDCConfig             `yaml:"oidc" mapstructure:"oidc"`
+}
+
 // CloudflareAccessConfig configures the cloudflare protection provider.
+// The two booleans are pointers so an entry in the providers list can
+// distinguish "unset" (secure default: true) from an explicit false —
+// viper defaults only reach the legacy top-level block, not list entries.
 type CloudflareAccessConfig struct {
-	VerifyJWT  bool   `yaml:"verifyJWT" mapstructure:"verifyJWT"`
+	VerifyJWT  *bool  `yaml:"verifyJWT" mapstructure:"verifyJWT"`
 	TeamDomain string `yaml:"teamDomain" mapstructure:"teamDomain"`
 	AudTag     string `yaml:"audTag" mapstructure:"audTag"`
 	JwtHeader  string `yaml:"jwtHeader" mapstructure:"jwtHeader"`
@@ -86,17 +153,40 @@ type CloudflareAccessConfig struct {
 	// authenticate, using the token's common_name (client ID) as the
 	// identity subject. Whether a service token can reach the app at all is
 	// still gated by the app's CF Access policy. Defaults to true.
-	AllowServiceTokens bool `yaml:"allowServiceTokens" mapstructure:"allowServiceTokens"`
+	AllowServiceTokens *bool `yaml:"allowServiceTokens" mapstructure:"allowServiceTokens"`
+	// SessionCookieName overrides the session cookie name. Defaults to
+	// "authenticatoor_<name>_session".
+	SessionCookieName string `yaml:"sessionCookieName" mapstructure:"sessionCookieName"`
+	// SessionTTL is the session cookie lifetime for logins minted at
+	// the provider's login entry (/<name>/login). Defaults to "12h".
+	SessionTTL time.Duration `yaml:"sessionTTL" mapstructure:"sessionTTL"`
+}
+
+// VerifyJWTEnabled reports the effective verifyJWT setting (unset = true).
+func (c CloudflareAccessConfig) VerifyJWTEnabled() bool {
+	return c.VerifyJWT == nil || *c.VerifyJWT
+}
+
+// ServiceTokensAllowed reports the effective allowServiceTokens setting
+// (unset = true).
+func (c CloudflareAccessConfig) ServiceTokensAllowed() bool {
+	return c.AllowServiceTokens == nil || *c.AllowServiceTokens
 }
 
 // BasicAuthConfig configures the basic protection provider.
 type BasicAuthConfig struct {
 	// HtpasswdFile is the path to the htpasswd password file. Required
-	// when authMode is "basic".
+	// for basic providers.
 	HtpasswdFile string `yaml:"htpasswdFile" mapstructure:"htpasswdFile"`
 	// Realm is the value sent in WWW-Authenticate. Defaults to
 	// "authenticatoor".
 	Realm string `yaml:"realm" mapstructure:"realm"`
+	// SessionCookieName overrides the session cookie name. Defaults to
+	// "authenticatoor_<name>_session".
+	SessionCookieName string `yaml:"sessionCookieName" mapstructure:"sessionCookieName"`
+	// SessionTTL is the session cookie lifetime for logins minted at
+	// the provider's login entry (/<name>/login). Defaults to "12h".
+	SessionTTL time.Duration `yaml:"sessionTTL" mapstructure:"sessionTTL"`
 }
 
 // AnyAuthConfig configures the anyauth (dev-only) protection provider.
@@ -105,9 +195,6 @@ type AnyAuthConfig struct {
 	// CookieName overrides the username cookie name. Defaults to
 	// "authenticatoor_anyauth_user".
 	CookieName string `yaml:"cookieName" mapstructure:"cookieName"`
-	// LoginPath overrides the login form path. Defaults to
-	// "/auth/anyauth/login".
-	LoginPath string `yaml:"loginPath" mapstructure:"loginPath"`
 	// CookieTTL overrides the cookie lifetime. Defaults to "12h".
 	CookieTTL time.Duration `yaml:"cookieTTL" mapstructure:"cookieTTL"`
 }
@@ -126,7 +213,7 @@ type GitHubOAuthConfig struct {
 	// configure here.
 
 	// CallbackPath is the path of the OAuth redirect URI registered
-	// publicly. Default "/auth/oauth/callback".
+	// publicly. Defaults to "/<name>/callback".
 	CallbackPath string `yaml:"callbackPath" mapstructure:"callbackPath"`
 	// SessionCookieName is the name of the session cookie. Default
 	// "authenticatoor_session".
@@ -150,7 +237,7 @@ type OIDCConfig struct {
 	// CallbackURL is the absolute URL registered at the IdP as this
 	// client's redirect_uri. In a relay-fronted deployment that's the
 	// relay's URL (shared across every authenticatoor instance); in a
-	// direct deployment that's <externalURL>/auth/oidc/callback. Required.
+	// direct deployment that's <externalURL>/oidc/callback. Required.
 	CallbackURL string `yaml:"callbackURL" mapstructure:"callbackURL"`
 
 	// ClientID is the OAuth client_id registered at the IdP. Required.
@@ -161,8 +248,8 @@ type OIDCConfig struct {
 	ClientSecret     string `yaml:"clientSecret" mapstructure:"clientSecret"`
 	ClientSecretFile string `yaml:"clientSecretFile" mapstructure:"clientSecretFile"`
 
-	// CallbackPath is the local path the relay forwards to. Default
-	// "/auth/oidc/callback".
+	// CallbackPath is the local path the relay forwards to. Defaults to
+	// "/<name>/callback".
 	CallbackPath string `yaml:"callbackPath" mapstructure:"callbackPath"`
 	// SessionCookieName overrides the session cookie name. Default
 	// "authenticatoor_oidc_session".
@@ -259,15 +346,18 @@ func Load(path string) (*Config, error) {
 func setDefaults(v *viper.Viper) {
 	v.SetDefault("listen", ":8080")
 	v.SetDefault("tokenTTL", "30m")
-	v.SetDefault("authMode", AuthModeCloudflare)
+	// authMode has no viper default: applyDerived distinguishes "unset"
+	// (→ all configured providers, or cloudflare) from an explicit value.
 
 	// Deprecated top-level alias. Kept defaulted so existing configs
 	// continue to populate cloudflareAccess.userHeader via applyDerived
 	// without explicit migration.
 	v.SetDefault("userHeader", "Cf-Access-Authenticated-User-Email")
 
-	v.SetDefault("cloudflareAccess.verifyJWT", true)
-	v.SetDefault("cloudflareAccess.allowServiceTokens", true)
+	// cloudflareAccess.verifyJWT / allowServiceTokens intentionally have
+	// no viper defaults: they are *bool fields whose nil value means
+	// "true", so entries in the providers list get the same secure
+	// default as the legacy top-level block.
 	v.SetDefault("cloudflareAccess.jwtHeader", "Cf-Access-Jwt-Assertion")
 
 	v.SetDefault("signing.mode", "rs256")
@@ -330,10 +420,6 @@ func (c *Config) applyDerived() error {
 		c.CORS.AllowedOrigins = c.AllowedReturnHosts
 	}
 
-	if c.AuthMode == "" {
-		c.AuthMode = AuthModeCloudflare
-	}
-
 	const defaultCFUserHeader = "Cf-Access-Authenticated-User-Email"
 	switch {
 	case c.CloudflareAccess.UserHeader == "":
@@ -343,6 +429,78 @@ func (c *Config) applyDerived() error {
 			"top-level userHeader is set alongside cloudflareAccess.userHeader; the top-level value is ignored. The top-level userHeader field is deprecated — move it under cloudflareAccess.")
 	}
 	c.UserHeader = c.CloudflareAccess.UserHeader
+
+	return c.resolveProviders()
+}
+
+// resolveProviders normalizes the providers list and the authMode
+// advertised set. Afterwards c.Providers holds every defined provider
+// (all of them enabled), and c.AuthMode lists the advertised providers'
+// names in advertisement order.
+//
+// Two input shapes:
+//   - providers empty (legacy): each authMode entry names a provider
+//     TYPE whose top-level block is converted into an entry. The legacy
+//     blocks carry the viper defaults, so converted entries inherit
+//     them. Unset authMode means ["cloudflare"].
+//   - providers set (canonical): each authMode entry references an
+//     entry by NAME; unset authMode advertises all entries in list
+//     order. Unreferenced entries stay fully enabled — they just don't
+//     appear on the selector or as the direct login target.
+func (c *Config) resolveProviders() error {
+	converted := false
+	if len(c.Providers) == 0 {
+		converted = true
+		modes := c.AuthMode
+		if len(modes) == 0 {
+			modes = []string{AuthModeCloudflare}
+		}
+		c.Providers = make([]ProviderConfig, 0, len(modes))
+		for _, mode := range modes {
+			name, known := legacyProviderNames[mode]
+			if !known {
+				return fmt.Errorf("authMode: unsupported value %q", mode)
+			}
+			c.Providers = append(c.Providers, ProviderConfig{
+				Name:             name,
+				Type:             mode,
+				CloudflareAccess: c.CloudflareAccess,
+				BasicAuth:        c.BasicAuth,
+				AnyAuth:          c.AnyAuth,
+				GitHubOAuth:      c.GitHubOAuth,
+				OIDC:             c.OIDC,
+			})
+		}
+	}
+
+	// Converted entries ARE the advertised set (authMode named types,
+	// not names); with an explicit providers list an unset authMode
+	// advertises all. Either way authMode ends up holding names.
+	if converted || len(c.AuthMode) == 0 {
+		names := make([]string, 0, len(c.Providers))
+		for i := range c.Providers {
+			names = append(names, c.Providers[i].Name)
+		}
+		c.AuthMode = names
+		return nil
+	}
+
+	// Explicit authMode: every entry must reference a defined provider.
+	// Duplicates would produce duplicate selector entries.
+	byName := make(map[string]struct{}, len(c.Providers))
+	for i := range c.Providers {
+		byName[c.Providers[i].Name] = struct{}{}
+	}
+	seen := make(map[string]struct{}, len(c.AuthMode))
+	for _, name := range c.AuthMode {
+		if _, ok := byName[name]; !ok {
+			return fmt.Errorf("authMode: no provider named %q", name)
+		}
+		if _, dup := seen[name]; dup {
+			return fmt.Errorf("authMode: duplicate entry %q", name)
+		}
+		seen[name] = struct{}{}
+	}
 	return nil
 }
 
@@ -391,48 +549,22 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("signing.mode: unsupported value %q (only rs256 is supported)", c.Signing.Mode)
 	}
 
-	switch c.AuthMode {
-	case AuthModeCloudflare:
-		if c.CloudflareAccess.UserHeader == "" {
-			return errors.New("cloudflareAccess.userHeader is required")
+	if len(c.Providers) == 0 {
+		return errors.New("providers: at least one provider is required")
+	}
+	seenNames := make(map[string]struct{}, len(c.Providers))
+	for i := range c.Providers {
+		p := &c.Providers[i]
+		if err := validateProviderName(p.Name); err != nil {
+			return fmt.Errorf("providers[%d]: %w", i, err)
 		}
-		if c.CloudflareAccess.VerifyJWT && c.CloudflareAccess.TeamDomain == "" {
-			return errors.New("cloudflareAccess.teamDomain is required when verifyJWT is true")
+		if _, dup := seenNames[p.Name]; dup {
+			return fmt.Errorf("providers[%d]: duplicate name %q", i, p.Name)
 		}
-	case AuthModeBasic:
-		if c.BasicAuth.HtpasswdFile == "" {
-			return errors.New("basicAuth.htpasswdFile is required when authMode is basic")
+		seenNames[p.Name] = struct{}{}
+		if err := p.validate(); err != nil {
+			return fmt.Errorf("providers[%d] (%s): %w", i, p.Name, err)
 		}
-	case AuthModeAny:
-		// no required fields
-	case AuthModeGitHub:
-		if c.GitHubOAuth.ClientID == "" {
-			return errors.New("githubOAuth.clientId is required when authMode is github")
-		}
-		if c.GitHubOAuth.ClientSecret == "" && c.GitHubOAuth.ClientSecretFile == "" {
-			return errors.New("githubOAuth.clientSecret or githubOAuth.clientSecretFile is required")
-		}
-		if len(c.GitHubOAuth.AllowedOrgs) == 0 {
-			return errors.New("githubOAuth.allowedOrgs must list at least one org")
-		}
-	case AuthModeOIDC:
-		if c.OIDC.IssuerURL == "" {
-			return errors.New("oidc.issuerURL is required when authMode is oidc")
-		}
-		if c.OIDC.CallbackURL == "" {
-			return errors.New("oidc.callbackURL is required when authMode is oidc")
-		}
-		if c.OIDC.ClientID == "" {
-			return errors.New("oidc.clientId is required when authMode is oidc")
-		}
-		if c.OIDC.ClientSecret == "" && c.OIDC.ClientSecretFile == "" {
-			return errors.New("oidc.clientSecret or oidc.clientSecretFile is required when authMode is oidc")
-		}
-		// oidc.allowedGroups is optional: empty means "trust the IdP's
-		// own gating" (e.g. dex's connector orgs allow-list). Set it
-		// to narrow further on a per-instance basis.
-	default:
-		return fmt.Errorf("authMode: unsupported value %q", c.AuthMode)
 	}
 
 	if slices.Contains(c.AllowedReturnHosts, "") {
@@ -445,6 +577,69 @@ func (c *Config) Validate() error {
 	return nil
 }
 
+// providerNamePattern constrains provider instance names: they double as
+// path segments and cookie-name fragments.
+var providerNamePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,31}$`)
+
+// validateProviderName rejects empty, malformed, or reserved names.
+func validateProviderName(name string) error {
+	if name == "" {
+		return errors.New("name is required")
+	}
+	if !providerNamePattern.MatchString(name) {
+		return fmt.Errorf("name %q must match %s", name, providerNamePattern.String())
+	}
+	if _, reserved := reservedProviderNames[name]; reserved {
+		return fmt.Errorf("name %q collides with a built-in route", name)
+	}
+	return nil
+}
+
+// validate applies per-provider semantic validation.
+func (p *ProviderConfig) validate() error {
+	switch p.Type {
+	case AuthModeCloudflare:
+		if p.CloudflareAccess.VerifyJWTEnabled() && p.CloudflareAccess.TeamDomain == "" {
+			return errors.New("cloudflareAccess.teamDomain is required when verifyJWT is true")
+		}
+	case AuthModeBasic:
+		if p.BasicAuth.HtpasswdFile == "" {
+			return errors.New("basicAuth.htpasswdFile is required")
+		}
+	case AuthModeAny:
+		// no required fields
+	case AuthModeGitHub:
+		if p.GitHubOAuth.ClientID == "" {
+			return errors.New("githubOAuth.clientId is required")
+		}
+		if p.GitHubOAuth.ClientSecret == "" && p.GitHubOAuth.ClientSecretFile == "" {
+			return errors.New("githubOAuth.clientSecret or githubOAuth.clientSecretFile is required")
+		}
+		if len(p.GitHubOAuth.AllowedOrgs) == 0 {
+			return errors.New("githubOAuth.allowedOrgs must list at least one org")
+		}
+	case AuthModeOIDC:
+		if p.OIDC.IssuerURL == "" {
+			return errors.New("oidc.issuerURL is required")
+		}
+		if p.OIDC.CallbackURL == "" {
+			return errors.New("oidc.callbackURL is required")
+		}
+		if p.OIDC.ClientID == "" {
+			return errors.New("oidc.clientId is required")
+		}
+		if p.OIDC.ClientSecret == "" && p.OIDC.ClientSecretFile == "" {
+			return errors.New("oidc.clientSecret or oidc.clientSecretFile is required")
+		}
+		// oidc.allowedGroups is optional: empty means "trust the IdP's
+		// own gating" (e.g. dex's connector orgs allow-list). Set it
+		// to narrow further on a per-instance basis.
+	default:
+		return fmt.Errorf("type: unsupported value %q", p.Type)
+	}
+	return nil
+}
+
 // String returns a redacted representation of the config (suitable for
 // logging at startup). Sensitive paths/keys are not included verbatim, but
 // presence is indicated.
@@ -452,12 +647,15 @@ func (c *Config) String() string {
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "listen=%s ", c.Listen)
 	fmt.Fprintf(&sb, "issuer=%s ", c.Issuer)
-	fmt.Fprintf(&sb, "authMode=%s ", c.AuthMode)
+	providers := make([]string, 0, len(c.Providers))
+	for _, p := range c.Providers {
+		providers = append(providers, p.Name+":"+p.Type)
+	}
+	fmt.Fprintf(&sb, "providers=%v ", providers)
 	fmt.Fprintf(&sb, "audience=%v ", c.Audience)
 	fmt.Fprintf(&sb, "scope=%s ", c.ScopePattern)
 	fmt.Fprintf(&sb, "tokenTTL=%s ", c.TokenTTL)
 	fmt.Fprintf(&sb, "allowedReturnHosts=%v ", c.AllowedReturnHosts)
-	fmt.Fprintf(&sb, "cf.verifyJWT=%v ", c.CloudflareAccess.VerifyJWT)
 	fmt.Fprintf(&sb, "signing.mode=%s ", c.Signing.Mode)
 	fmt.Fprintf(&sb, "signing.rs256.keyFile=present(%t) ", c.Signing.RS256.PrivateKeyFile != "")
 	fmt.Fprintf(&sb, "previousKeys=%d", len(c.Signing.RS256.PreviousKeys))

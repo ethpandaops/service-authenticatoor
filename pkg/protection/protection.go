@@ -1,17 +1,32 @@
 // Package protection authenticates incoming requests against an upstream
 // identity source — Cloudflare Access, HTTP Basic auth, GitHub OAuth, etc.
 //
-// authenticatoor's /auth/* endpoints are gated by exactly one Provider per
-// process, selected at startup by the authMode config field. Each provider
-// inspects the incoming request and returns an Outcome describing the next
-// step: an Identity (the request is authenticated), a RedirectTo URL (the
-// provider needs to send the user through a flow), or a Status (typically
-// 401, optionally with WWW-Authenticate Challenge headers).
+// authenticatoor's /auth/* endpoints are gated by one or more Providers,
+// configured at startup via the providers list (or the legacy authMode
+// field, which promotes to a single-entry list). On each request the auth
+// middleware runs every provider's Authenticate in order and the first
+// Identity wins. Authenticate is passive: it only inspects credentials
+// already on the request (a session cookie, ambient headers injected by
+// an edge proxy, an Authorization header) and never initiates a login
+// flow itself. When no provider authenticates the request, the middleware
+// falls back to the single provider's Outcome (redirect / challenge), or
+// — with multiple providers — redirects to the provider selector page.
+//
+// Interactive login lives on per-provider entry paths (e.g.
+// /cfaccess/login, /htpasswd/login, /github/login). Those routes convert
+// a successful upstream authentication into a signed session cookie and
+// redirect back to the originally-requested /auth/* URL. This keeps
+// /auth/* independent of any edge protection: an instance whose edge
+// proxy (Cloudflare Access) still covers /auth/* authenticates via the
+// ambient headers and never redirects, while an instance that narrows
+// the edge protection to the provider's login prefix authenticates via
+// the session cookie.
 package protection
 
 import (
 	"context"
 	"net/http"
+	"strings"
 
 	"github.com/gorilla/mux"
 )
@@ -34,7 +49,7 @@ type Outcome struct {
 	// Identity is set when the request carries valid authentication.
 	Identity *Identity
 	// RedirectTo is set when the provider needs to send the user to a
-	// login flow (e.g. a GitHub authorize URL). The middleware emits a
+	// login flow (e.g. its own login entry path). The middleware emits a
 	// 302 to this URL.
 	RedirectTo string
 	// Challenge holds headers the middleware writes before the 401
@@ -45,8 +60,7 @@ type Outcome struct {
 	// RedirectTo is set. Only meaningful for the unauthenticated path.
 	Status int
 	// SetCookies holds cookies the middleware writes on the response
-	// before the redirect / status code (e.g. an OAuth state cookie set
-	// alongside the redirect to the IdP). Use a cookie with MaxAge=-1
+	// before the redirect / status code. Use a cookie with MaxAge=-1
 	// to clear an existing cookie.
 	SetCookies []*http.Cookie
 }
@@ -62,17 +76,65 @@ type Provider interface {
 	// Stop releases any resources held by the provider. Called once on
 	// shutdown.
 	Stop() error
-	// Authenticate inspects the request and returns the outcome.
+	// Authenticate passively inspects the request — session cookie,
+	// ambient proxy headers, Authorization header — and returns the
+	// outcome. It must not initiate a login flow with side effects (no
+	// state cookies); an unauthenticated outcome either points at the
+	// provider's login entry (RedirectTo) or carries a challenge.
 	Authenticate(ctx context.Context, r *http.Request) (Outcome, error)
+	// LoginURL returns the URL of the provider's interactive login entry
+	// point, carrying returnTo (a same-origin path to resume after
+	// login). The selector page links here; the provider's own
+	// unauthenticated Outcome typically redirects here too. Empty when
+	// the provider has no interactive entry.
+	LoginURL(returnTo string) string
 	// Logout writes the appropriate logout response for this provider.
-	// Called from /auth/logout regardless of the request's authentication
-	// state. Cookie-based providers clear their session cookie; Basic-
-	// shaped providers return 401 with a rotated realm to coax the
-	// browser to drop cached credentials; proxy-trusted providers point
-	// the user at the upstream's logout URL.
+	// Called from /auth/logout when this provider is the only one
+	// configured. Cookie-based providers clear their session cookie;
+	// Basic-shaped providers explain the browser credential cache;
+	// proxy-trusted providers point the user at the upstream's logout
+	// URL. With multiple providers the server clears every provider's
+	// session cookie instead (see SessionClearer).
 	Logout(w http.ResponseWriter, r *http.Request)
 	// RegisterRoutes lets the provider attach auxiliary public routes
-	// (e.g. /auth/oauth/callback) that don't go through the auth
+	// (login entries, OAuth callbacks) that don't go through the auth
 	// middleware. May be a no-op.
 	RegisterRoutes(r *mux.Router)
+}
+
+// AmbientAuthenticator is implemented by providers whose credentials ride
+// on the request itself, injected by an edge proxy (e.g. Cloudflare
+// Access assertion headers). The server mounts a machine-friendly token
+// alias (/<name>/token) for these providers: the alias path can stay
+// behind the edge protection while /auth/* is opened up, so
+// non-interactive clients (service tokens) keep a direct JSON endpoint
+// that never redirects.
+type AmbientAuthenticator interface {
+	// AuthenticateAmbient inspects only the ambient edge credentials —
+	// no session cookies, no redirects. The outcome carries either an
+	// Identity or an unauthenticated Status.
+	AuthenticateAmbient(ctx context.Context, r *http.Request) (Outcome, error)
+}
+
+// SessionClearer is implemented by providers that track their session in
+// a clearable cookie. The server's multi-provider logout collects and
+// clears every provider's session cookie in one response.
+type SessionClearer interface {
+	// ClearSessionCookie returns a cookie that deletes the provider's
+	// session cookie (MaxAge=-1, attributes matching the live cookie).
+	ClearSessionCookie() *http.Cookie
+}
+
+// SafeReturnTo sanitizes a return_to value supplied to a login entry
+// path. Only same-origin relative paths are accepted — absolute URLs and
+// protocol-relative forms ("//", "/\") would turn the login entry into
+// an open redirect. Invalid or empty values fall back to "/".
+func SafeReturnTo(raw string) string {
+	if raw == "" || !strings.HasPrefix(raw, "/") {
+		return "/"
+	}
+	if strings.HasPrefix(raw, "//") || strings.HasPrefix(raw, "/\\") {
+		return "/"
+	}
+	return raw
 }

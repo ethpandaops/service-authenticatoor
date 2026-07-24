@@ -26,9 +26,12 @@ import (
 // VerifyHeader, when non-empty, must also be present (any non-empty
 // value) for authentication to succeed; this lets tests exercise the
 // "missing assertion" path that the real CF provider enforces via JWKS.
+// A non-empty loginPath makes the unauthenticated outcome a redirect
+// there (like the cookie-shaped providers) instead of a 401.
 type fakeProvider struct {
 	emailHeader  string
 	verifyHeader string
+	loginPath    string
 }
 
 func (p *fakeProvider) Name() string                  { return "fake" }
@@ -40,12 +43,22 @@ func (p *fakeProvider) Logout(w http.ResponseWriter, _ *http.Request) {
 	_, _ = w.Write([]byte(`{"loggedOut":true}`))
 }
 
+func (p *fakeProvider) LoginURL(returnTo string) string {
+	if p.loginPath == "" {
+		return ""
+	}
+	return p.loginPath + "?" + url.Values{"return_to": {returnTo}}.Encode()
+}
+
 func (p *fakeProvider) Authenticate(_ context.Context, r *http.Request) (protection.Outcome, error) {
 	if p.verifyHeader != "" && r.Header.Get(p.verifyHeader) == "" {
 		return protection.Outcome{Status: http.StatusUnauthorized}, nil
 	}
 	email := r.Header.Get(p.emailHeader)
 	if email == "" {
+		if p.loginPath != "" {
+			return protection.Outcome{RedirectTo: p.LoginURL(r.URL.RequestURI())}, nil
+		}
 		return protection.Outcome{Status: http.StatusUnauthorized}, nil
 	}
 	return protection.Outcome{Identity: &protection.Identity{
@@ -64,7 +77,7 @@ func newTestServer(t *testing.T) (*Server, *issuer.RS256Issuer, *fakeProvider) {
 		Listen:             ":0",
 		Issuer:             "https://auth.test.example",
 		ExternalURL:        "https://auth.test.example",
-		AuthMode:           config.AuthModeCloudflare,
+		AuthMode:           []string{config.AuthModeCloudflare},
 		Audience:           []string{"test.example"},
 		ScopePattern:       "*.test.example",
 		TokenTTL:           30 * time.Minute,
@@ -95,11 +108,11 @@ func newTestServer(t *testing.T) (*Server, *issuer.RS256Issuer, *fakeProvider) {
 
 	prov := &fakeProvider{emailHeader: "X-Test-Email"}
 	s, err := New(Options{
-		Config:   cfg,
-		Issuer:   iss,
-		Provider: prov,
-		Log:      log,
-		Registry: prometheus.NewRegistry(),
+		Config:    cfg,
+		Issuer:    iss,
+		Providers: []NamedProvider{{Name: "fake", Provider: prov}},
+		Log:       log,
+		Registry:  prometheus.NewRegistry(),
 	})
 	if err != nil {
 		t.Fatalf("new server: %v", err)
@@ -429,6 +442,219 @@ func TestHandleLogout_CORSPreflightAllowed(t *testing.T) {
 	}
 	if got := rr.Header().Get("Access-Control-Allow-Origin"); got != "https://app.test.example" {
 		t.Errorf("ACAO: %q", got)
+	}
+}
+
+// ambientFakeProvider extends fakeProvider with the AmbientAuthenticator
+// interface so tests can exercise the /<name>/token machine alias.
+type ambientFakeProvider struct {
+	fakeProvider
+	ambientHeader string
+}
+
+func (p *ambientFakeProvider) AuthenticateAmbient(_ context.Context, r *http.Request) (protection.Outcome, error) {
+	email := r.Header.Get(p.ambientHeader)
+	if email == "" {
+		return protection.Outcome{Status: http.StatusUnauthorized}, nil
+	}
+	return protection.Outcome{Identity: &protection.Identity{Subject: email, Email: email}}, nil
+}
+
+// newMultiProviderServer builds a Server with two providers: "first"
+// (ambient-capable, reads X-First-Email / X-First-Ambient) and "second"
+// (cookie-shaped with a login path, reads X-Second-Email).
+func newMultiProviderServer(t *testing.T) (*Server, *ambientFakeProvider, *fakeProvider) {
+	t.Helper()
+	s, _, _ := newTestServer(t)
+
+	first := &ambientFakeProvider{
+		fakeProvider:  fakeProvider{emailHeader: "X-First-Email", loginPath: "/first/login"},
+		ambientHeader: "X-First-Ambient",
+	}
+	second := &fakeProvider{emailHeader: "X-Second-Email", loginPath: "/second/login"}
+	s.providers = []NamedProvider{
+		{Name: "first", Provider: first},
+		{Name: "second", Provider: second},
+	}
+	s.advertised = s.providers
+	return s, first, second
+}
+
+func TestAuthChain_SecondProviderAuthenticates(t *testing.T) {
+	s, _, _ := newMultiProviderServer(t)
+
+	req := httptest.NewRequest(http.MethodGet, "/auth/token", nil)
+	req.Header.Set("X-Second-Email", "bob@example.com")
+	rr := httptest.NewRecorder()
+	s.routes().ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status: %d, body: %s", rr.Code, rr.Body.String())
+	}
+	var resp tokenResponse
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.User != "bob@example.com" {
+		t.Errorf("user: %q", resp.User)
+	}
+}
+
+func TestAuthChain_NoProviderRedirectsToSelector(t *testing.T) {
+	s, _, _ := newMultiProviderServer(t)
+
+	req := httptest.NewRequest(http.MethodGet, "/auth/token?aud=test.example", nil)
+	rr := httptest.NewRecorder()
+	s.routes().ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusFound {
+		t.Fatalf("status: got %d, want 302", rr.Code)
+	}
+	loc := rr.Header().Get("Location")
+	if !strings.HasPrefix(loc, "/login?") {
+		t.Errorf("location: got %q, want /login?...", loc)
+	}
+	if !strings.Contains(loc, "return_to=%2Fauth%2Ftoken%3Faud%3Dtest.example") {
+		t.Errorf("location missing return_to: %q", loc)
+	}
+}
+
+func TestLoginSelector_ListsProviders(t *testing.T) {
+	s, _, _ := newMultiProviderServer(t)
+
+	req := httptest.NewRequest(http.MethodGet, "/login?return_to=%2Fauth%2Ftoken", nil)
+	rr := httptest.NewRecorder()
+	s.routes().ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status: %d", rr.Code)
+	}
+	body := rr.Body.String()
+	if !strings.Contains(body, `href="/first/login?return_to=%2Fauth%2Ftoken"`) {
+		t.Errorf("selector missing first provider link: %s", body)
+	}
+	if !strings.Contains(body, `href="/second/login?return_to=%2Fauth%2Ftoken"`) {
+		t.Errorf("selector missing second provider link: %s", body)
+	}
+}
+
+func TestLoginSelector_SingleProviderForwards(t *testing.T) {
+	s, _, prov := newTestServer(t)
+	prov.loginPath = "/fake/login"
+
+	req := httptest.NewRequest(http.MethodGet, "/login?return_to=%2Fauth%2Ftoken", nil)
+	rr := httptest.NewRecorder()
+	s.routes().ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusFound {
+		t.Fatalf("status: got %d, want 302", rr.Code)
+	}
+	if loc := rr.Header().Get("Location"); !strings.HasPrefix(loc, "/fake/login?") {
+		t.Errorf("location: %q", loc)
+	}
+}
+
+func TestLoginSelector_RejectsAbsoluteReturnTo(t *testing.T) {
+	s, _, _ := newMultiProviderServer(t)
+
+	req := httptest.NewRequest(http.MethodGet, "/login?return_to=https%3A%2F%2Fevil.example%2F", nil)
+	rr := httptest.NewRecorder()
+	s.routes().ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status: %d", rr.Code)
+	}
+	if strings.Contains(rr.Body.String(), "evil.example") {
+		t.Error("absolute return_to leaked into selector links")
+	}
+}
+
+func TestAmbientTokenAlias_IssuesToken(t *testing.T) {
+	s, first, _ := newMultiProviderServer(t)
+	_ = first
+
+	req := httptest.NewRequest(http.MethodGet, "/first/token", nil)
+	req.Header.Set("X-First-Ambient", "svc@example.com")
+	rr := httptest.NewRecorder()
+	s.routes().ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status: %d, body: %s", rr.Code, rr.Body.String())
+	}
+	var resp tokenResponse
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.Token == "" || resp.User != "svc@example.com" {
+		t.Errorf("token=%q user=%q", resp.Token, resp.User)
+	}
+}
+
+func TestAmbientTokenAlias_RejectsWithoutAmbientCredentials(t *testing.T) {
+	s, _, _ := newMultiProviderServer(t)
+
+	// Even the chain-authenticating header must not satisfy the alias.
+	req := httptest.NewRequest(http.MethodGet, "/first/token", nil)
+	req.Header.Set("X-First-Email", "user@example.com")
+	rr := httptest.NewRecorder()
+	s.routes().ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusUnauthorized {
+		t.Errorf("status: got %d, want 401", rr.Code)
+	}
+}
+
+// TestUnadvertisedProviderStillAuthenticates pins the authMode contract:
+// providers left out of authMode disappear from the selector and the
+// fallback redirect, but keep authenticating in the passive chain.
+func TestUnadvertisedProviderStillAuthenticates(t *testing.T) {
+	s, _, _ := newMultiProviderServer(t)
+	s.advertised = s.providers[:1] // only "first" is advertised
+
+	// "second" still authenticates.
+	req := httptest.NewRequest(http.MethodGet, "/auth/token", nil)
+	req.Header.Set("X-Second-Email", "bob@example.com")
+	rr := httptest.NewRecorder()
+	s.routes().ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("unadvertised provider auth: status %d", rr.Code)
+	}
+
+	// The selector only lists "first".
+	req = httptest.NewRequest(http.MethodGet, "/login?return_to=%2Fauth%2Ftoken", nil)
+	rr = httptest.NewRecorder()
+	s.routes().ServeHTTP(rr, req)
+	if rr.Code != http.StatusFound {
+		t.Fatalf("selector with one advertised provider: status %d, want 302", rr.Code)
+	}
+	if loc := rr.Header().Get("Location"); !strings.HasPrefix(loc, "/first/login?") {
+		t.Errorf("selector redirect: %q", loc)
+	}
+
+	// The unauthenticated fallback goes straight to "first", no selector.
+	req = httptest.NewRequest(http.MethodGet, "/auth/token", nil)
+	rr = httptest.NewRecorder()
+	s.routes().ServeHTTP(rr, req)
+	if rr.Code != http.StatusFound {
+		t.Fatalf("fallback: status %d, want 302", rr.Code)
+	}
+	if loc := rr.Header().Get("Location"); !strings.HasPrefix(loc, "/first/login?") {
+		t.Errorf("fallback redirect: %q", loc)
+	}
+}
+
+func TestMultiProviderLogout_ClearsWithoutProviderDispatch(t *testing.T) {
+	s, _, _ := newMultiProviderServer(t)
+
+	req := httptest.NewRequest(http.MethodPost, "/auth/logout", nil)
+	rr := httptest.NewRecorder()
+	s.routes().ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status: %d", rr.Code)
+	}
+	if !strings.Contains(rr.Body.String(), `"loggedOut":true`) {
+		t.Errorf("body: %q", rr.Body.String())
 	}
 }
 

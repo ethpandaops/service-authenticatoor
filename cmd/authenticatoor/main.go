@@ -101,27 +101,17 @@ func run(ctx context.Context, cfgPath string) error {
 		return fmt.Errorf("build issuer: %w", err)
 	}
 
-	// Derive the protection-provider session key from the signing key so
-	// cookie-shaped providers (github / oidc) don't need a separate
-	// secret. Rotating the signing key invalidates active sessions —
-	// users re-authenticate on the next request, which is the expected
-	// posture for a security-key rotation.
-	sessionKey, err := issuer.DeriveHMACKey(priv, "authenticatoor session v1")
+	providers, err := buildProviders(log, cfg, priv)
 	if err != nil {
-		return fmt.Errorf("derive session key: %w", err)
-	}
-
-	prov, err := buildProvider(log, cfg, sessionKey)
-	if err != nil {
-		return fmt.Errorf("build provider: %w", err)
+		return fmt.Errorf("build providers: %w", err)
 	}
 
 	srv, err := server.New(server.Options{
-		Config:   cfg,
-		Issuer:   iss,
-		Provider: prov,
-		Log:      log,
-		Registry: prometheus.NewRegistry(),
+		Config:    cfg,
+		Issuer:    iss,
+		Providers: providers,
+		Log:       log,
+		Registry:  prometheus.NewRegistry(),
 	})
 	if err != nil {
 		return fmt.Errorf("build server: %w", err)
@@ -130,62 +120,120 @@ func run(ctx context.Context, cfgPath string) error {
 	return srv.Start(ctx)
 }
 
-// buildProvider constructs the protection.Provider named by cfg.AuthMode.
-// sessionKey is the derived HMAC key passed to cookie-shaped providers.
-// Provider.Start (heavy initialization) is deferred to server.Start.
-func buildProvider(log logrus.FieldLogger, cfg *config.Config, sessionKey []byte) (protection.Provider, error) {
-	switch cfg.AuthMode {
+// buildProviders constructs one protection.Provider per configured
+// providers entry. Provider.Start (heavy initialization) is deferred to
+// server.Start.
+func buildProviders(
+	log logrus.FieldLogger, cfg *config.Config, priv *rsa.PrivateKey,
+) ([]server.NamedProvider, error) {
+	out := make([]server.NamedProvider, 0, len(cfg.Providers))
+	for i := range cfg.Providers {
+		pc := &cfg.Providers[i]
+
+		// Derive a per-instance session key from the signing key so
+		// cookie-shaped providers don't need a separate secret and one
+		// provider's session cookie can't be replayed as another's.
+		// Rotating the signing key invalidates active sessions — users
+		// re-authenticate on the next request, which is the expected
+		// posture for a security-key rotation.
+		sessionKey, err := issuer.DeriveHMACKey(priv, "authenticatoor session v1 provider="+pc.Name)
+		if err != nil {
+			return nil, fmt.Errorf("derive session key for %s: %w", pc.Name, err)
+		}
+
+		prov, err := buildProvider(log, cfg, pc, sessionKey)
+		if err != nil {
+			return nil, fmt.Errorf("provider %s: %w", pc.Name, err)
+		}
+		out = append(out, server.NamedProvider{Name: pc.Name, Provider: prov})
+	}
+	return out, nil
+}
+
+// buildProvider constructs the protection.Provider for one providers
+// entry. Path and cookie-name defaults derive from the instance name so
+// every provider lives under its own /<name>/ prefix.
+func buildProvider(
+	log logrus.FieldLogger, cfg *config.Config, pc *config.ProviderConfig, sessionKey []byte,
+) (protection.Provider, error) {
+	// The login entry is not configurable — it is always the provider's
+	// own prefix, derived from the instance name.
+	loginPath := "/" + pc.Name + "/login"
+	callbackPath := func(configured string) string {
+		if configured != "" {
+			return configured
+		}
+		return "/" + pc.Name + "/callback"
+	}
+	cookieName := func(configured, suffix string) string {
+		if configured != "" {
+			return configured
+		}
+		return "authenticatoor_" + pc.Name + suffix
+	}
+
+	switch pc.Type {
 	case config.AuthModeCloudflare:
 		return cloudflare.New(log, cloudflare.Config{
-			VerifyJWT:          cfg.CloudflareAccess.VerifyJWT,
-			TeamDomain:         cfg.CloudflareAccess.TeamDomain,
-			AudTag:             cfg.CloudflareAccess.AudTag,
-			JwtHeader:          cfg.CloudflareAccess.JwtHeader,
-			UserHeader:         cfg.CloudflareAccess.UserHeader,
-			AllowServiceTokens: cfg.CloudflareAccess.AllowServiceTokens,
+			VerifyJWT:          pc.CloudflareAccess.VerifyJWTEnabled(),
+			TeamDomain:         pc.CloudflareAccess.TeamDomain,
+			AudTag:             pc.CloudflareAccess.AudTag,
+			JwtHeader:          pc.CloudflareAccess.JwtHeader,
+			UserHeader:         pc.CloudflareAccess.UserHeader,
+			AllowServiceTokens: pc.CloudflareAccess.ServiceTokensAllowed(),
+			LoginPath:          loginPath,
+			SessionKey:         sessionKey,
+			SessionCookieName:  cookieName(pc.CloudflareAccess.SessionCookieName, "_session"),
+			SessionTTL:         pc.CloudflareAccess.SessionTTL,
 		}), nil
 	case config.AuthModeBasic:
 		return basic.New(log, basic.Config{
-			HtpasswdFile: cfg.BasicAuth.HtpasswdFile,
-			Realm:        cfg.BasicAuth.Realm,
+			HtpasswdFile:      pc.BasicAuth.HtpasswdFile,
+			Realm:             pc.BasicAuth.Realm,
+			LoginPath:         loginPath,
+			SessionKey:        sessionKey,
+			SessionCookieName: cookieName(pc.BasicAuth.SessionCookieName, "_session"),
+			SessionTTL:        pc.BasicAuth.SessionTTL,
 		}), nil
 	case config.AuthModeAny:
 		return anyauth.New(log, anyauth.Config{
-			CookieName: cfg.AnyAuth.CookieName,
-			LoginPath:  cfg.AnyAuth.LoginPath,
-			CookieTTL:  cfg.AnyAuth.CookieTTL,
+			CookieName: pc.AnyAuth.CookieName,
+			LoginPath:  loginPath,
+			CookieTTL:  pc.AnyAuth.CookieTTL,
 		}), nil
 	case config.AuthModeGitHub:
 		return github.New(log, github.Config{
-			ClientID:          cfg.GitHubOAuth.ClientID,
-			ClientSecret:      cfg.GitHubOAuth.ClientSecret,
-			ClientSecretFile:  cfg.GitHubOAuth.ClientSecretFile,
+			ClientID:          pc.GitHubOAuth.ClientID,
+			ClientSecret:      pc.GitHubOAuth.ClientSecret,
+			ClientSecretFile:  pc.GitHubOAuth.ClientSecretFile,
 			SessionKey:        sessionKey,
-			CallbackPath:      cfg.GitHubOAuth.CallbackPath,
+			LoginPath:         loginPath,
+			CallbackPath:      callbackPath(pc.GitHubOAuth.CallbackPath),
 			PublicURL:         cfg.ExternalURL,
-			SessionCookieName: cfg.GitHubOAuth.SessionCookieName,
-			StateCookieName:   cfg.GitHubOAuth.StateCookieName,
-			SessionTTL:        cfg.GitHubOAuth.SessionTTL,
-			AllowedOrgs:       cfg.GitHubOAuth.AllowedOrgs,
+			SessionCookieName: cookieName(pc.GitHubOAuth.SessionCookieName, "_session"),
+			StateCookieName:   cookieName(pc.GitHubOAuth.StateCookieName, "_state"),
+			SessionTTL:        pc.GitHubOAuth.SessionTTL,
+			AllowedOrgs:       pc.GitHubOAuth.AllowedOrgs,
 		}), nil
 	case config.AuthModeOIDC:
 		return oidc.New(log, oidc.Config{
-			IssuerURL:         cfg.OIDC.IssuerURL,
-			CallbackURL:       cfg.OIDC.CallbackURL,
+			IssuerURL:         pc.OIDC.IssuerURL,
+			CallbackURL:       pc.OIDC.CallbackURL,
 			PublicURL:         cfg.ExternalURL,
-			ClientID:          cfg.OIDC.ClientID,
-			ClientSecret:      cfg.OIDC.ClientSecret,
-			ClientSecretFile:  cfg.OIDC.ClientSecretFile,
+			ClientID:          pc.OIDC.ClientID,
+			ClientSecret:      pc.OIDC.ClientSecret,
+			ClientSecretFile:  pc.OIDC.ClientSecretFile,
 			SessionKey:        sessionKey,
-			CallbackPath:      cfg.OIDC.CallbackPath,
-			SessionCookieName: cfg.OIDC.SessionCookieName,
-			StateCookieName:   cfg.OIDC.StateCookieName,
-			SessionTTL:        cfg.OIDC.SessionTTL,
-			AllowedGroups:     cfg.OIDC.AllowedGroups,
-			Scopes:            cfg.OIDC.Scopes,
+			LoginPath:         loginPath,
+			CallbackPath:      callbackPath(pc.OIDC.CallbackPath),
+			SessionCookieName: cookieName(pc.OIDC.SessionCookieName, "_session"),
+			StateCookieName:   cookieName(pc.OIDC.StateCookieName, "_state"),
+			SessionTTL:        pc.OIDC.SessionTTL,
+			AllowedGroups:     pc.OIDC.AllowedGroups,
+			Scopes:            pc.OIDC.Scopes,
 		}), nil
 	default:
-		return nil, fmt.Errorf("authMode %q not implemented", cfg.AuthMode)
+		return nil, fmt.Errorf("type %q not implemented", pc.Type)
 	}
 }
 

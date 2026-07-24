@@ -3,7 +3,7 @@
 //
 // Authenticated users are tracked via a signed session cookie issued by
 // this service; unauthenticated requests to /auth/* are redirected to
-// GitHub's authorize endpoint and bounce back through /auth/oauth/callback
+// GitHub's authorize endpoint and bounce back through /github/callback
 // to set the cookie. Membership in any of the configured allowedOrgs is
 // required; users outside the allow-list get a 403 from the callback.
 //
@@ -33,7 +33,8 @@ import (
 
 // Defaults applied when corresponding Config fields are empty.
 const (
-	DefaultCallbackPath      = "/auth/oauth/callback"
+	DefaultLoginPath         = "/github/login"
+	DefaultCallbackPath      = "/github/callback"
 	DefaultSessionCookieName = "authenticatoor_session"
 	DefaultStateCookieName   = "authenticatoor_oauth_state"
 	DefaultSessionTTL        = 12 * time.Hour
@@ -57,9 +58,13 @@ type Config struct {
 	// there's no separate secret to manage. Must be at least 16 bytes.
 	// Required.
 	SessionKey []byte
+	// LoginPath is the interactive login entry: it sets the state cookie
+	// and redirects to GitHub's authorize endpoint. Defaults to
+	// "/github/login".
+	LoginPath string
 	// CallbackPath is the path of the OAuth redirect URI, registered on
-	// the public router. Defaults to "/auth/oauth/callback". Must match
-	// the redirect_uri configured in the GitHub OAuth app.
+	// the public router. Defaults to "/github/callback". Must match the
+	// redirect_uri configured in the GitHub OAuth app.
 	CallbackPath string
 	// PublicURL is the externally-visible base URL of the auth service.
 	// Used to build the absolute redirect_uri sent to GitHub. Required.
@@ -107,11 +112,17 @@ type Provider struct {
 	allowedOrgsSet map[string]struct{}
 }
 
-var _ protection.Provider = (*Provider)(nil)
+var (
+	_ protection.Provider       = (*Provider)(nil)
+	_ protection.SessionClearer = (*Provider)(nil)
+)
 
 // New constructs a Provider. Defaults are filled in here; secret material
 // and reachability checks happen in Start.
 func New(log logrus.FieldLogger, cfg Config) *Provider {
+	if cfg.LoginPath == "" {
+		cfg.LoginPath = DefaultLoginPath
+	}
 	if cfg.CallbackPath == "" {
 		cfg.CallbackPath = DefaultCallbackPath
 	}
@@ -190,17 +201,24 @@ func (p *Provider) Start(_ context.Context) error {
 // Stop is a no-op.
 func (p *Provider) Stop() error { return nil }
 
-// RegisterRoutes attaches the OAuth callback handler. It runs on the
-// parent router (not the /auth/* subrouter) so the auth middleware is
-// bypassed — the request IS the act of authenticating.
+// RegisterRoutes attaches the login entry and the OAuth callback
+// handler. They run on the parent router (not the /auth/* subrouter) so
+// the auth middleware is bypassed — the request IS the act of
+// authenticating.
 func (p *Provider) RegisterRoutes(r *mux.Router) {
+	r.HandleFunc(p.cfg.LoginPath, p.handleLoginStart).Methods(http.MethodGet)
 	r.HandleFunc(p.cfg.CallbackPath, p.handleCallback).Methods(http.MethodGet)
 }
 
+// LoginURL returns the login entry path carrying returnTo.
+func (p *Provider) LoginURL(returnTo string) string {
+	v := url.Values{}
+	v.Set("return_to", returnTo)
+	return p.cfg.LoginPath + "?" + v.Encode()
+}
+
 // Authenticate looks for a valid session cookie. When absent or stale the
-// provider returns a redirect to GitHub's authorize endpoint, with a
-// signed state cookie that carries the original request URL so the
-// callback can complete the round-trip.
+// outcome redirects to the login entry, which starts the OAuth flow.
 func (p *Provider) Authenticate(_ context.Context, r *http.Request) (protection.Outcome, error) {
 	if c, err := r.Cookie(p.cfg.SessionCookieName); err == nil {
 		login, email, perr := session.Parse(p.sessionSecret, c.Value, p.cfg.Now())
@@ -210,20 +228,26 @@ func (p *Provider) Authenticate(_ context.Context, r *http.Request) (protection.
 				Email:   email,
 			}}, nil
 		}
-		p.log.WithError(perr).Debug("session cookie invalid; redirecting to github")
+		p.log.WithError(perr).Debug("session cookie invalid; redirecting to login")
 	}
 
+	return protection.Outcome{RedirectTo: p.LoginURL(r.URL.RequestURI())}, nil
+}
+
+// handleLoginStart begins the OAuth dance: mint the state nonce, bind it
+// to the (sanitized) return_to in the signed state cookie, and redirect
+// to GitHub's authorize endpoint.
+func (p *Provider) handleLoginStart(w http.ResponseWriter, r *http.Request) {
 	state, err := session.NewNonce()
 	if err != nil {
-		return protection.Outcome{}, fmt.Errorf("github: state: %w", err)
+		p.log.WithError(err).Error("state nonce generation failed")
+		http.Error(w, "state error", http.StatusInternalServerError)
+		return
 	}
-	stateCookie := p.signedStateCookie(state, r.URL.RequestURI())
-
-	redirect := p.authorizeRedirect(state)
-	return protection.Outcome{
-		RedirectTo: redirect,
-		SetCookies: []*http.Cookie{stateCookie},
-	}, nil
+	returnTo := protection.SafeReturnTo(r.URL.Query().Get("return_to"))
+	http.SetCookie(w, p.signedStateCookie(state, returnTo))
+	w.Header().Set("Cache-Control", "no-store")
+	http.Redirect(w, r, p.authorizeRedirect(state), http.StatusFound)
 }
 
 // authorizeRedirect builds the GitHub authorize URL.

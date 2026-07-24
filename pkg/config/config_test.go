@@ -41,8 +41,19 @@ cloudflareAccess:
 	if cfg.UserHeader != "Cf-Access-Authenticated-User-Email" {
 		t.Errorf("userHeader default: %q", cfg.UserHeader)
 	}
-	if !cfg.CloudflareAccess.VerifyJWT {
+	if !cfg.CloudflareAccess.VerifyJWTEnabled() {
 		t.Error("cf verifyJWT default should be true")
+	}
+
+	// Legacy single-provider promotion.
+	if len(cfg.Providers) != 1 {
+		t.Fatalf("expected one promoted provider, got %d", len(cfg.Providers))
+	}
+	if cfg.Providers[0].Name != "cfaccess" || cfg.Providers[0].Type != AuthModeCloudflare {
+		t.Errorf("promoted provider: got %s:%s", cfg.Providers[0].Name, cfg.Providers[0].Type)
+	}
+	if cfg.Providers[0].CloudflareAccess.TeamDomain != "test.cloudflareaccess.com" {
+		t.Errorf("promoted teamDomain: %q", cfg.Providers[0].CloudflareAccess.TeamDomain)
 	}
 
 	// Derived from issuer
@@ -204,8 +215,8 @@ cloudflareAccess:
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
-	if cfg.AuthMode != AuthModeCloudflare {
-		t.Errorf("authMode: got %q want %q", cfg.AuthMode, AuthModeCloudflare)
+	if len(cfg.AuthMode) != 1 || cfg.AuthMode[0] != "cfaccess" {
+		t.Errorf("authMode: got %v want [cfaccess]", cfg.AuthMode)
 	}
 }
 
@@ -298,8 +309,8 @@ basicAuth:
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
-	if cfg.AuthMode != AuthModeBasic {
-		t.Errorf("authMode: got %q", cfg.AuthMode)
+	if len(cfg.AuthMode) != 1 || cfg.AuthMode[0] != "htpasswd" {
+		t.Errorf("authMode: got %v want [htpasswd]", cfg.AuthMode)
 	}
 	if cfg.BasicAuth.HtpasswdFile != "/etc/htpasswd" {
 		t.Errorf("htpasswdFile: got %q", cfg.BasicAuth.HtpasswdFile)
@@ -318,8 +329,247 @@ signing:
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
-	if cfg.AuthMode != AuthModeAny {
-		t.Errorf("authMode: got %q", cfg.AuthMode)
+	if len(cfg.AuthMode) != 1 || cfg.AuthMode[0] != "anyauth" {
+		t.Errorf("authMode: got %v want [anyauth]", cfg.AuthMode)
+	}
+}
+
+func TestLoad_ProvidersList(t *testing.T) {
+	p := writeTempConfig(t, `
+issuer: "https://auth.foo.example"
+signing:
+  rs256:
+    privateKeyFile: "/etc/keys/private.pem"
+providers:
+  - name: cfaccess
+    type: cloudflare
+    cloudflareAccess:
+      teamDomain: "test.cloudflareaccess.com"
+  - name: oidc
+    type: oidc
+    oidc:
+      issuerURL: "https://dex.example"
+      callbackURL: "https://relay.example/oidc/callback"
+      clientId: "authenticatoor"
+      clientSecret: "secret"
+  - name: panda
+    type: oidc
+    oidc:
+      issuerURL: "https://authentik.example/application/o/panda/"
+      callbackURL: "https://auth.foo.example/panda/callback"
+      clientId: "panda"
+      clientSecret: "secret"
+`)
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if len(cfg.Providers) != 3 {
+		t.Fatalf("expected 3 providers, got %d", len(cfg.Providers))
+	}
+	if cfg.Providers[0].Name != "cfaccess" || cfg.Providers[1].Name != "oidc" || cfg.Providers[2].Name != "panda" {
+		t.Errorf("names: got %s, %s, %s", cfg.Providers[0].Name, cfg.Providers[1].Name, cfg.Providers[2].Name)
+	}
+	// Unset verifyJWT in a providers entry must still mean "on".
+	if !cfg.Providers[0].CloudflareAccess.VerifyJWTEnabled() {
+		t.Error("providers-entry verifyJWT default should be true")
+	}
+}
+
+func TestLoad_ProvidersList_RejectsMissingName(t *testing.T) {
+	p := writeTempConfig(t, `
+issuer: "https://auth.foo.example"
+signing:
+  rs256:
+    privateKeyFile: "/etc/keys/private.pem"
+providers:
+  - type: any
+`)
+	if _, err := Load(p); err == nil {
+		t.Error("expected error for providers entry without a name")
+	}
+}
+
+func TestLoad_ProvidersList_RejectsDuplicateNames(t *testing.T) {
+	p := writeTempConfig(t, `
+issuer: "https://auth.foo.example"
+signing:
+  rs256:
+    privateKeyFile: "/etc/keys/private.pem"
+providers:
+  - name: dev
+    type: any
+  - name: dev
+    type: any
+`)
+	if _, err := Load(p); err == nil {
+		t.Error("expected error for duplicate provider names")
+	}
+}
+
+func TestLoad_ProvidersList_RejectsReservedName(t *testing.T) {
+	p := writeTempConfig(t, `
+issuer: "https://auth.foo.example"
+signing:
+  rs256:
+    privateKeyFile: "/etc/keys/private.pem"
+providers:
+  - name: auth
+    type: any
+`)
+	if _, err := Load(p); err == nil {
+		t.Error("expected error for reserved provider name")
+	}
+}
+
+func TestLoad_ProvidersList_RejectsMissingRequiredFields(t *testing.T) {
+	p := writeTempConfig(t, `
+issuer: "https://auth.foo.example"
+signing:
+  rs256:
+    privateKeyFile: "/etc/keys/private.pem"
+providers:
+  - name: github
+    type: github
+    githubOAuth:
+      clientId: "id-only"
+`)
+	if _, err := Load(p); err == nil {
+		t.Error("expected error for incomplete github provider")
+	}
+}
+
+func TestLoad_ProvidersList_CFVerifyJWTExplicitFalse(t *testing.T) {
+	p := writeTempConfig(t, `
+issuer: "https://auth.foo.example"
+signing:
+  rs256:
+    privateKeyFile: "/etc/keys/private.pem"
+providers:
+  - name: cfaccess
+    type: cloudflare
+    cloudflareAccess:
+      verifyJWT: false
+`)
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.Providers[0].CloudflareAccess.VerifyJWTEnabled() {
+		t.Error("explicit verifyJWT: false must be honored")
+	}
+}
+
+func TestLoad_AuthModeArray_ConvertsLegacyBlocks(t *testing.T) {
+	p := writeTempConfig(t, `
+authMode: [basic, any]
+issuer: "https://auth.foo.example"
+signing:
+  rs256:
+    privateKeyFile: "/etc/keys/private.pem"
+basicAuth:
+  htpasswdFile: "/etc/htpasswd"
+`)
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if len(cfg.Providers) != 2 {
+		t.Fatalf("expected 2 converted providers, got %d", len(cfg.Providers))
+	}
+	if cfg.Providers[0].Name != "htpasswd" || cfg.Providers[0].Type != AuthModeBasic {
+		t.Errorf("providers[0]: got %s:%s", cfg.Providers[0].Name, cfg.Providers[0].Type)
+	}
+	if cfg.Providers[1].Name != "anyauth" || cfg.Providers[1].Type != AuthModeAny {
+		t.Errorf("providers[1]: got %s:%s", cfg.Providers[1].Name, cfg.Providers[1].Type)
+	}
+	if len(cfg.AuthMode) != 2 || cfg.AuthMode[0] != "htpasswd" || cfg.AuthMode[1] != "anyauth" {
+		t.Errorf("authMode: got %v", cfg.AuthMode)
+	}
+}
+
+func TestLoad_AuthModeAdvertisesProvidersByName(t *testing.T) {
+	p := writeTempConfig(t, `
+authMode: [alt, anyauth]
+issuer: "https://auth.foo.example"
+signing:
+  rs256:
+    privateKeyFile: "/etc/keys/private.pem"
+providers:
+  - name: anyauth
+    type: any
+  - name: alt
+    type: any
+  - name: dormant
+    type: any
+`)
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	// ALL defined providers stay enabled; authMode only orders the
+	// advertised subset.
+	if len(cfg.Providers) != 3 {
+		t.Fatalf("expected all 3 providers enabled, got %d", len(cfg.Providers))
+	}
+	if len(cfg.AuthMode) != 2 || cfg.AuthMode[0] != "alt" || cfg.AuthMode[1] != "anyauth" {
+		t.Errorf("advertised: got %v", cfg.AuthMode)
+	}
+}
+
+func TestLoad_AuthModeRejectsDuplicateEntries(t *testing.T) {
+	p := writeTempConfig(t, `
+authMode: [anyauth, anyauth]
+issuer: "https://auth.foo.example"
+signing:
+  rs256:
+    privateKeyFile: "/etc/keys/private.pem"
+providers:
+  - name: anyauth
+    type: any
+`)
+	if _, err := Load(p); err == nil {
+		t.Error("expected error for duplicate authMode entries")
+	}
+}
+
+func TestLoad_AuthModeRejectsUnknownProviderName(t *testing.T) {
+	p := writeTempConfig(t, `
+authMode: nope
+issuer: "https://auth.foo.example"
+signing:
+  rs256:
+    privateKeyFile: "/etc/keys/private.pem"
+providers:
+  - name: anyauth
+    type: any
+`)
+	if _, err := Load(p); err == nil {
+		t.Error("expected error for authMode referencing unknown provider")
+	}
+}
+
+func TestLoad_ProvidersDefaultAllActive(t *testing.T) {
+	p := writeTempConfig(t, `
+issuer: "https://auth.foo.example"
+signing:
+  rs256:
+    privateKeyFile: "/etc/keys/private.pem"
+providers:
+  - name: anyauth
+    type: any
+  - name: alt
+    type: any
+`)
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if len(cfg.Providers) != 2 {
+		t.Fatalf("expected both providers active, got %d", len(cfg.Providers))
+	}
+	if len(cfg.AuthMode) != 2 || cfg.AuthMode[0] != "anyauth" || cfg.AuthMode[1] != "alt" {
+		t.Errorf("authMode: got %v", cfg.AuthMode)
 	}
 }
 
