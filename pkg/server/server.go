@@ -334,9 +334,11 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 			return
 		}
 
-		// Suppress WWW-Authenticate-style challenges on /auth/embed so
-		// invisible iframes don't trigger a credential dialog.
-		if !isEmbedPath(r.URL.Path) {
+		// Only challenge interactive requests: a WWW-Authenticate
+		// header on a background fetch (the v2 client frame's
+		// /auth/token probe) or an invisible iframe would pop the
+		// browser's credential dialog on every page load.
+		if !suppressChallenge(r) {
 			for k, vs := range fallback.Challenge {
 				for _, v := range vs {
 					w.Header().Add(k, v)
@@ -380,6 +382,21 @@ func (s *Server) ambientTokenHandler(amb protection.AmbientAuthenticator) http.H
 // Both forms appear depending on where the middleware sits.
 func isEmbedPath(p string) bool {
 	return p == "/auth/embed" || p == "/embed"
+}
+
+// suppressChallenge reports whether WWW-Authenticate-style challenges
+// must be withheld from an unauthenticated response. That is the case
+// for /auth/embed and for every browser request that isn't a top-level
+// navigation (Sec-Fetch-Dest other than "document": fetch/XHR report
+// "empty", iframes "iframe"). Requests without Fetch Metadata — non-browser
+// clients and old browsers — keep the challenge so they can still
+// negotiate credentials.
+func suppressChallenge(r *http.Request) bool {
+	if isEmbedPath(r.URL.Path) {
+		return true
+	}
+	dest := r.Header.Get("Sec-Fetch-Dest")
+	return dest != "" && dest != "document"
 }
 
 // isLogoutPath reports whether p targets the logout handler. The auth

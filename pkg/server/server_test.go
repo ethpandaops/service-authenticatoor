@@ -32,6 +32,7 @@ type fakeProvider struct {
 	emailHeader  string
 	verifyHeader string
 	loginPath    string
+	challenge    http.Header
 }
 
 func (p *fakeProvider) Name() string                  { return "fake" }
@@ -59,7 +60,7 @@ func (p *fakeProvider) Authenticate(_ context.Context, r *http.Request) (protect
 		if p.loginPath != "" {
 			return protection.Outcome{RedirectTo: p.LoginURL(r.URL.RequestURI())}, nil
 		}
-		return protection.Outcome{Status: http.StatusUnauthorized}, nil
+		return protection.Outcome{Status: http.StatusUnauthorized, Challenge: p.challenge}, nil
 	}
 	return protection.Outcome{Identity: &protection.Identity{
 		Subject: email,
@@ -367,6 +368,47 @@ func TestAuthMiddleware_ProviderRequiresExtraHeader(t *testing.T) {
 	s.routes().ServeHTTP(rr, req)
 	if rr.Code != http.StatusOK {
 		t.Errorf("status: got %d, want 200 with assertion present", rr.Code)
+	}
+}
+
+// TestAuthMiddleware_ChallengeOnlyOnInteractiveRequests checks that the
+// WWW-Authenticate challenge reaches top-level navigations and
+// non-browser clients, but not background fetches or iframes — those
+// would pop the browser's credential dialog on every page load.
+func TestAuthMiddleware_ChallengeOnlyOnInteractiveRequests(t *testing.T) {
+	s, _, prov := newTestServer(t)
+	prov.challenge = http.Header{"Www-Authenticate": {`Basic realm="test"`}}
+
+	tests := []struct {
+		name      string
+		path      string
+		fetchDest string
+		want      bool
+	}{
+		{"top-level login navigation", "/auth/login?return_to=x", "document", true},
+		{"non-browser client", "/auth/token", "", true},
+		{"frame token probe", "/auth/token", "empty", false},
+		{"userinfo fetch", "/auth/userinfo", "empty", false},
+		{"iframe navigation", "/auth/token", "iframe", false},
+		{"embed without fetch metadata", "/auth/embed?target_origin=x", "", false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, tc.path, nil)
+			if tc.fetchDest != "" {
+				req.Header.Set("Sec-Fetch-Dest", tc.fetchDest)
+			}
+			rr := httptest.NewRecorder()
+			s.routes().ServeHTTP(rr, req)
+
+			if rr.Code != http.StatusUnauthorized {
+				t.Fatalf("status: got %d, want 401", rr.Code)
+			}
+			got := rr.Header().Get("WWW-Authenticate") != ""
+			if got != tc.want {
+				t.Errorf("challenge present: got %v, want %v", got, tc.want)
+			}
+		})
 	}
 }
 
