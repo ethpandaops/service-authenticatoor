@@ -293,27 +293,3 @@ func TestSanitizeUsername(t *testing.T) {
 		})
 	}
 }
-
-func TestIsSafeReturnTo(t *testing.T) {
-	cases := []struct {
-		in   string
-		want bool
-	}{
-		{"", false},
-		{"/", true},
-		{"/auth/login", true},
-		{"/auth/login?x=1", true},
-		{"//evil.example/", false},
-		{`/\evil.example/`, false},
-		{"https://evil.example/", false},
-		{"javascript:alert(1)", false},
-		{"./relative", false},
-	}
-	for _, tc := range cases {
-		t.Run(tc.in, func(t *testing.T) {
-			if got := isSafeReturnTo(tc.in); got != tc.want {
-				t.Errorf("isSafeReturnTo(%q): got %v want %v", tc.in, got, tc.want)
-			}
-		})
-	}
-}

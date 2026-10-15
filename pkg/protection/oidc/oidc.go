@@ -12,12 +12,14 @@
 //
 // State encoding contract (matches the relay's regex):
 //
-//	state = "<public-url>~<random-nonce>"
+//	state = "<public-url><callback-dir>~<random-nonce>"
 //
 // where <public-url> is the originating authenticatoor's externally-
 // visible URL prefix (scheme + host + optional port; the relay's regex
-// constrains it to *.ethpandaops.io / *.localhost / 127.0.0.1) and
-// <random-nonce> is a 128-bit base64url value. The nonce is also stored
+// constrains it to *.ethpandaops.io / *.localhost / 127.0.0.1),
+// <callback-dir> is the callback path minus its trailing "/callback"
+// (e.g. "/oidc"; the relay redirects to <public-url><callback-dir>/callback)
+// and <random-nonce> is a 128-bit base64url value. The nonce is also stored
 // in the HMAC-signed state cookie alongside the original returnTo URL;
 // the callback compares the URL nonce to the cookie's nonce to bind the
 // flow to this browser (CSRF defense), and feeds the nonce to the OIDC
@@ -44,7 +46,8 @@ import (
 
 // Defaults applied when corresponding Config fields are empty.
 const (
-	DefaultCallbackPath      = "/auth/oidc/callback"
+	DefaultLoginPath         = "/oidc/login"
+	DefaultCallbackPath      = "/oidc/callback"
 	DefaultSessionCookieName = "authenticatoor_oidc_session"
 	DefaultStateCookieName   = "authenticatoor_oidc_state"
 	DefaultSessionTTL        = 12 * time.Hour
@@ -96,11 +99,15 @@ type Config struct {
 	// Required.
 	SessionKey []byte
 
+	// LoginPath is the interactive login entry: it sets the state cookie
+	// and redirects to the IdP's authorize endpoint. Defaults to
+	// "/oidc/login".
+	LoginPath string
 	// CallbackPath is the local path that handles the OIDC callback.
 	// In a relay-fronted deployment, the IdP only ever sees CallbackURL
 	// (the relay's URL) and the relay forwards to <PublicURL><CallbackPath>.
 	// In a direct deployment, CallbackURL should equal
-	// <PublicURL><CallbackPath>. Default "/auth/oidc/callback".
+	// <PublicURL><CallbackPath>. Default "/oidc/callback".
 	CallbackPath string
 	// SessionCookieName is the name of the session cookie. Default
 	// "authenticatoor_oidc_session".
@@ -156,11 +163,17 @@ type Provider struct {
 	cookieSecure  bool
 }
 
-var _ protection.Provider = (*Provider)(nil)
+var (
+	_ protection.Provider       = (*Provider)(nil)
+	_ protection.SessionClearer = (*Provider)(nil)
+)
 
 // New constructs a Provider. Defaults are filled in here; secret material,
 // discovery fetch, and JWKS load happen in Start.
 func New(log logrus.FieldLogger, cfg Config) *Provider {
+	if cfg.LoginPath == "" {
+		cfg.LoginPath = DefaultLoginPath
+	}
 	if cfg.CallbackPath == "" {
 		cfg.CallbackPath = DefaultCallbackPath
 	}
@@ -246,17 +259,23 @@ func (p *Provider) Start(ctx context.Context) error {
 // Stop is a no-op.
 func (p *Provider) Stop() error { return nil }
 
-// RegisterRoutes attaches the OIDC callback handler. It runs on the
-// parent router (not the /auth/* subrouter) so the auth middleware is
-// bypassed — the request IS the act of authenticating.
+// RegisterRoutes attaches the login entry and the OIDC callback handler.
+// They run on the parent router (not the /auth/* subrouter) so the auth
+// middleware is bypassed — the request IS the act of authenticating.
 func (p *Provider) RegisterRoutes(r *mux.Router) {
+	r.HandleFunc(p.cfg.LoginPath, p.handleLoginStart).Methods(http.MethodGet)
 	r.HandleFunc(p.cfg.CallbackPath, p.handleCallback).Methods(http.MethodGet)
 }
 
+// LoginURL returns the login entry path carrying returnTo.
+func (p *Provider) LoginURL(returnTo string) string {
+	v := url.Values{}
+	v.Set("return_to", returnTo)
+	return p.cfg.LoginPath + "?" + v.Encode()
+}
+
 // Authenticate looks for a valid session cookie. When absent or stale the
-// provider returns a redirect to the IdP's authorize endpoint, with a
-// signed state cookie that carries the OIDC nonce + the original request
-// URL so the callback can complete the round-trip.
+// outcome redirects to the login entry, which starts the OIDC flow.
 func (p *Provider) Authenticate(_ context.Context, r *http.Request) (protection.Outcome, error) {
 	if c, err := r.Cookie(p.cfg.SessionCookieName); err == nil {
 		sub, email, perr := session.Parse(p.sessionSecret, c.Value, p.cfg.Now())
@@ -266,18 +285,32 @@ func (p *Provider) Authenticate(_ context.Context, r *http.Request) (protection.
 				Email:   email,
 			}}, nil
 		}
-		p.log.WithError(perr).Debug("session cookie invalid; redirecting to IdP")
+		p.log.WithError(perr).Debug("session cookie invalid; redirecting to login")
 	}
 
+	return protection.Outcome{RedirectTo: p.LoginURL(r.URL.RequestURI())}, nil
+}
+
+// handleLoginStart begins the OIDC dance: mint the nonce, bind it to the
+// (sanitized) return_to in the signed state cookie, and redirect to the
+// IdP's authorize endpoint. The nonce doubles as the id_token `nonce`
+// claim (replay defense) — see the package comment for the state
+// encoding contract.
+func (p *Provider) handleLoginStart(w http.ResponseWriter, r *http.Request) {
 	nonce, err := session.NewNonce()
 	if err != nil {
-		return protection.Outcome{}, fmt.Errorf("oidc: nonce: %w", err)
+		p.log.WithError(err).Error("nonce generation failed")
+		http.Error(w, "state error", http.StatusInternalServerError)
+		return
 	}
-	stateBlob, err := session.SignState(p.sessionSecret, nonce, r.URL.RequestURI(), p.cfg.Now(), DefaultStateTTL)
+	returnTo := protection.SafeReturnTo(r.URL.Query().Get("return_to"))
+	stateBlob, err := session.SignState(p.sessionSecret, nonce, returnTo, p.cfg.Now(), DefaultStateTTL)
 	if err != nil {
-		return protection.Outcome{}, fmt.Errorf("oidc: sign state: %w", err)
+		p.log.WithError(err).Error("state signing failed")
+		http.Error(w, "state error", http.StatusInternalServerError)
+		return
 	}
-	stateCookie := &http.Cookie{
+	http.SetCookie(w, &http.Cookie{
 		Name:     p.cfg.StateCookieName,
 		Value:    stateBlob,
 		Path:     p.cfg.CallbackPath,
@@ -285,16 +318,23 @@ func (p *Provider) Authenticate(_ context.Context, r *http.Request) (protection.
 		HttpOnly: true,
 		Secure:   p.cookieSecure,
 		SameSite: http.SameSiteLaxMode,
-	}
+	})
+	w.Header().Set("Cache-Control", "no-store")
+	http.Redirect(w, r, p.authorizeRedirect(nonce), http.StatusFound)
+}
 
-	return protection.Outcome{
-		RedirectTo: p.authorizeRedirect(nonce),
-		SetCookies: []*http.Cookie{stateCookie},
-	}, nil
+// statePrefix is the routing prefix carried in the state parameter: the
+// public URL plus the callback path minus its trailing "/callback"
+// segment (e.g. "https://auth.example/oidc"). The relay appends
+// "/callback" to it, so callback paths are expected to end in
+// "/callback".
+func (p *Provider) statePrefix() string {
+	return strings.TrimRight(p.cfg.PublicURL, "/") +
+		strings.TrimSuffix(p.cfg.CallbackPath, "/callback")
 }
 
 // authorizeRedirect builds the IdP authorize URL. The state parameter
-// is "<publicURL>~<nonce>" — the prefix lets the relay route the
+// is "<statePrefix>~<nonce>" — the prefix lets the relay route the
 // callback back to this instance, and the nonce binds the URL to the
 // state cookie on this browser (CSRF defense; the cookie carries the
 // full signed payload including returnTo).
@@ -305,7 +345,7 @@ func (p *Provider) authorizeRedirect(nonce string) string {
 	v.Set("response_type", "code")
 	v.Set("scope", p.scopeList)
 	v.Set("nonce", nonce)
-	v.Set("state", strings.TrimRight(p.cfg.PublicURL, "/")+stateDelimiter+nonce)
+	v.Set("state", p.statePrefix()+stateDelimiter+nonce)
 	return p.disco.AuthorizationEndpoint + "?" + v.Encode()
 }
 
@@ -329,7 +369,7 @@ func (p *Provider) handleCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// State value shape: "<public-url>~<nonce>". Use LastIndex defensively
+	// State value shape: "<statePrefix>~<nonce>". Use LastIndex defensively
 	// in case the public URL ever contains `~` (it shouldn't).
 	idx := strings.LastIndex(stateParam, stateDelimiter)
 	if idx < 0 {
@@ -342,10 +382,10 @@ func (p *Provider) handleCallback(w http.ResponseWriter, r *http.Request) {
 	// Anchor: the state must claim THIS instance. A flow that landed
 	// here with a different public URL is either misrouted by the relay
 	// (allow-list regex too loose) or crafted by an attacker.
-	if urlStatePrefix != strings.TrimRight(p.cfg.PublicURL, "/") {
+	if urlStatePrefix != p.statePrefix() {
 		p.log.WithFields(logrus.Fields{
 			"got":      urlStatePrefix,
-			"expected": p.cfg.PublicURL,
+			"expected": p.statePrefix(),
 		}).Warn("state prefix mismatch — flow originated elsewhere")
 		http.Error(w, "state prefix mismatch", http.StatusBadRequest)
 		return

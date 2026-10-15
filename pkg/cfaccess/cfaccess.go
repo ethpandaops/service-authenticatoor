@@ -36,6 +36,24 @@ type Claims struct {
 	Identity string `json:"identity_nonce,omitempty"`
 }
 
+// MetaClaims is the subset of claims carried by the "meta" token that
+// Cloudflare Access embeds in its login redirect
+// (https://<team>/cdn-cgi/access/login/<host>?kid=<aud>&meta=<jwt>). It
+// is signed with the team's keys and names the protected application
+// (aud) and the requested hostname, which lets an instance learn its own
+// application AUD tag without configuration.
+type MetaClaims struct {
+	jwt.RegisteredClaims
+
+	Type     string `json:"type"`
+	Hostname string `json:"hostname"`
+}
+
+// MetaVerifier validates Cloudflare Access login-redirect meta tokens.
+type MetaVerifier interface {
+	VerifyMeta(ctx context.Context, jwtString string) (*MetaClaims, error)
+}
+
 // Verifier validates Cloudflare Access assertion JWTs. Implementations are
 // safe for concurrent use.
 type Verifier interface {
@@ -121,6 +139,36 @@ func (v *JWKSVerifier) Verify(ctx context.Context, tokenString string) (*Claims,
 	// least one — the provider decides whether a service token is allowed.
 	if claims.Email == "" && claims.CommonName == "" {
 		return nil, errors.New("cfaccess: assertion missing both email and common_name claims")
+	}
+	return claims, nil
+}
+
+// VerifyMeta parses and validates a login-redirect meta token: RS256
+// signature against the team's JWKS, unexpired, and type "meta". Meta
+// tokens carry no issuer claim, so the team key is the only anchor; the
+// caller must check Hostname. Returns an error on any failure.
+func (v *JWKSVerifier) VerifyMeta(_ context.Context, tokenString string) (*MetaClaims, error) {
+	if tokenString == "" {
+		return nil, errors.New("cfaccess: empty meta token")
+	}
+	claims := &MetaClaims{}
+	parser := jwt.NewParser(
+		jwt.WithValidMethods([]string{jwt.SigningMethodRS256.Alg()}),
+		jwt.WithExpirationRequired(),
+		jwt.WithTimeFunc(v.cfg.Now),
+	)
+	tok, err := parser.ParseWithClaims(tokenString, claims, v.kf.Keyfunc)
+	if err != nil {
+		return nil, fmt.Errorf("cfaccess: parse meta: %w", err)
+	}
+	if !tok.Valid {
+		return nil, errors.New("cfaccess: meta token not valid")
+	}
+	if claims.Type != "meta" {
+		return nil, fmt.Errorf("cfaccess: unexpected meta token type %q", claims.Type)
+	}
+	if len(claims.Audience) != 1 || claims.Audience[0] == "" {
+		return nil, errors.New("cfaccess: meta token must name exactly one audience")
 	}
 	return claims, nil
 }

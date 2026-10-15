@@ -248,18 +248,30 @@ curl http://127.0.0.1:18080/.well-known/openid-configuration
 go test ./...
 ```
 
-## Protection modes
+## Protection providers
 
-`authMode` selects who is allowed to mint tokens. One provider per process:
+Providers decide who is allowed to mint tokens. The `providers` list
+defines the instances — all enabled: on each `/auth/*` request the chain
+runs in order and the first provider recognizing a credential (session
+cookie, ambient Cloudflare Access headers, Basic `Authorization`) wins.
+`authMode` (a name, or a list of names) picks what unauthenticated users
+are offered: a single advertised provider redirects into its own login
+flow, several redirect to the `/login` selector page. Each provider mounts
+its interactive login flow under its own prefix (`/cfaccess/login`,
+`/htpasswd/login`, `/github/login`, `/oidc/login`, `/anyauth/login`),
+so `/auth/*` itself needs no edge protection.
 
 - **`cloudflare`** (default): trust headers from a Cloudflare Access (or
-  similar) reverse-proxy SSO; optionally verify the assertion JWT.
+  similar) reverse-proxy SSO; optionally verify the assertion JWT. Works
+  with the edge covering `/auth/*` (ambient) or just `/cfaccess/*`
+  (cookie via `/cfaccess/login`; machine token alias at `/cfaccess/token`).
 - **`basic`**: HTTP Basic auth backed by an htpasswd file. Self-contained.
 - **`any`**: dev-only — any Basic credential is accepted, username = identity.
 - **`github`**: GitHub OAuth with org-membership gating; signed session cookie.
+- **`oidc`**: OpenID Connect against any IdP, with group gating.
 
-See [`docs/config.md`](docs/config.md#protection-modes) for the per-mode
-config blocks and trade-offs.
+See [`docs/config.md`](docs/config.md#protection-providers) for the
+per-provider config blocks and trade-offs.
 
 ## Repo layout
 
@@ -270,7 +282,7 @@ pkg/issuer/           issuer-side: RSA keys, RS256 signing, JWKS marshaling
 pkg/cors/             CORS middleware with strict allow-list
 pkg/cfaccess/         Cf-Access-Jwt-Assertion verification
 pkg/config/           YAML + env config loader, derivation, validation
-pkg/protection/       Provider interface; sub-packages cloudflare/basic/anyauth/github
+pkg/protection/       Provider interface; sub-packages cloudflare/basic/anyauth/github/oidc
 pkg/server/           HTTP server: routes, handlers, lifecycle
 Dockerfile            multi-stage source build
 Dockerfile-stub       packages a pre-built binary into a distroless image (used by CI)

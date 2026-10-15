@@ -32,9 +32,12 @@ signing:
   rs256:
     privateKeyFile: "/etc/authenticatoor/keys/private.pem"
 
-cloudflareAccess:
-  teamDomain: "<team>.cloudflareaccess.com"
-  audTag: "<from CF Access app config>"
+providers:
+  - name: cfaccess
+    type: cloudflare
+    cloudflareAccess:
+      teamDomain: "<team>.cloudflareaccess.com"
+      audTag: "<from CF Access app config>"
 ```
 
 Everything else is derived from the issuer URL (audience, scope, return-host
@@ -50,38 +53,44 @@ allow-list, CORS origins) or covered by sensible defaults.
 | `audience`                             | string list | parent zone of `issuer` host         | JWT `aud`.                                                            |
 | `scopePattern`                         | string      | `*.<parent zone>`                    | JWT `scope` (host wildcard).                                          |
 | `tokenTTL`                             | duration    | `30m`                                | JWT lifetime.                                                         |
-| `authMode`                             | string      | `cloudflare`                         | `cloudflare`, `basic`, `any`, `github`, or `oidc`. See **Protection modes** below. |
+| `authMode`                             | string \| string list | all defined providers      | Provider(s) *advertised* to unauthenticated users, referenced by instance name. One entry → direct login redirect; several → `/login` selection page (in this order). All defined providers stay enabled regardless — unlisted ones just aren't offered. With an empty `providers` list, entries name provider *types* whose legacy top-level blocks are converted. Env override accepts a comma-separated value. |
+| `providers`                            | list        | converted from legacy blocks         | Canonical provider instance definitions. See **Protection providers** below. |
+| `providers[].name`                     | string      | (required)                           | Instance name; doubles as the path prefix (`/<name>/login`, …), the selector-page label, and the reference key in `authMode`. Unique, `[a-z0-9-]`. |
+| `providers[].type`                     | string      | (required)                           | Provider implementation: `cloudflare`, `basic`, `any`, `github`, or `oidc`. |
 | `devMode`                              | bool        | `false`                              | Serve client scripts unminified for local development (no source maps generated). |
 | `userHeader`                           | string      | `Cf-Access-Authenticated-User-Email` | **Deprecated** alias for `cloudflareAccess.userHeader`. Folded in by Load when the new field is empty; emits a startup warning when both are set. |
 | `allowedReturnHosts`                   | string list | `["*.<parent zone>"]`                | Hosts allowed in `/auth/login?return_to=…`.                           |
 | `cors.allowedOrigins`                  | string list | = `allowedReturnHosts`               | Browsers allowed to call `/auth/*` with credentials.                  |
 | `cloudflareAccess.verifyJWT`           | bool        | `true`                               | Verify `Cf-Access-Jwt-Assertion` against CF JWKS.                     |
 | `cloudflareAccess.teamDomain`          | string      | (required when `verifyJWT`)          | e.g. `<team>.cloudflareaccess.com`.                                   |
-| `cloudflareAccess.audTag`              | string      | `""`                                 | AUD tag of the CF Access application. When empty the audience claim is not checked — signature + issuer still pin the assertion to the team. |
+| `cloudflareAccess.audTag`              | string      | `""` (detected)                      | AUD tag of the CF Access application. When empty (and `verifyJWT` is on), the tag is detected from Cloudflare's login redirect for `/<name>/login` and enforced on `/<name>/login` and `/<name>/token`; those routes answer 503 until it is detected. `/auth/*` then checks signature + issuer only, pinning the assertion to the team but not the application. |
 | `cloudflareAccess.jwtHeader`           | string      | `Cf-Access-Jwt-Assertion`            |                                                                       |
 | `cloudflareAccess.userHeader`          | string      | `Cf-Access-Authenticated-User-Email` | Header carrying the authenticated email. Replaces top-level `userHeader`. |
 | `cloudflareAccess.allowServiceTokens`  | bool        | `true`                               | Allow non-identity CF Access service tokens, using the token's `common_name` (client ID) as the identity subject. Still gated by the app's CF Access policy. Requires `verifyJWT`. |
+| `cloudflareAccess.sessionCookieName`   | string      | `authenticatoor_<name>_session`      | Browser cookie name for login-path sessions. |
+| `cloudflareAccess.sessionTTL`          | duration    | `12h`                                | Lifetime of login-path sessions; the CF Access policy is only re-checked on expiry. |
 | `basicAuth.htpasswdFile`               | string      | (required for `basic`)               | Path to the htpasswd password file.                                   |
 | `basicAuth.realm`                      | string      | `authenticatoor`                     | Sent in `WWW-Authenticate: Basic realm="…"`.                          |
+| `basicAuth.sessionCookieName`          | string      | `authenticatoor_<name>_session`      | Browser cookie name for login-path sessions. |
+| `basicAuth.sessionTTL`                 | duration    | `12h`                                | Lifetime of login-path sessions. |
 | `anyAuth.cookieName`                   | string      | `authenticatoor_anyauth_user`        | Cookie holding the chosen username for the dev-only any-auth provider. |
-| `anyAuth.loginPath`                    | string      | `/auth/anyauth/login`                | Path of the dev-login form (GET to render, POST to submit).           |
 | `anyAuth.cookieTTL`                    | duration    | `12h`                                | Cookie lifetime for the dev-only any-auth provider.                   |
 | `githubOAuth.clientId`                 | string      | (required for `github`)              | OAuth app client ID.                                                  |
 | `githubOAuth.clientSecret`             | string      | (required for `github`)              | OAuth app client secret. Inline alternative to `clientSecretFile`.    |
 | `githubOAuth.clientSecretFile`         | string      |                                      | File path holding the OAuth app secret.                               |
-| `githubOAuth.callbackPath`             | string      | `/auth/oauth/callback`               | Must match the redirect URI registered with the GitHub OAuth app.    |
-| `githubOAuth.sessionCookieName`        | string      | `authenticatoor_session`             | Browser cookie name for the session.                                  |
-| `githubOAuth.stateCookieName`          | string      | `authenticatoor_oauth_state`         | Browser cookie name for the OAuth CSRF state.                         |
+| `githubOAuth.callbackPath`             | string      | `/<name>/callback` (legacy block: `/auth/oauth/callback`) | Must match the redirect URI registered with the GitHub OAuth app.    |
+| `githubOAuth.sessionCookieName`        | string      | `authenticatoor_<name>_session` (legacy block: `authenticatoor_session`) | Browser cookie name for the session.                                  |
+| `githubOAuth.stateCookieName`          | string      | `authenticatoor_<name>_state` (legacy block: `authenticatoor_oauth_state`) | Browser cookie name for the OAuth CSRF state.                         |
 | `githubOAuth.sessionTTL`               | duration    | `12h`                                | Session cookie lifetime.                                              |
 | `githubOAuth.allowedOrgs`              | string list | (required for `github`)              | GitHub orgs whose members may authenticate. Case-insensitive.         |
 | `oidc.issuerURL`                       | string      | (required for `oidc`)                | IdP issuer URL. Discovery doc fetched from `<issuerURL>/.well-known/openid-configuration` at startup. |
-| `oidc.callbackURL`                     | string      | (required for `oidc`)                | Absolute callback URL registered at the IdP as this client's `redirect_uri`. Use the shared relay URL for relay-fronted deployments, or `<externalURL>/auth/oidc/callback` for direct ones. |
+| `oidc.callbackURL`                     | string      | (required for `oidc`)                | Absolute callback URL registered at the IdP as this client's `redirect_uri`. Use the shared relay URL for relay-fronted deployments, or `<externalURL>/oidc/callback` for direct ones. |
 | `oidc.clientId`                        | string      | (required for `oidc`)                | OAuth client_id registered at the IdP.                                |
 | `oidc.clientSecret`                    | string      | (required for `oidc`)                | OAuth client secret. Inline alternative to `clientSecretFile`.        |
 | `oidc.clientSecretFile`                | string      |                                      | File path holding the OAuth client secret.                            |
-| `oidc.callbackPath`                    | string      | `/auth/oidc/callback`                | Local path the relay forwards the callback to.                        |
-| `oidc.sessionCookieName`               | string      | `authenticatoor_oidc_session`        | Browser cookie name for the session.                                  |
-| `oidc.stateCookieName`                 | string      | `authenticatoor_oidc_state`          | Browser cookie name for the OAuth CSRF / OIDC nonce state.            |
+| `oidc.callbackPath`                    | string      | `/<name>/callback` (legacy block: `/auth/oidc/callback`) | Local path the relay forwards the callback to. Must end in `/callback` for relay routing. |
+| `oidc.sessionCookieName`               | string      | `authenticatoor_<name>_session`      | Browser cookie name for the session.                                  |
+| `oidc.stateCookieName`                 | string      | `authenticatoor_<name>_state`        | Browser cookie name for the OAuth CSRF / OIDC nonce state.            |
 | `oidc.sessionTTL`                      | duration    | `12h`                                | Session cookie lifetime.                                              |
 | `oidc.allowedGroups`                   | string list | `[]` (inherit IdP gating)            | Groups (as emitted by the IdP) whose members may authenticate. For dex's GitHub connector each group is `<org>` or `<org>:<team>`. Case-insensitive. A bare `<org>` entry matches both `<org>` and any `<org>:<team>` (useful because dex emits `<org>:<team>` for orgs even without a `teams:` filter). An `<org>:<team>` entry matches that exact team only. Empty list = trust the IdP's own gating. |
 | `oidc.scopes`                          | string list | `[openid, email, groups]`            | OIDC scopes requested. `openid` is required.                          |
@@ -96,21 +105,114 @@ allow-list, CORS origins) or covered by sensible defaults.
 | `metrics.enabled`                      | bool        | `false`                              | Expose `/metrics` on a separate port.                                 |
 | `metrics.listen`                       | string      | `:9090`                              | Bind address for the metrics server.                                  |
 
-## Protection modes
+## Protection providers
 
-`authMode` selects the active protection provider. Exactly one provider
-gates `/auth/*` per process. The defaults preserve the original Cloudflare
-Access behavior.
+Providers gate `/auth/*`. The `providers` list defines the instances —
+all of them enabled: on each `/auth/*` request every defined provider
+passively inspects the credentials already present — a session cookie,
+ambient Cloudflare Access headers, a Basic `Authorization` header — and
+the first match wins. No provider ever starts a login flow from
+`/auth/*` itself.
+
+`authMode` (a string or a list of instance names) controls what is
+*advertised* to unauthenticated users: one entry sends them straight
+into that provider's login flow, several entries send them to the
+`/login` selection page listing exactly those providers. Providers left
+out of `authMode` keep authenticating and their `/<name>/login` routes
+stay reachable — they just aren't offered. Useful for machine-only or
+soft-launched providers.
+
+Legacy compatibility: when `providers` is empty, each `authMode` entry
+names a provider *type* (`cloudflare`, `basic`, `any`, `github`, `oidc`)
+and the matching legacy top-level block (`cloudflareAccess:`, …) is
+converted into a provider entry, named after the type (cloudflare→
+`cfaccess`, basic→`htpasswd`, any→`anyauth`, github→`github`,
+oidc→`oidc`). Converted `github` / `oidc` entries keep the previous
+defaults for unset fields — callback paths `/auth/oauth/callback` /
+`/auth/oidc/callback` and cookie names `authenticatoor_session` /
+`authenticatoor_oauth_state` (github) — so registered redirect URIs keep
+working. Session cookies are signed with a new per-provider key, so
+existing sessions require one re-login after the upgrade. Prefer the
+`providers` list for new configs.
+
+Interactive login lives under each provider's own path prefix, derived
+from the entry's (required) `name`:
+
+| Route              | Providers          | Purpose                                              |
+| ------------------ | ------------------ | ---------------------------------------------------- |
+| `/<name>/login`    | all                | Login entry: authenticates, mints a signed session cookie, redirects back via `return_to`. |
+| `/<name>/callback` | `github`, `oidc`   | OAuth/OIDC callback.                                 |
+| `/<name>/token`    | `cloudflare`       | Machine token alias: `/auth/token` contract, authenticated purely from ambient CF headers (service tokens; never redirects). |
+| `/login`           | server             | Provider selector listing the `authMode` entries. Redirects straight to the login entry when only one provider is advertised. |
+
+When no provider authenticates a request, an instance advertising a
+single provider applies that provider's own fallback (redirect to its
+login entry, or the Basic challenge); with several advertised providers
+the request 302s to the `/login` selection page.
+
+`/auth/*` itself needs **no edge protection** in this model. For the
+`cloudflare` type, only the `/cfaccess/*` prefix has to be covered by the
+CF Access application; an edge that (still) covers `/auth/*` keeps
+working unchanged, because the ambient headers authenticate before any
+redirect happens. That makes migration a pure Cloudflare-side change:
+narrow the CF Access app from the whole host (or `/auth/*`) down to
+`/cfaccess/*`, no service redeploy needed.
+
+Without a configured `audTag`, the provider learns its application's
+AUD tag on its own: it requests `<externalURL>/<name>/login` without
+credentials, and once the CF Access edge covers that path, Cloudflare's
+login redirect carries a team-signed `meta` token naming the
+application and hostname. The tag is verified against the team JWKS and
+the instance's own hostname, then required on `/<name>/login` and
+`/<name>/token`. Until the edge covers the prefix, those two routes
+answer 503 — they never accept assertions issued for other applications
+of the team. Detection retries every minute (and on demand when a login
+arrives), so narrowing the CF Access app takes effect without a restart.
+
+Session cookies are HMAC-signed with a per-provider key derived from the
+JWT signing key — no separate session secret to manage, and one
+provider's cookie cannot be replayed as another's. Rotating the signing
+key invalidates all active sessions.
+
+```yaml
+# Multi-provider example: CF Access for the edge-protected path plus a
+# second OIDC IdP; both advertised, so unauthenticated users pick one
+# on /login.
+authMode: [cfaccess, oidc]
+providers:
+  - name: cfaccess
+    type: cloudflare
+    cloudflareAccess:
+      teamDomain: "<team>.cloudflareaccess.com"
+  - name: oidc
+    type: oidc
+    oidc:
+      issuerURL: "https://dex.primary.production.platform.ethpandaops.io"
+      callbackURL: "https://oidc-relay.primary.production.platform.ethpandaops.io/oidc/callback"
+      clientId: "authenticatoor"
+      clientSecretFile: "/etc/authenticatoor/oidc-client-secret"
+      allowedGroups: ["ethpandaops"]
+```
 
 ### `cloudflare` (default)
 
-A reverse-proxy SSO sits in front of the service. The provider trusts the
-proxy's user-email header and (when `verifyJWT: true`) verifies the
-proxy's signed assertion against Cloudflare's JWKS. There is no
-service-side login UI — Cloudflare's login page handles unauthenticated
-users before they ever reach this service. Logout 302s to
-`/cdn-cgi/access/logout`, which the CF edge intercepts on the protected
-origin to clear the local `CF_Authorization` cookie.
+Cloudflare Access authenticates the user at the edge and forwards the
+identity as request headers. The provider trusts the user-email header
+and (when `verifyJWT: true`) verifies the signed assertion against
+Cloudflare's JWKS. Two topologies:
+
+- **Edge covers `/auth/*`** (the original deployment): every request
+  arrives with CF headers and authenticates ambiently. The login path is
+  never used.
+- **Edge covers `/cfaccess/*` only**: `/auth/*` is publicly reachable;
+  unauthenticated browsers are redirected to `/cfaccess/login`, which
+  sits behind CF Access, converts the ambient identity into a session
+  cookie, and bounces back. Machines holding CF Access service tokens
+  call `/cfaccess/token` (same JSON contract as `/auth/token`) on the
+  protected prefix.
+
+Logout 302s to `/cdn-cgi/access/logout`, which the CF edge intercepts on
+the protected origin to clear the local `CF_Authorization` cookie.
 
 ```yaml
 authMode: cloudflare
@@ -124,8 +226,12 @@ cloudflareAccess:
 
 HTTP Basic auth backed by an htpasswd file. Self-contained — no upstream
 proxy required. The browser handles the credential dialog and caches
-credentials per (origin, realm) until the tab closes. Hot-reload of the
-htpasswd file is not currently supported; redeploy on change.
+credentials per (origin, realm) until the tab closes. An `Authorization`
+header on `/auth/*` authenticates directly; the `/htpasswd/login` entry
+additionally converts valid credentials into a session cookie (needed
+when several providers share the instance, since `/auth/*` can only
+challenge for one realm). Hot-reload of the htpasswd file is not
+currently supported; redeploy on change.
 
 ```yaml
 authMode: basic
@@ -137,7 +243,7 @@ basicAuth:
 ### `any`
 
 **Development only.** Unauthenticated `/auth/*` requests are redirected
-to a small login form (`/auth/anyauth/login` by default) where the user
+to a small login form (`/anyauth/login` by default) where the user
 types any username. That username is stored in a plain, HttpOnly cookie
 and reused as the identity until the cookie is cleared via `POST
 /auth/logout` — handy for switching between identities while iterating
@@ -148,7 +254,6 @@ authMode: any
 # All anyAuth fields are optional; defaults are fine for local dev.
 # anyAuth:
 #   cookieName: "authenticatoor_anyauth_user"
-#   loginPath:  "/auth/anyauth/login"
 #   cookieTTL:  "12h"
 ```
 
@@ -161,7 +266,8 @@ emitted to downstream services has the GitHub login as `sub` and the
 primary verified email as `email`.
 
 The OAuth callback is registered at `githubOAuth.callbackPath` (default
-`/auth/oauth/callback`); this must match the redirect URI registered in
+`/<name>/callback`, or `/auth/oauth/callback` for the legacy top-level
+block); this must match the redirect URI registered in
 the GitHub OAuth app.
 
 ```yaml
@@ -194,20 +300,23 @@ confidential client at the IdP. To avoid registering a per-instance
 redirect URI with the IdP, the redirect target is a stateless
 **callback relay** (see `platform/applications/oidc-relay`) that
 forwards each callback to the originating authenticatoor based on the
-host encoded in the OAuth `state` parameter. The state contract:
+URL encoded in the OAuth `state` parameter. The state contract:
 
 ```
-state = "<our-public-url>~<base64url-signed-blob>"
+state = "<our-public-url><callback-dir>~<base64url-signed-blob>"
 ```
 
 where `<our-public-url>` is this instance's `externalURL` (the relay's
 regex constrains it to `*.ethpandaops.io` / `localhost` / `127.0.0.1`)
+and `<callback-dir>` is `oidc.callbackPath` minus its trailing
+`/callback` (e.g. `/oidc`); the relay redirects to
+`<our-public-url><callback-dir>/callback`,
 and the signed blob is HMAC-signed against a key derived from the JWT
 signing key. The relay never inspects the signed blob — only the
 originating instance can verify it.
 
 The provider also works **without** a relay: register
-`<externalURL>/auth/oidc/callback` directly at the IdP as the
+`<externalURL>/oidc/callback` directly at the IdP as the
 `redirect_uri` and set `oidc.callbackURL` to the same value.
 
 ```yaml
@@ -236,14 +345,15 @@ from the JWT signing key — no separate session secret to configure.
 
 ### Logout (`/auth/logout`)
 
-Always reachable, regardless of authentication state. Per-provider
-behavior:
+Always reachable, regardless of authentication state. With multiple
+providers configured, logout clears every provider's session cookie in
+one JSON response. With a single provider, its specific behavior applies:
 
-- **cloudflare**: 302 to `/cdn-cgi/access/logout`. CF Access intercepts that path on the protected origin and clears the `CF_Authorization` cookie.
+- **cloudflare**: clears the local session cookie and 302s to `/cdn-cgi/access/logout`. CF Access intercepts that path on the protected origin and clears the `CF_Authorization` cookie.
 - **any**: clears the username cookie (`authenticatoor_anyauth_user` by default). The next `/auth/*` request redirects back to the login form.
 - **github**: clears the session cookie. The next `/auth/*` request kicks off a fresh OAuth round-trip.
 - **oidc**: clears the session cookie. The next `/auth/*` request kicks off a fresh OIDC round-trip via dex. The IdP session is left intact (dex 2.x has no robust RP-initiated logout).
-- **basic**: 200 with a "close the tab" hint. HTTP Basic credentials are cached by the browser and the server has no reliable way to invalidate them — deliberately no `WWW-Authenticate` challenge so the iframe-based client logout doesn't pop a credential dialog.
+- **basic**: clears the session cookie; cached HTTP Basic credentials may re-authenticate ambiently until the tab closes (the server has no reliable way to invalidate the browser cache) — deliberately no `WWW-Authenticate` challenge so the iframe-based client logout doesn't pop a credential dialog.
 
 The bundled `client.js` calls `/auth/logout` from `logout()` via a hidden
 iframe after clearing local sessionStorage; the iframe follows any

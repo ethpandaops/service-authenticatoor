@@ -50,115 +50,128 @@ tokenTTL: "30m"
 #   allowedOrigins:
 #     - "*.example.com"
 
-# ─── auth mode ────────────────────────────────────────────────────────────────
+# ─── auth providers ───────────────────────────────────────────────────────────
 
-# Names the active protection provider. Default: "cloudflare".
-# Other modes (basic, any, github) are configured by their own blocks below.
-authMode: cloudflare
-
-# ─── Cloudflare Access (authMode: cloudflare) ─────────────────────────────────
-
-# When enabled (default), the service verifies the Cf-Access-Jwt-Assertion
-# header against Cloudflare's JWKS, in addition to trusting the user-email
-# header. Recommended even when the service is unreachable outside the CF
-# tunnel.
-cloudflareAccess:
-  verifyJWT: true
-  teamDomain: "<team>.cloudflareaccess.com"
-  # Optional. When set, assertions whose aud doesn't match are rejected. When
-  # empty, the audience claim is not checked — assertions from any application
-  # in the same CF Access team are accepted (signature + issuer still tie them
-  # to the team). Useful when you can't easily look up the AUD per deployment.
-  audTag: ""
-  jwtHeader: "Cf-Access-Jwt-Assertion"
-  # HTTP header carrying the authenticated user's email. CF Access forwards
-  # this automatically. Default: "Cf-Access-Authenticated-User-Email".
-  # The top-level userHeader field is a deprecated alias for this one.
-  userHeader: "Cf-Access-Authenticated-User-Email"
-  # Allow non-identity CF Access service tokens to authenticate, using the
-  # token's common_name (its client ID) as the identity subject. Whether a
-  # service token can reach the app at all is still gated by the app's CF
-  # Access policy. Requires verifyJWT. Default: true.
-  allowServiceTokens: true
-
-# ─── HTTP Basic auth (authMode: basic) ────────────────────────────────────────
-
-# Self-contained alternative to a reverse-proxy SSO. The browser handles the
-# credential dialog; credentials are validated against an htpasswd file.
-
-# basicAuth:
-#   htpasswdFile: "/etc/authenticatoor/htpasswd"
-#   realm: "authenticatoor"
-
-# ─── any auth (authMode: any) ─────────────────────────────────────────────────
-
-# DEV ONLY. Unauthenticated /auth/* requests redirect to a small form where
-# the user picks any username. The picked name is stored in a clearable
-# cookie and reused as the identity until POST /auth/logout. Defaults are
-# sensible — no anyAuth: block is needed unless you want to override the
-# cookie name, login path, or TTL.
-
-# anyAuth:
-#   cookieName: "authenticatoor_anyauth_user"
-#   loginPath:  "/auth/anyauth/login"
-#   cookieTTL:  "12h"
-
-# ─── GitHub OAuth (authMode: github) ──────────────────────────────────────────
-
-# Authenticates users through GitHub OAuth, gated on org membership. The
-# clientId / clientSecret come from a "GitHub OAuth App" created at
-# https://github.com/settings/developers (or under your org's settings).
-# Register the redirect URI as <issuer>/auth/oauth/callback (or whatever
-# githubOAuth.callbackPath you configure).
+# All providers defined in the `providers` list are enabled: they all
+# authenticate requests, and their login routes are always reachable.
 #
-# Mount clientSecret from a Kubernetes Secret in production; the inline
-# variant accepts the value directly via env var for ad-hoc deployments.
+# authMode: string | string list. Names the provider(s) actively
+# ADVERTISED to unauthenticated users, by instance name. With a single
+# entry, unauthenticated /auth/* requests go straight into that
+# provider's login flow; with several, they land on the /login provider
+# selection page listing exactly these entries (in this order). Providers
+# left out stay fully functional via their direct /<name>/login paths —
+# they just aren't offered. Unset = advertise all defined providers.
+# Env override accepts a comma-separated value
+# (AUTHENTICATOOR_AUTHMODE="cfaccess,oidc").
+authMode: cfaccess
 
-# githubOAuth:
-#   clientId: "Iv1.…"
-#   clientSecretFile: "/etc/authenticatoor/gh-secret"
-#   sessionTTL: "12h"
-#   allowedOrgs:
-#     - "ethpandaops"
-#   # callbackPath: "/auth/oauth/callback"
-#   # sessionCookieName: "authenticatoor_session"
-#   # stateCookieName: "authenticatoor_oauth_state"
-
-# ─── OIDC (authMode: oidc) ────────────────────────────────────────────────────
-
-# Standard OIDC against any IdP (designed against the central ethpandaops
-# dex). One shared confidential client at the IdP; per-instance redirect
-# URI registration is avoided by routing the callback through a stateless
-# relay (platform/applications/oidc-relay) that extracts the originating
-# authenticatoor host from the state parameter.
+# providers: the provider instances. Each entry has a required, unique
+# `name`, a `type`, and the type's config block. All interactive routes
+# live under the instance's own path prefix:
 #
-# State contract:  state = "<externalURL>~<base64url-signed-blob>"
-# Group membership is checked against the id_token's `groups` claim — for
-# dex's GitHub connector that's org names (and optionally `<org>:<team>`).
+#   /<name>/login      — login entry (authenticates, mints a signed session
+#                        cookie, redirects back via return_to)
+#   /<name>/callback   — OAuth/OIDC callback (github / oidc types)
+#   /<name>/token      — machine token alias (cloudflare type only): same
+#                        JSON contract as /auth/token, authenticated purely
+#                        from the ambient CF headers — keep this path behind
+#                        the CF Access application so service tokens work
+#                        without redirects.
 #
-# callbackURL is what the IdP redirects to after authentication. With a
-# relay in front: the relay's URL (shared across every authenticatoor).
-# Direct (no relay): <externalURL>/auth/oidc/callback, registered with
-# the IdP as this client's redirect_uri.
+# On each /auth/* request every active provider passively inspects the
+# credentials already present (session cookie, ambient CF headers, Basic
+# Authorization header) and the first match wins. /auth/* itself needs NO
+# edge protection — only the cloudflare type's /cfaccess/* prefix does. An
+# edge that (still) covers /auth/* keeps working: the CF headers
+# authenticate ambiently and the login redirect never triggers.
 #
-# Mount clientSecret from a Kubernetes Secret in production; the inline
-# variant works for ad-hoc setups via env var. The session HMAC key is
-# derived from the JWT signing key — no separate session secret to manage.
+# Session cookies are HMAC-signed with per-provider keys derived from the
+# JWT signing key — no separate session secret to manage.
+providers:
+  # Cloudflare Access: the edge authenticates and injects identity headers.
+  # verifyJWT (default true) verifies the Cf-Access-Jwt-Assertion against
+  # the team's JWKS — strongly recommended. allowServiceTokens (default
+  # true) lets non-identity CF service tokens authenticate with their
+  # common_name as subject.
+  - name: cfaccess
+    type: cloudflare
+    cloudflareAccess:
+      teamDomain: "<team>.cloudflareaccess.com"
+      # Optional. When set, assertions whose aud doesn't match are rejected.
+      # When empty, signature + issuer still tie the assertion to the team.
+      # audTag: ""
+      # verifyJWT: true
+      # allowServiceTokens: true
+      # jwtHeader: "Cf-Access-Jwt-Assertion"
+      # userHeader: "Cf-Access-Authenticated-User-Email"
+      # sessionCookieName: "authenticatoor_cfaccess_session"
+      # sessionTTL: "12h"   # CF policy re-checked only on cookie expiry
 
-# oidc:
-#   issuerURL: "https://dex.primary.production.platform.ethpandaops.io"
-#   callbackURL: "https://oidc-relay.primary.production.platform.ethpandaops.io/oidc/callback"
-#   clientId: "authenticatoor"
-#   clientSecretFile: "/etc/authenticatoor/oidc-client-secret"
-#   sessionTTL: "12h"
-#   allowedGroups:
-#     - "ethpandaops"
-#     - "EthDevOpsAccess:validatorops"
-#     - "sigp"
-#   # callbackPath: "/auth/oidc/callback"
-#   # sessionCookieName: "authenticatoor_oidc_session"
-#   # stateCookieName: "authenticatoor_oidc_state"
-#   # scopes: ["openid", "email", "groups"]
+  # HTTP Basic auth backed by an htpasswd file. Self-contained. An
+  # Authorization header on /auth/* authenticates directly; the login
+  # entry converts credentials into a session cookie (needed alongside
+  # other providers).
+  # - name: htpasswd
+  #   type: basic
+  #   basicAuth:
+  #     htpasswdFile: "/etc/authenticatoor/htpasswd"
+  #     realm: "authenticatoor"
+  #     # sessionCookieName: "authenticatoor_htpasswd_session"
+  #     # sessionTTL: "12h"
+
+  # DEV ONLY: a form where the user picks any username.
+  # - name: anyauth
+  #   type: any
+  #   anyAuth:
+  #     # cookieName: "authenticatoor_anyauth_user"
+  #     # cookieTTL:  "12h"
+
+  # GitHub OAuth with org-membership gating. Register the OAuth app's
+  # redirect URI as <issuer>/github/callback. Mount clientSecret from a
+  # Kubernetes Secret in production; the inline variant accepts the value
+  # via env var for ad-hoc deployments.
+  # - name: github
+  #   type: github
+  #   githubOAuth:
+  #     clientId: "Iv1.…"
+  #     clientSecretFile: "/etc/authenticatoor/gh-secret"
+  #     sessionTTL: "12h"
+  #     allowedOrgs:
+  #       - "ethpandaops"
+  #     # callbackPath: "/github/callback"
+  #     # sessionCookieName: "authenticatoor_github_session"
+  #     # stateCookieName: "authenticatoor_github_state"
+
+  # Standard OIDC against any IdP (designed against the central
+  # ethpandaops dex + oidc-relay; see docs/config.md for the relay/state
+  # contract). callbackURL is the relay's URL, or
+  # <externalURL>/oidc/callback for direct (relay-less) deployments.
+  # Group membership is checked against the id_token `groups` claim.
+  # Same type twice is fine — give each instance its own name, e.g. a
+  # second entry trusting a different IdP.
+  # - name: oidc
+  #   type: oidc
+  #   oidc:
+  #     issuerURL: "https://dex.primary.production.platform.ethpandaops.io"
+  #     callbackURL: "https://oidc-relay.primary.production.platform.ethpandaops.io/oidc/callback"
+  #     clientId: "authenticatoor"
+  #     clientSecretFile: "/etc/authenticatoor/oidc-client-secret"
+  #     sessionTTL: "12h"
+  #     allowedGroups:
+  #       - "ethpandaops"
+  #       - "EthDevOpsAccess:validatorops"
+  #     # callbackPath: "/oidc/callback"
+  #     # sessionCookieName: "authenticatoor_oidc_session"
+  #     # stateCookieName: "authenticatoor_oidc_state"
+  #     # scopes: ["openid", "email", "groups"]
+
+# Legacy form (deprecated): when `providers` is empty, authMode entries
+# name provider TYPES and the matching top-level blocks are converted
+# into provider entries (with names cloudflare→cfaccess, basic→htpasswd,
+# any→anyauth, github→github, oidc→oidc) — an old config with
+# `authMode: cloudflare` plus a top-level `cloudflareAccess:` block keeps
+# working unchanged. Prefer the providers list for new configs.
 
 # ─── signing keys ─────────────────────────────────────────────────────────────
 

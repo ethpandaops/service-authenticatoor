@@ -1,15 +1,16 @@
 // Package server wires the HTTP routes, middleware, and lifecycle. Two
 // listeners are exposed:
 //
-//   - the main listener serves /auth/*, /jwks.json, OIDC discovery,
-//     /healthz, and /
+//   - the main listener serves /auth/*, the per-provider login prefixes
+//     (/<name>/...), /jwks.json, OIDC discovery, /healthz, and /
 //   - when metrics are enabled, a separate listener serves /metrics
 //
-// /auth/* is gated by exactly one protection.Provider per process,
-// selected at startup via the authMode config field. The provider is
-// responsible for translating an incoming request into either an
-// Identity, a redirect to a login flow, or a 401 with optional
-// challenge headers.
+// /auth/* is gated by an ordered chain of protection.Providers: each
+// provider passively inspects the request (session cookie, ambient edge
+// headers, Authorization header) and the first Identity wins. When no
+// provider authenticates, a single-provider instance applies that
+// provider's own outcome (redirect to its login entry, or a challenge),
+// and a multi-provider instance redirects to the /login selector page.
 package server
 
 import (
@@ -17,6 +18,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -32,12 +34,27 @@ import (
 	"github.com/ethpandaops/service-authenticatoor/pkg/protection"
 )
 
+// NamedProvider pairs a protection.Provider with its instance name from
+// the config. The name doubles as the provider's path prefix (the server
+// mounts machine token aliases at /<name>/token) and as the label shown
+// on the /login selector page.
+type NamedProvider struct {
+	Name     string
+	Provider protection.Provider
+}
+
 // Server is the lifecycle-managed HTTP entrypoint for authenticatoor.
 type Server struct {
-	cfg      *config.Config
-	issuer   issuer.Issuer
-	provider protection.Provider
-	log      logrus.FieldLogger
+	cfg       *config.Config
+	issuer    issuer.Issuer
+	providers []NamedProvider
+	// advertised is the subset of providers offered to unauthenticated
+	// users (the config's authMode entries, in order): the direct
+	// redirect target when it holds one entry, the /login selector's
+	// contents otherwise. Every provider in providers authenticates
+	// regardless.
+	advertised []NamedProvider
+	log        logrus.FieldLogger
 
 	main    *http.Server
 	metrics *http.Server
@@ -56,11 +73,11 @@ type Server struct {
 
 // Options bundles the dependencies needed to construct a Server.
 type Options struct {
-	Config   *config.Config
-	Issuer   issuer.Issuer
-	Provider protection.Provider
-	Log      logrus.FieldLogger
-	Registry prometheus.Registerer
+	Config    *config.Config
+	Issuer    issuer.Issuer
+	Providers []NamedProvider
+	Log       logrus.FieldLogger
+	Registry  prometheus.Registerer
 }
 
 // New constructs a Server. Heavy initialization (binding sockets, fetching
@@ -72,8 +89,8 @@ func New(opts Options) (*Server, error) {
 	if opts.Issuer == nil {
 		return nil, errors.New("server: Issuer is required")
 	}
-	if opts.Provider == nil {
-		return nil, errors.New("server: Provider is required")
+	if len(opts.Providers) == 0 {
+		return nil, errors.New("server: at least one Provider is required")
 	}
 	if opts.Log == nil {
 		return nil, errors.New("server: Log is required")
@@ -85,7 +102,8 @@ func New(opts Options) (*Server, error) {
 	s := &Server{
 		cfg:              opts.Config,
 		issuer:           opts.Issuer,
-		provider:         opts.Provider,
+		providers:        opts.Providers,
+		advertised:       advertisedProviders(opts.Config.AuthMode, opts.Providers),
 		log:              opts.Log.WithField("package", "server"),
 		clientAssetCache: make(map[string]*builtClientAsset, 4),
 	}
@@ -110,11 +128,13 @@ func New(opts Options) (*Server, error) {
 // Start binds the HTTP listener(s) and serves until ctx is canceled or Stop
 // is called. It returns an error from the underlying ListenAndServe if it
 // fails for any reason other than http.ErrServerClosed. The protection
-// provider's Start is invoked first; failures there are returned without
+// providers' Start is invoked first; failures there are returned without
 // binding any listener.
 func (s *Server) Start(ctx context.Context) error {
-	if err := s.provider.Start(ctx); err != nil {
-		return fmt.Errorf("provider %s start: %w", s.provider.Name(), err)
+	for _, np := range s.providers {
+		if err := np.Provider.Start(ctx); err != nil {
+			return fmt.Errorf("provider %s start: %w", np.Name, err)
+		}
 	}
 
 	errCh := make(chan error, 2)
@@ -161,8 +181,10 @@ func (s *Server) shutdown() error {
 			err = e
 		}
 	}
-	if e := s.provider.Stop(); e != nil && err == nil {
-		err = e
+	for _, np := range s.providers {
+		if e := np.Provider.Stop(); e != nil && err == nil {
+			err = e
+		}
 	}
 	return err
 }
@@ -182,11 +204,30 @@ func (s *Server) routes() http.Handler {
 	r.HandleFunc("/clientFrame", s.handleClientFrame).Methods(http.MethodGet)
 	r.HandleFunc("/", s.handleIndex).Methods(http.MethodGet)
 
-	// Provider-owned auxiliary routes (e.g. /auth/oauth/callback). These
-	// run without the auth middleware because the request is the act of
-	// authenticating. The provider is responsible for any input
-	// validation it needs.
-	s.provider.RegisterRoutes(r)
+	// Provider-owned auxiliary routes (login entries, OAuth callbacks)
+	// under each provider's own path prefix. These run without the auth
+	// middleware because the request is the act of authenticating. The
+	// provider is responsible for any input validation it needs.
+	for _, np := range s.providers {
+		np.Provider.RegisterRoutes(r)
+	}
+
+	// Machine token aliases: providers whose credentials are injected by
+	// an edge proxy (Cloudflare Access) get /<name>/token — the same
+	// contract as /auth/token, but authenticated purely from the ambient
+	// edge credentials. The alias lives inside the provider's prefix so
+	// it can stay behind the edge protection when /auth/* is opened up,
+	// giving non-interactive clients (CF service tokens) an endpoint
+	// that never redirects.
+	for _, np := range s.providers {
+		if amb, ok := np.Provider.(protection.AmbientAuthenticator); ok {
+			r.HandleFunc("/"+np.Name+"/token", s.ambientTokenHandler(amb)).Methods(http.MethodGet)
+		}
+	}
+
+	// Provider selector: the multi-provider fallback target. With a
+	// single provider it just forwards to that provider's login entry.
+	r.HandleFunc("/login", s.handleLoginSelector).Methods(http.MethodGet)
 
 	// Protected routes. The active provider's Authenticate is run via
 	// authMiddleware; CORS allows allow-listed browser origins to fetch
@@ -215,17 +256,33 @@ func (s *Server) routes() http.Handler {
 	return s.recover(s.accessLog(r))
 }
 
-// handleLogout dispatches to the active provider's Logout. It runs
+// handleLogout clears the authentication state. With a single provider
+// it dispatches to that provider's Logout (preserving provider-specific
+// behavior like the Cloudflare edge-logout redirect); with several it
+// clears every provider's session cookie in one response. It runs
 // without an authenticated identity so a user with a stale or missing
 // session can still hit it.
 func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
-	s.provider.Logout(w, r)
+	if len(s.providers) == 1 {
+		s.providers[0].Provider.Logout(w, r)
+		return
+	}
+	for _, np := range s.providers {
+		if sc, ok := np.Provider.(protection.SessionClearer); ok {
+			http.SetCookie(w, sc.ClearSessionCookie())
+		}
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Content-Type", "application/json")
+	_, _ = w.Write([]byte(`{"loggedOut":true}` + "\n"))
 }
 
-// authMiddleware runs the active protection provider on the request and
-// stamps any returned Identity onto the request context. On a flow
-// outcome (RedirectTo) it emits a 302; on no outcome it emits Status
-// (default 401) with any challenge headers.
+// authMiddleware runs the protection provider chain on the request and
+// stamps the first returned Identity onto the request context. When no
+// provider authenticates, a single-provider instance applies that
+// provider's own outcome (redirect to its login flow, or Status plus
+// challenge headers); a multi-provider instance redirects to the /login
+// selector instead — it cannot know which provider the user wants.
 //
 // On preflight (OPTIONS) the middleware is a no-op — CORS preflight is
 // handled by the cors middleware ahead of it. /auth/logout is also
@@ -237,43 +294,86 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 			return
 		}
 
-		out, err := s.provider.Authenticate(r.Context(), r)
-		if err != nil {
-			s.log.WithError(err).Error("provider authenticate")
-			http.Error(w, "auth provider error", http.StatusInternalServerError)
+		// Every defined provider gets a passive shot at the request;
+		// the fallback for unauthenticated requests comes from the
+		// advertised set only.
+		var fallback protection.Outcome
+		for _, np := range s.providers {
+			out, err := np.Provider.Authenticate(r.Context(), r)
+			if err != nil {
+				s.log.WithError(err).WithField("provider", np.Name).Error("provider authenticate")
+				http.Error(w, "auth provider error", http.StatusInternalServerError)
+				return
+			}
+			if out.Identity != nil {
+				for _, c := range out.SetCookies {
+					http.SetCookie(w, c)
+				}
+				next.ServeHTTP(w, r.WithContext(withIdentity(r.Context(), out.Identity)))
+				return
+			}
+			if len(s.advertised) == 1 && np.Name == s.advertised[0].Name {
+				fallback = out
+			}
+		}
+
+		if len(s.advertised) != 1 {
+			w.Header().Set("Cache-Control", "no-store")
+			http.Redirect(w, r, "/login?"+url.Values{"return_to": {r.URL.RequestURI()}}.Encode(),
+				http.StatusFound)
 			return
 		}
 
-		for _, c := range out.SetCookies {
+		for _, c := range fallback.SetCookies {
 			http.SetCookie(w, c)
 		}
 
-		if out.Identity != nil {
-			next.ServeHTTP(w, r.WithContext(withIdentity(r.Context(), out.Identity)))
-			return
-		}
-
-		if out.RedirectTo != "" {
+		if fallback.RedirectTo != "" {
 			w.Header().Set("Cache-Control", "no-store")
-			http.Redirect(w, r, out.RedirectTo, http.StatusFound)
+			http.Redirect(w, r, fallback.RedirectTo, http.StatusFound)
 			return
 		}
 
-		// Suppress WWW-Authenticate-style challenges on /auth/embed so
-		// invisible iframes don't trigger a credential dialog.
-		if !isEmbedPath(r.URL.Path) {
-			for k, vs := range out.Challenge {
+		// Only challenge interactive requests: a WWW-Authenticate
+		// header on a background fetch (the v2 client frame's
+		// /auth/token probe) or an invisible iframe would pop the
+		// browser's credential dialog on every page load.
+		if !suppressChallenge(r) {
+			for k, vs := range fallback.Challenge {
 				for _, v := range vs {
 					w.Header().Add(k, v)
 				}
 			}
 		}
-		status := out.Status
+		status := fallback.Status
 		if status == 0 {
 			status = http.StatusUnauthorized
 		}
 		http.Error(w, "unauthorized", status)
 	})
+}
+
+// ambientTokenHandler adapts the /auth/token contract onto a provider's
+// ambient edge credentials. No cookies, no redirects: either the edge
+// injected a verifiable identity or the response is the outcome's status.
+func (s *Server) ambientTokenHandler(amb protection.AmbientAuthenticator) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		out, err := amb.AuthenticateAmbient(r.Context(), r)
+		if err != nil {
+			s.log.WithError(err).Error("ambient authenticate")
+			http.Error(w, "auth provider error", http.StatusInternalServerError)
+			return
+		}
+		if out.Identity == nil {
+			status := out.Status
+			if status == 0 {
+				status = http.StatusUnauthorized
+			}
+			http.Error(w, "unauthorized", status)
+			return
+		}
+		s.handleToken(w, r.WithContext(withIdentity(r.Context(), out.Identity)))
+	}
 }
 
 // isEmbedPath reports whether p targets the silent-iframe handler. The
@@ -282,6 +382,21 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 // Both forms appear depending on where the middleware sits.
 func isEmbedPath(p string) bool {
 	return p == "/auth/embed" || p == "/embed"
+}
+
+// suppressChallenge reports whether WWW-Authenticate-style challenges
+// must be withheld from an unauthenticated response. That is the case
+// for /auth/embed and for every browser request that isn't a top-level
+// navigation (Sec-Fetch-Dest other than "document": fetch/XHR report
+// "empty", iframes "iframe"). Requests without Fetch Metadata — non-browser
+// clients and old browsers — keep the challenge so they can still
+// negotiate credentials.
+func suppressChallenge(r *http.Request) bool {
+	if isEmbedPath(r.URL.Path) {
+		return true
+	}
+	dest := r.Header.Get("Sec-Fetch-Dest")
+	return dest != "" && dest != "document"
 }
 
 // isLogoutPath reports whether p targets the logout handler. The auth
@@ -343,6 +458,27 @@ func withIdentity(ctx context.Context, id *protection.Identity) context.Context 
 func identityFromContext(ctx context.Context) *protection.Identity {
 	v, _ := ctx.Value(identityKey{}).(*protection.Identity)
 	return v
+}
+
+// advertisedProviders resolves the authMode names against the provider
+// list, preserving authMode order. Unknown names are skipped (config
+// validation rejects them for loaded configs; hand-built test configs
+// fall back gracefully). An empty result advertises everything.
+func advertisedProviders(names []string, providers []NamedProvider) []NamedProvider {
+	byName := make(map[string]NamedProvider, len(providers))
+	for _, np := range providers {
+		byName[np.Name] = np
+	}
+	out := make([]NamedProvider, 0, len(names))
+	for _, name := range names {
+		if np, ok := byName[name]; ok {
+			out = append(out, np)
+		}
+	}
+	if len(out) == 0 {
+		return providers
+	}
+	return out
 }
 
 // clientIP returns the remote IP, preferring X-Forwarded-For when present.
