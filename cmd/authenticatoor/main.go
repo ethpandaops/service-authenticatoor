@@ -181,6 +181,7 @@ func buildProvider(
 			JwtHeader:          pc.CloudflareAccess.JwtHeader,
 			UserHeader:         pc.CloudflareAccess.UserHeader,
 			AllowServiceTokens: pc.CloudflareAccess.ServiceTokensAllowed(),
+			PublicURL:          cfg.ExternalURL,
 			LoginPath:          loginPath,
 			SessionKey:         sessionKey,
 			SessionCookieName:  cookieName(pc.CloudflareAccess.SessionCookieName, "_session"),

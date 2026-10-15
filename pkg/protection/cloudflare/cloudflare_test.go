@@ -19,6 +19,7 @@ import (
 type stubVerifier struct {
 	email      string
 	commonName string
+	aud        []string
 	err        error
 }
 
@@ -26,7 +27,9 @@ func (s stubVerifier) Verify(_ context.Context, _ string) (*cfaccess.Claims, err
 	if s.err != nil {
 		return nil, s.err
 	}
-	return &cfaccess.Claims{Email: s.email, CommonName: s.commonName}, nil
+	c := &cfaccess.Claims{Email: s.email, CommonName: s.commonName}
+	c.Audience = s.aud
+	return c, nil
 }
 
 var testSessionKey = []byte("0123456789abcdef0123456789abcdef")

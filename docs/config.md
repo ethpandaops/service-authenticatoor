@@ -63,7 +63,7 @@ allow-list, CORS origins) or covered by sensible defaults.
 | `cors.allowedOrigins`                  | string list | = `allowedReturnHosts`               | Browsers allowed to call `/auth/*` with credentials.                  |
 | `cloudflareAccess.verifyJWT`           | bool        | `true`                               | Verify `Cf-Access-Jwt-Assertion` against CF JWKS.                     |
 | `cloudflareAccess.teamDomain`          | string      | (required when `verifyJWT`)          | e.g. `<team>.cloudflareaccess.com`.                                   |
-| `cloudflareAccess.audTag`              | string      | `""`                                 | AUD tag of the CF Access application. When empty the audience claim is not checked — signature + issuer still pin the assertion to the team. |
+| `cloudflareAccess.audTag`              | string      | `""` (detected)                      | AUD tag of the CF Access application. When empty (and `verifyJWT` is on), the tag is detected from Cloudflare's login redirect for `/<name>/login` and enforced on `/<name>/login` and `/<name>/token`; those routes answer 503 until it is detected. `/auth/*` then checks signature + issuer only, pinning the assertion to the team but not the application. |
 | `cloudflareAccess.jwtHeader`           | string      | `Cf-Access-Jwt-Assertion`            |                                                                       |
 | `cloudflareAccess.userHeader`          | string      | `Cf-Access-Authenticated-User-Email` | Header carrying the authenticated email. Replaces top-level `userHeader`. |
 | `cloudflareAccess.allowServiceTokens`  | bool        | `true`                               | Allow non-identity CF Access service tokens, using the token's `common_name` (client ID) as the identity subject. Still gated by the app's CF Access policy. Requires `verifyJWT`. |
@@ -157,6 +157,17 @@ working unchanged, because the ambient headers authenticate before any
 redirect happens. That makes migration a pure Cloudflare-side change:
 narrow the CF Access app from the whole host (or `/auth/*`) down to
 `/cfaccess/*`, no service redeploy needed.
+
+Without a configured `audTag`, the provider learns its application's
+AUD tag on its own: it requests `<externalURL>/<name>/login` without
+credentials, and once the CF Access edge covers that path, Cloudflare's
+login redirect carries a team-signed `meta` token naming the
+application and hostname. The tag is verified against the team JWKS and
+the instance's own hostname, then required on `/<name>/login` and
+`/<name>/token`. Until the edge covers the prefix, those two routes
+answer 503 — they never accept assertions issued for other applications
+of the team. Detection retries every minute (and on demand when a login
+arrives), so narrowing the CF Access app takes effect without a restart.
 
 Session cookies are HMAC-signed with a per-provider key derived from the
 JWT signing key — no separate session secret to manage, and one

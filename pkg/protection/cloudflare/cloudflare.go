@@ -26,6 +26,9 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"slices"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/mux"
@@ -63,8 +66,16 @@ type Config struct {
 	TeamDomain string
 	// AudTag is the AUD tag of the CF Access application. When set, the
 	// verifier rejects assertions whose aud claim doesn't match. When
-	// empty, only signature + issuer are verified.
+	// empty and PublicURL is set, the tag is detected from Cloudflare's
+	// login redirect for LoginPath and enforced on the login entry and
+	// token alias only; /auth/* then verifies signature + issuer alone.
 	AudTag string
+	// PublicURL is the instance's externally visible base URL, used to
+	// probe LoginPath through the CF Access edge for AUD tag detection.
+	PublicURL string
+	// HTTPClient performs the detection probe. Defaults to a client with
+	// a 10s timeout.
+	HTTPClient *http.Client
 	// JwtHeader is the header carrying the assertion. Defaults to
 	// "Cf-Access-Jwt-Assertion".
 	JwtHeader string
@@ -105,6 +116,15 @@ type Provider struct {
 	cfg      Config
 	log      logrus.FieldLogger
 	verifier cfaccess.Verifier
+	meta     cfaccess.MetaVerifier
+
+	// AUD tag detection state (see detect.go). detectMu serializes
+	// attempts and guards lastDetect.
+	detectedAud atomic.Pointer[string]
+	detectMu    sync.Mutex
+	lastDetect  time.Time
+	cancel      context.CancelFunc
+	wg          sync.WaitGroup
 }
 
 var (
@@ -133,6 +153,9 @@ func New(log logrus.FieldLogger, cfg Config) *Provider {
 	}
 	if cfg.Now == nil {
 		cfg.Now = time.Now
+	}
+	if cfg.HTTPClient == nil {
+		cfg.HTTPClient = &http.Client{Timeout: detectTimeout}
 	}
 	return &Provider{
 		cfg: cfg,
@@ -165,17 +188,33 @@ func (p *Provider) Start(ctx context.Context) error {
 		return fmt.Errorf("cloudflare: build verifier: %w", err)
 	}
 	p.verifier = v
+	p.meta = v
 	entry := p.log.WithField("team", p.cfg.TeamDomain)
-	if p.cfg.AudTag == "" {
-		entry.Warn("cf access verifier ready — audTag not set, accepting assertions from any application in the team")
-	} else {
+	switch {
+	case p.cfg.AudTag != "":
 		entry.WithField("aud", p.cfg.AudTag).Info("cf access verifier ready")
+	case p.detecting():
+		entry.Warn("cf access verifier ready — audTag not set, accepting assertions from any application in the team on /auth/*; " +
+			p.cfg.LoginPath + " stays unavailable until the aud tag is detected from the Cloudflare Access redirect")
+		// Detached from ctx: the loop must outlive Start and stops in Stop.
+		loopCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
+		p.cancel = cancel
+		p.wg.Add(1)
+		go p.detectLoop(loopCtx)
+	default:
+		entry.Warn("cf access verifier ready — audTag not set, accepting assertions from any application in the team")
 	}
 	return nil
 }
 
-// Stop is a no-op.
-func (p *Provider) Stop() error { return nil }
+// Stop ends AUD tag detection.
+func (p *Provider) Stop() error {
+	if p.cancel != nil {
+		p.cancel()
+	}
+	p.wg.Wait()
+	return nil
+}
 
 // RegisterRoutes attaches the login entry. It runs on the parent router
 // (bypassing the auth middleware) because the request is the act of
@@ -214,7 +253,7 @@ func (p *Provider) Logout(w http.ResponseWriter, r *http.Request) {
 // A present-but-invalid assertion fails hard with 401 (it signals
 // misconfiguration or forgery, not an unauthenticated browser).
 func (p *Provider) Authenticate(ctx context.Context, r *http.Request) (protection.Outcome, error) {
-	out, hardFail := p.ambient(ctx, r)
+	out, hardFail := p.ambient(ctx, r, false)
 	if out.Identity != nil || hardFail {
 		return out, nil
 	}
@@ -236,9 +275,10 @@ func (p *Provider) Authenticate(ctx context.Context, r *http.Request) (protectio
 // AuthenticateAmbient inspects only the ambient CF Access headers — no
 // session cookie, no redirects. The server mounts the machine token
 // alias (/<name>/token) on top of this so CF Access service tokens keep
-// a direct JSON endpoint behind the edge-protected prefix.
+// a direct JSON endpoint behind the edge-protected prefix. Callers are
+// the provider's own prefix, so a detected AUD tag is enforced.
 func (p *Provider) AuthenticateAmbient(ctx context.Context, r *http.Request) (protection.Outcome, error) {
-	out, _ := p.ambient(ctx, r)
+	out, _ := p.ambient(ctx, r, true)
 	if out.Identity == nil && out.Status == 0 {
 		out.Status = http.StatusUnauthorized
 	}
@@ -247,8 +287,12 @@ func (p *Provider) AuthenticateAmbient(ctx context.Context, r *http.Request) (pr
 
 // ambient runs the CF Access header check. hardFail reports that the
 // request carried an assertion that failed verification — callers must
-// not fall through to weaker checks in that case.
-func (p *Provider) ambient(ctx context.Context, r *http.Request) (out protection.Outcome, hardFail bool) {
+// not fall through to weaker checks in that case. ownPrefix marks
+// requests to the provider's login entry or token alias: with AUD tag
+// detection active, those require the detected tag (503 until known).
+func (p *Provider) ambient(
+	ctx context.Context, r *http.Request, ownPrefix bool,
+) (out protection.Outcome, hardFail bool) {
 	email := r.Header.Get(p.cfg.UserHeader)
 	commonName := ""
 
@@ -261,6 +305,16 @@ func (p *Provider) ambient(ctx context.Context, r *http.Request) (out protection
 		if err != nil {
 			p.log.WithError(err).Debug("cf access verification failed")
 			return protection.Outcome{Status: http.StatusUnauthorized}, true
+		}
+		if ownPrefix && p.detecting() {
+			aud := p.ensureAud(ctx)
+			if aud == "" {
+				return protection.Outcome{Status: http.StatusServiceUnavailable}, true
+			}
+			if !slices.Contains(claims.Audience, aud) {
+				p.log.WithField("aud", claims.Audience).Debug("cf access assertion for another application")
+				return protection.Outcome{Status: http.StatusUnauthorized}, true
+			}
 		}
 		email = claims.Email
 		commonName = claims.CommonName
@@ -294,6 +348,12 @@ func (p *Provider) handleLogin(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		p.log.WithError(err).Error("cf login ambient check")
 		http.Error(w, "auth provider error", http.StatusInternalServerError)
+		return
+	}
+	if out.Status == http.StatusServiceUnavailable {
+		http.Error(w,
+			"Cloudflare Access application not detected yet — the CF Access application must cover this path",
+			http.StatusServiceUnavailable)
 		return
 	}
 	if out.Identity == nil {
@@ -351,3 +411,7 @@ func (p *Provider) ClearSessionCookie() *http.Cookie {
 
 // SetVerifier overrides the JWT verifier; intended for tests.
 func (p *Provider) SetVerifier(v cfaccess.Verifier) { p.verifier = v }
+
+// SetMetaVerifier overrides the meta token verifier used for AUD tag
+// detection; intended for tests.
+func (p *Provider) SetMetaVerifier(v cfaccess.MetaVerifier) { p.meta = v }
