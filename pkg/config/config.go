@@ -319,6 +319,18 @@ func Load(path string) (*Config, error) {
 	v.AutomaticEnv()
 
 	setDefaults(v)
+	// AutomaticEnv only resolves keys viper already knows (defaults or
+	// config file). These keys deliberately have no default — see
+	// setDefaults — so bind them explicitly to keep their env overrides.
+	for _, key := range []string{
+		"authMode",
+		"cloudflareAccess.verifyJWT",
+		"cloudflareAccess.allowServiceTokens",
+	} {
+		if err := v.BindEnv(key); err != nil {
+			return nil, fmt.Errorf("config: bind env %s: %w", key, err)
+		}
+	}
 
 	if path != "" {
 		v.SetConfigFile(path)
@@ -461,7 +473,7 @@ func (c *Config) resolveProviders() error {
 			if !known {
 				return fmt.Errorf("authMode: unsupported value %q", mode)
 			}
-			c.Providers = append(c.Providers, ProviderConfig{
+			pc := ProviderConfig{
 				Name:             name,
 				Type:             mode,
 				CloudflareAccess: c.CloudflareAccess,
@@ -469,7 +481,9 @@ func (c *Config) resolveProviders() error {
 				AnyAuth:          c.AnyAuth,
 				GitHubOAuth:      c.GitHubOAuth,
 				OIDC:             c.OIDC,
-			})
+			}
+			pc.applyLegacyDefaults()
+			c.Providers = append(c.Providers, pc)
 		}
 	}
 
@@ -575,6 +589,29 @@ func (c *Config) Validate() error {
 	}
 
 	return nil
+}
+
+// applyLegacyDefaults pins the pre-multi-provider callback paths and
+// cookie names on an entry converted from a legacy top-level block, so
+// existing deployments keep their registered OAuth redirect URIs and
+// live session cookie names. Entries in the providers list get the
+// /<name>/... defaults instead.
+func (p *ProviderConfig) applyLegacyDefaults() {
+	setDefault := func(field *string, value string) {
+		if *field == "" {
+			*field = value
+		}
+	}
+	switch p.Type {
+	case AuthModeGitHub:
+		setDefault(&p.GitHubOAuth.CallbackPath, "/auth/oauth/callback")
+		setDefault(&p.GitHubOAuth.SessionCookieName, "authenticatoor_session")
+		setDefault(&p.GitHubOAuth.StateCookieName, "authenticatoor_oauth_state")
+	case AuthModeOIDC:
+		setDefault(&p.OIDC.CallbackPath, "/auth/oidc/callback")
+		setDefault(&p.OIDC.SessionCookieName, "authenticatoor_oidc_session")
+		setDefault(&p.OIDC.StateCookieName, "authenticatoor_oidc_state")
+	}
 }
 
 // providerNamePattern constrains provider instance names: they double as

@@ -597,3 +597,98 @@ cloudflareAccess:
 		t.Errorf("env override of privateKeyFile failed: got %q", cfg.Signing.RS256.PrivateKeyFile)
 	}
 }
+
+// TestLoad_EnvOverrideKeysWithoutDefaults covers keys that have no viper
+// default: their env overrides must apply even when the config file
+// doesn't mention them.
+func TestLoad_EnvOverrideKeysWithoutDefaults(t *testing.T) {
+	p := writeTempConfig(t, `
+issuer: "https://auth.foo.example"
+signing:
+  rs256:
+    privateKeyFile: "/etc/keys/private.pem"
+basicAuth:
+  htpasswdFile: "/etc/htpasswd"
+`)
+
+	t.Setenv("AUTHENTICATOOR_AUTHMODE", "cloudflare,basic")
+	t.Setenv("AUTHENTICATOOR_CLOUDFLAREACCESS_VERIFYJWT", "false")
+	t.Setenv("AUTHENTICATOOR_CLOUDFLAREACCESS_ALLOWSERVICETOKENS", "false")
+
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if len(cfg.AuthMode) != 2 || cfg.AuthMode[0] != "cfaccess" || cfg.AuthMode[1] != "htpasswd" {
+		t.Errorf("authMode env override: got %v", cfg.AuthMode)
+	}
+	cf := cfg.Providers[0].CloudflareAccess
+	if cf.VerifyJWTEnabled() {
+		t.Error("verifyJWT env override: still enabled")
+	}
+	if cf.ServiceTokensAllowed() {
+		t.Error("allowServiceTokens env override: still enabled")
+	}
+}
+
+// TestLoad_LegacyBlocksKeepPreviousDefaults checks that entries converted
+// from legacy top-level blocks keep the old callback paths and cookie
+// names, while providers-list entries leave them empty (→ /<name>/...).
+func TestLoad_LegacyBlocksKeepPreviousDefaults(t *testing.T) {
+	p := writeTempConfig(t, `
+authMode: [github, oidc]
+issuer: "https://auth.foo.example"
+signing:
+  rs256:
+    privateKeyFile: "/etc/keys/private.pem"
+githubOAuth:
+  clientId: "id"
+  clientSecret: "secret"
+  allowedOrgs: ["org"]
+oidc:
+  issuerURL: "https://idp.example"
+  callbackURL: "https://relay.example/oidc/callback"
+  clientId: "id"
+  clientSecret: "secret"
+  sessionCookieName: "custom_oidc_session"
+`)
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	gh := cfg.Providers[0].GitHubOAuth
+	if gh.CallbackPath != "/auth/oauth/callback" {
+		t.Errorf("github callbackPath: got %q", gh.CallbackPath)
+	}
+	if gh.SessionCookieName != "authenticatoor_session" || gh.StateCookieName != "authenticatoor_oauth_state" {
+		t.Errorf("github cookie names: got %q / %q", gh.SessionCookieName, gh.StateCookieName)
+	}
+	oc := cfg.Providers[1].OIDC
+	if oc.CallbackPath != "/auth/oidc/callback" {
+		t.Errorf("oidc callbackPath: got %q", oc.CallbackPath)
+	}
+	if oc.SessionCookieName != "custom_oidc_session" {
+		t.Errorf("explicit oidc sessionCookieName overridden: got %q", oc.SessionCookieName)
+	}
+
+	p = writeTempConfig(t, `
+issuer: "https://auth.foo.example"
+signing:
+  rs256:
+    privateKeyFile: "/etc/keys/private.pem"
+providers:
+  - name: gh
+    type: github
+    githubOAuth:
+      clientId: "id"
+      clientSecret: "secret"
+      allowedOrgs: ["org"]
+`)
+	cfg, err = Load(p)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if got := cfg.Providers[0].GitHubOAuth.CallbackPath; got != "" {
+		t.Errorf("providers-list callbackPath should stay unset, got %q", got)
+	}
+}

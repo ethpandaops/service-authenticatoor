@@ -12,12 +12,14 @@
 //
 // State encoding contract (matches the relay's regex):
 //
-//	state = "<public-url>~<random-nonce>"
+//	state = "<public-url><callback-dir>~<random-nonce>"
 //
 // where <public-url> is the originating authenticatoor's externally-
 // visible URL prefix (scheme + host + optional port; the relay's regex
-// constrains it to *.ethpandaops.io / *.localhost / 127.0.0.1) and
-// <random-nonce> is a 128-bit base64url value. The nonce is also stored
+// constrains it to *.ethpandaops.io / *.localhost / 127.0.0.1),
+// <callback-dir> is the callback path minus its trailing "/callback"
+// (e.g. "/oidc"; the relay redirects to <public-url><callback-dir>/callback)
+// and <random-nonce> is a 128-bit base64url value. The nonce is also stored
 // in the HMAC-signed state cookie alongside the original returnTo URL;
 // the callback compares the URL nonce to the cookie's nonce to bind the
 // flow to this browser (CSRF defense), and feeds the nonce to the OIDC
@@ -321,8 +323,18 @@ func (p *Provider) handleLoginStart(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, p.authorizeRedirect(nonce), http.StatusFound)
 }
 
+// statePrefix is the routing prefix carried in the state parameter: the
+// public URL plus the callback path minus its trailing "/callback"
+// segment (e.g. "https://auth.example/oidc"). The relay appends
+// "/callback" to it, so callback paths are expected to end in
+// "/callback".
+func (p *Provider) statePrefix() string {
+	return strings.TrimRight(p.cfg.PublicURL, "/") +
+		strings.TrimSuffix(p.cfg.CallbackPath, "/callback")
+}
+
 // authorizeRedirect builds the IdP authorize URL. The state parameter
-// is "<publicURL>~<nonce>" — the prefix lets the relay route the
+// is "<statePrefix>~<nonce>" — the prefix lets the relay route the
 // callback back to this instance, and the nonce binds the URL to the
 // state cookie on this browser (CSRF defense; the cookie carries the
 // full signed payload including returnTo).
@@ -333,7 +345,7 @@ func (p *Provider) authorizeRedirect(nonce string) string {
 	v.Set("response_type", "code")
 	v.Set("scope", p.scopeList)
 	v.Set("nonce", nonce)
-	v.Set("state", strings.TrimRight(p.cfg.PublicURL, "/")+strings.TrimRight(p.cfg.CallbackPath, "/callback")+stateDelimiter+nonce)
+	v.Set("state", p.statePrefix()+stateDelimiter+nonce)
 	return p.disco.AuthorizationEndpoint + "?" + v.Encode()
 }
 
@@ -357,7 +369,7 @@ func (p *Provider) handleCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// State value shape: "<public-url>~<nonce>". Use LastIndex defensively
+	// State value shape: "<statePrefix>~<nonce>". Use LastIndex defensively
 	// in case the public URL ever contains `~` (it shouldn't).
 	idx := strings.LastIndex(stateParam, stateDelimiter)
 	if idx < 0 {
@@ -370,10 +382,10 @@ func (p *Provider) handleCallback(w http.ResponseWriter, r *http.Request) {
 	// Anchor: the state must claim THIS instance. A flow that landed
 	// here with a different public URL is either misrouted by the relay
 	// (allow-list regex too loose) or crafted by an attacker.
-	if urlStatePrefix != strings.TrimRight(p.cfg.PublicURL, "/")+strings.TrimRight(p.cfg.CallbackPath, "/callback") {
+	if urlStatePrefix != p.statePrefix() {
 		p.log.WithFields(logrus.Fields{
 			"got":      urlStatePrefix,
-			"expected": p.cfg.PublicURL,
+			"expected": p.statePrefix(),
 		}).Warn("state prefix mismatch — flow originated elsewhere")
 		http.Error(w, "state prefix mismatch", http.StatusBadRequest)
 		return

@@ -78,9 +78,9 @@ allow-list, CORS origins) or covered by sensible defaults.
 | `githubOAuth.clientId`                 | string      | (required for `github`)              | OAuth app client ID.                                                  |
 | `githubOAuth.clientSecret`             | string      | (required for `github`)              | OAuth app client secret. Inline alternative to `clientSecretFile`.    |
 | `githubOAuth.clientSecretFile`         | string      |                                      | File path holding the OAuth app secret.                               |
-| `githubOAuth.callbackPath`             | string      | `/<name>/callback`                   | Must match the redirect URI registered with the GitHub OAuth app.    |
-| `githubOAuth.sessionCookieName`        | string      | `authenticatoor_<name>_session`      | Browser cookie name for the session.                                  |
-| `githubOAuth.stateCookieName`          | string      | `authenticatoor_<name>_state`        | Browser cookie name for the OAuth CSRF state.                         |
+| `githubOAuth.callbackPath`             | string      | `/<name>/callback` (legacy block: `/auth/oauth/callback`) | Must match the redirect URI registered with the GitHub OAuth app.    |
+| `githubOAuth.sessionCookieName`        | string      | `authenticatoor_<name>_session` (legacy block: `authenticatoor_session`) | Browser cookie name for the session.                                  |
+| `githubOAuth.stateCookieName`          | string      | `authenticatoor_<name>_state` (legacy block: `authenticatoor_oauth_state`) | Browser cookie name for the OAuth CSRF state.                         |
 | `githubOAuth.sessionTTL`               | duration    | `12h`                                | Session cookie lifetime.                                              |
 | `githubOAuth.allowedOrgs`              | string list | (required for `github`)              | GitHub orgs whose members may authenticate. Case-insensitive.         |
 | `oidc.issuerURL`                       | string      | (required for `oidc`)                | IdP issuer URL. Discovery doc fetched from `<issuerURL>/.well-known/openid-configuration` at startup. |
@@ -88,7 +88,7 @@ allow-list, CORS origins) or covered by sensible defaults.
 | `oidc.clientId`                        | string      | (required for `oidc`)                | OAuth client_id registered at the IdP.                                |
 | `oidc.clientSecret`                    | string      | (required for `oidc`)                | OAuth client secret. Inline alternative to `clientSecretFile`.        |
 | `oidc.clientSecretFile`                | string      |                                      | File path holding the OAuth client secret.                            |
-| `oidc.callbackPath`                    | string      | `/<name>/callback`                   | Local path the relay forwards the callback to.                        |
+| `oidc.callbackPath`                    | string      | `/<name>/callback` (legacy block: `/auth/oidc/callback`) | Local path the relay forwards the callback to. Must end in `/callback` for relay routing. |
 | `oidc.sessionCookieName`               | string      | `authenticatoor_<name>_session`      | Browser cookie name for the session.                                  |
 | `oidc.stateCookieName`                 | string      | `authenticatoor_<name>_state`        | Browser cookie name for the OAuth CSRF / OIDC nonce state.            |
 | `oidc.sessionTTL`                      | duration    | `12h`                                | Session cookie lifetime.                                              |
@@ -127,8 +127,13 @@ names a provider *type* (`cloudflare`, `basic`, `any`, `github`, `oidc`)
 and the matching legacy top-level block (`cloudflareAccess:`, …) is
 converted into a provider entry, named after the type (cloudflare→
 `cfaccess`, basic→`htpasswd`, any→`anyauth`, github→`github`,
-oidc→`oidc`) — an old `authMode: cloudflare` config keeps working
-bit-for-bit. Prefer the `providers` list for new configs.
+oidc→`oidc`). Converted `github` / `oidc` entries keep the previous
+defaults for unset fields — callback paths `/auth/oauth/callback` /
+`/auth/oidc/callback` and cookie names `authenticatoor_session` /
+`authenticatoor_oauth_state` (github) — so registered redirect URIs keep
+working. Session cookies are signed with a new per-provider key, so
+existing sessions require one re-login after the upgrade. Prefer the
+`providers` list for new configs.
 
 Interactive login lives under each provider's own path prefix, derived
 from the entry's (required) `name`:
@@ -250,7 +255,8 @@ emitted to downstream services has the GitHub login as `sub` and the
 primary verified email as `email`.
 
 The OAuth callback is registered at `githubOAuth.callbackPath` (default
-`/github/callback`); this must match the redirect URI registered in
+`/<name>/callback`, or `/auth/oauth/callback` for the legacy top-level
+block); this must match the redirect URI registered in
 the GitHub OAuth app.
 
 ```yaml
@@ -283,14 +289,17 @@ confidential client at the IdP. To avoid registering a per-instance
 redirect URI with the IdP, the redirect target is a stateless
 **callback relay** (see `platform/applications/oidc-relay`) that
 forwards each callback to the originating authenticatoor based on the
-host encoded in the OAuth `state` parameter. The state contract:
+URL encoded in the OAuth `state` parameter. The state contract:
 
 ```
-state = "<our-public-url>~<base64url-signed-blob>"
+state = "<our-public-url><callback-dir>~<base64url-signed-blob>"
 ```
 
 where `<our-public-url>` is this instance's `externalURL` (the relay's
 regex constrains it to `*.ethpandaops.io` / `localhost` / `127.0.0.1`)
+and `<callback-dir>` is `oidc.callbackPath` minus its trailing
+`/callback` (e.g. `/oidc`); the relay redirects to
+`<our-public-url><callback-dir>/callback`,
 and the signed blob is HMAC-signed against a key derived from the JWT
 signing key. The relay never inspects the signed blob — only the
 originating instance can verify it.
