@@ -333,7 +333,7 @@ func (p *Provider) authorizeRedirect(nonce string) string {
 	v.Set("response_type", "code")
 	v.Set("scope", p.scopeList)
 	v.Set("nonce", nonce)
-	v.Set("state", strings.TrimRight(p.cfg.PublicURL, "/")+stateDelimiter+nonce)
+	v.Set("state", strings.TrimRight(p.cfg.PublicURL, "/")+strings.TrimRight(p.cfg.CallbackPath, "/callback")+stateDelimiter+nonce)
 	return p.disco.AuthorizationEndpoint + "?" + v.Encode()
 }
 
@@ -370,7 +370,7 @@ func (p *Provider) handleCallback(w http.ResponseWriter, r *http.Request) {
 	// Anchor: the state must claim THIS instance. A flow that landed
 	// here with a different public URL is either misrouted by the relay
 	// (allow-list regex too loose) or crafted by an attacker.
-	if urlStatePrefix != strings.TrimRight(p.cfg.PublicURL, "/") {
+	if urlStatePrefix != strings.TrimRight(p.cfg.PublicURL, "/")+strings.TrimRight(p.cfg.CallbackPath, "/callback") {
 		p.log.WithFields(logrus.Fields{
 			"got":      urlStatePrefix,
 			"expected": p.cfg.PublicURL,
