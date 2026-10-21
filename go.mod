@@ -1,6 +1,6 @@
 module github.com/ethpandaops/service-authenticatoor
 
-go 1.25.0
+go 1.26.10
 
 require (
 	github.com/MicahParks/keyfunc/v3 v3.8.0
