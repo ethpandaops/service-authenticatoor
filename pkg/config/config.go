@@ -19,6 +19,8 @@ import (
 	"time"
 
 	"github.com/spf13/viper"
+
+	"github.com/ethpandaops/service-authenticatoor/pkg/protection"
 )
 
 // AuthMode names a protection provider type. Providers are configured
@@ -30,6 +32,7 @@ const (
 	AuthModeAny        = "any"
 	AuthModeGitHub     = "github"
 	AuthModeOIDC       = "oidc"
+	AuthModeBearer     = "bearer"
 )
 
 // legacyProviderNames maps a provider type to the instance name used
@@ -125,7 +128,8 @@ type ProviderConfig struct {
 	// key in authMode. Required; unique; lowercase [a-z0-9-].
 	Name string `yaml:"name" mapstructure:"name"`
 	// Type selects the provider implementation: cloudflare | basic |
-	// any | github | oidc. Required.
+	// any | github | oidc | bearer. Required. The bearer type has no
+	// legacy top-level block and is only available in this list.
 	Type string `yaml:"type" mapstructure:"type"`
 
 	CloudflareAccess CloudflareAccessConfig `yaml:"cloudflareAccess" mapstructure:"cloudflareAccess"`
@@ -133,6 +137,7 @@ type ProviderConfig struct {
 	AnyAuth          AnyAuthConfig          `yaml:"anyAuth" mapstructure:"anyAuth"`
 	GitHubOAuth      GitHubOAuthConfig      `yaml:"githubOAuth" mapstructure:"githubOAuth"`
 	OIDC             OIDCConfig             `yaml:"oidc" mapstructure:"oidc"`
+	Bearer           BearerConfig           `yaml:"bearer" mapstructure:"bearer"`
 }
 
 // CloudflareAccessConfig configures the cloudflare protection provider.
@@ -268,6 +273,23 @@ type OIDCConfig struct {
 	// Scopes overrides the OIDC scopes requested. Defaults to
 	// ["openid", "email", "groups"]. `openid` is required.
 	Scopes []string `yaml:"scopes" mapstructure:"scopes"`
+}
+
+// BearerConfig configures the bearer protection provider: requests
+// carrying an IdP-issued JWT as "Authorization: Bearer" authenticate
+// without any login flow.
+type BearerConfig struct {
+	// IssuerURL is the IdP issuer. Its JWKS is resolved through
+	// <IssuerURL>/.well-known/openid-configuration. Required.
+	IssuerURL string `yaml:"issuerURL" mapstructure:"issuerURL"`
+	// Audiences lists accepted "aud" values. At least one is required.
+	// Prefer an IdP application dedicated to authenticatoor over the
+	// audience of a general-purpose client.
+	Audiences []string `yaml:"audiences" mapstructure:"audiences"`
+	// AllowedGroups narrows access to members of these groups (same
+	// matching rules as oidc.allowedGroups). Optional: when empty, the
+	// IdP application's own access policy decides who gets a token.
+	AllowedGroups []string `yaml:"allowedGroups" mapstructure:"allowedGroups"`
 }
 
 // CORSConfig configures the CORS middleware.
@@ -671,6 +693,19 @@ func (p *ProviderConfig) validate() error {
 		// oidc.allowedGroups is optional: empty means "trust the IdP's
 		// own gating" (e.g. dex's connector orgs allow-list). Set it
 		// to narrow further on a per-instance basis.
+	case AuthModeBearer:
+		if p.Bearer.IssuerURL == "" {
+			return errors.New("bearer.issuerURL is required")
+		}
+		if err := protection.RequireHTTPS(p.Bearer.IssuerURL); err != nil {
+			return fmt.Errorf("bearer.issuerURL: %w", err)
+		}
+		if len(p.Bearer.Audiences) == 0 {
+			return errors.New("bearer.audiences must list at least one audience")
+		}
+		if slices.Contains(p.Bearer.Audiences, "") {
+			return errors.New("bearer.audiences must not contain empty entries")
+		}
 	default:
 		return fmt.Errorf("type: unsupported value %q", p.Type)
 	}

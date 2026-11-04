@@ -269,6 +269,8 @@ so `/auth/*` itself needs no edge protection.
 - **`any`**: dev-only — any Basic credential is accepted, username = identity.
 - **`github`**: GitHub OAuth with org-membership gating; signed session cookie.
 - **`oidc`**: OpenID Connect against any IdP, with group gating.
+- **`bearer`**: IdP-issued JWT bearer tokens for non-interactive clients
+  (no login flow); machine token alias at `/<name>/token`.
 
 See [`docs/config.md`](docs/config.md#protection-providers) for the
 per-provider config blocks and trade-offs.
@@ -282,7 +284,7 @@ pkg/issuer/           issuer-side: RSA keys, RS256 signing, JWKS marshaling
 pkg/cors/             CORS middleware with strict allow-list
 pkg/cfaccess/         Cf-Access-Jwt-Assertion verification
 pkg/config/           YAML + env config loader, derivation, validation
-pkg/protection/       Provider interface; sub-packages cloudflare/basic/anyauth/github/oidc
+pkg/protection/       Provider interface; sub-packages cloudflare/basic/anyauth/github/oidc/bearer
 pkg/server/           HTTP server: routes, handlers, lifecycle
 Dockerfile            multi-stage source build
 Dockerfile-stub       packages a pre-built binary into a distroless image (used by CI)

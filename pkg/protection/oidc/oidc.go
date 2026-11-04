@@ -158,7 +158,7 @@ type Provider struct {
 	httpClient    *http.Client
 	disco         *discovery
 	verifier      *idTokenVerifier
-	allowedGroups map[string]struct{}
+	allowedGroups protection.GroupSet
 	scopeList     string
 	cookieSecure  bool
 }
@@ -197,7 +197,7 @@ func New(log logrus.FieldLogger, cfg Config) *Provider {
 		cfg:           cfg,
 		log:           log.WithField("package", "protection/oidc"),
 		httpClient:    cfg.HTTPClient,
-		allowedGroups: allowedGroupsSet(cfg.AllowedGroups),
+		allowedGroups: protection.NewGroupSet(cfg.AllowedGroups),
 		scopeList:     strings.Join(scopes(cfg.Scopes), " "),
 		cookieSecure:  strings.HasPrefix(cfg.PublicURL, "https://"),
 	}
@@ -434,7 +434,7 @@ func (p *Provider) handleCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if !groupAllowed(claims.Groups, p.allowedGroups) {
+	if !p.allowedGroups.Allows(claims.Groups) {
 		p.log.WithFields(logrus.Fields{
 			"sub":           claims.Subject,
 			"email":         claims.Email,

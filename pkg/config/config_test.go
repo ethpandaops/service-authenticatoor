@@ -692,3 +692,90 @@ providers:
 		t.Errorf("providers-list callbackPath should stay unset, got %q", got)
 	}
 }
+
+func TestLoad_BearerProvider(t *testing.T) {
+	p := writeTempConfig(t, `
+issuer: "https://auth.foo.example"
+signing:
+  rs256:
+    privateKeyFile: "/etc/keys/private.pem"
+authMode: cfaccess
+providers:
+  - name: cfaccess
+    type: cloudflare
+    cloudflareAccess:
+      teamDomain: "test.cloudflareaccess.com"
+  - name: authentik
+    type: bearer
+    bearer:
+      issuerURL: "https://authentik.example/application/o/devnet-authenticatoor/"
+      audiences: ["devnet-authenticatoor"]
+`)
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if len(cfg.AuthMode) != 1 || cfg.AuthMode[0] != "cfaccess" {
+		t.Errorf("authMode: got %v, want [cfaccess]", cfg.AuthMode)
+	}
+	b := cfg.Providers[1].Bearer
+	if b.IssuerURL != "https://authentik.example/application/o/devnet-authenticatoor/" ||
+		len(b.Audiences) != 1 || b.Audiences[0] != "devnet-authenticatoor" || len(b.AllowedGroups) != 0 {
+		t.Errorf("bearer config: got %+v", b)
+	}
+}
+
+func TestLoad_BearerProvider_RejectsMissingRequiredFields(t *testing.T) {
+	for name, block := range map[string]string{
+		"no issuer":      `audiences: ["a"]`,
+		"no audiences":   `issuerURL: "https://idp.example"`,
+		"empty audience": `{issuerURL: "https://idp.example", audiences: [""]}`,
+		"plain http":     `{issuerURL: "http://idp.example/app/", audiences: ["a"]}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			p := writeTempConfig(t, `
+issuer: "https://auth.foo.example"
+signing:
+  rs256:
+    privateKeyFile: "/etc/keys/private.pem"
+providers:
+  - name: authentik
+    type: bearer
+    bearer: `+block+"\n")
+			if _, err := Load(p); err == nil {
+				t.Error("expected error for incomplete bearer provider")
+			}
+		})
+	}
+}
+
+func TestLoad_BearerProvider_AllowsHTTPLocalhost(t *testing.T) {
+	p := writeTempConfig(t, `
+issuer: "https://auth.foo.example"
+signing:
+  rs256:
+    privateKeyFile: "/etc/keys/private.pem"
+providers:
+  - name: authentik
+    type: bearer
+    bearer:
+      issuerURL: "http://localhost:9000/application/o/devnet/"
+      audiences: ["devnet"]
+`)
+	if _, err := Load(p); err != nil {
+		t.Fatalf("load: %v", err)
+	}
+}
+
+func TestLoad_BearerHasNoLegacyForm(t *testing.T) {
+	p := writeTempConfig(t, `
+issuer: "https://auth.foo.example"
+signing:
+  rs256:
+    privateKeyFile: "/etc/keys/private.pem"
+authMode: bearer
+`)
+	if _, err := Load(p); err == nil {
+		t.Error("expected error: bearer is only configurable in the providers list")
+	}
+}
