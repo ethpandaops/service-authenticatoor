@@ -695,6 +695,9 @@ func (p *ProviderConfig) validate() error {
 		if p.Bearer.IssuerURL == "" {
 			return errors.New("bearer.issuerURL is required")
 		}
+		if err := requireHTTPS(p.Bearer.IssuerURL); err != nil {
+			return fmt.Errorf("bearer.issuerURL: %w", err)
+		}
 		if len(p.Bearer.Audiences) == 0 {
 			return errors.New("bearer.audiences must list at least one audience")
 		}
@@ -705,6 +708,22 @@ func (p *ProviderConfig) validate() error {
 		return fmt.Errorf("type: unsupported value %q", p.Type)
 	}
 	return nil
+}
+
+// requireHTTPS rejects a plain-http URL unless it targets the local host.
+// The bearer provider derives who may mint tokens from the keys it fetches
+// there, so a network attacker on that path could forge identities.
+func requireHTTPS(rawURL string) error {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return fmt.Errorf("parse %q: %w", rawURL, err)
+	}
+	host := u.Hostname()
+	local := host == "localhost" || strings.HasSuffix(host, ".localhost") || host == "127.0.0.1" || host == "::1"
+	if u.Scheme == "https" || (u.Scheme == "http" && local) {
+		return nil
+	}
+	return fmt.Errorf("%q must use https (http is only allowed for localhost)", rawURL)
 }
 
 // String returns a redacted representation of the config (suitable for

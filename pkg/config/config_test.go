@@ -730,6 +730,7 @@ func TestLoad_BearerProvider_RejectsMissingRequiredFields(t *testing.T) {
 		"no issuer":      `audiences: ["a"]`,
 		"no audiences":   `issuerURL: "https://idp.example"`,
 		"empty audience": `{issuerURL: "https://idp.example", audiences: [""]}`,
+		"plain http":     `{issuerURL: "http://idp.example/app/", audiences: ["a"]}`,
 	} {
 		t.Run(name, func(t *testing.T) {
 			p := writeTempConfig(t, `
@@ -745,6 +746,24 @@ providers:
 				t.Error("expected error for incomplete bearer provider")
 			}
 		})
+	}
+}
+
+func TestLoad_BearerProvider_AllowsHTTPLocalhost(t *testing.T) {
+	p := writeTempConfig(t, `
+issuer: "https://auth.foo.example"
+signing:
+  rs256:
+    privateKeyFile: "/etc/keys/private.pem"
+providers:
+  - name: authentik
+    type: bearer
+    bearer:
+      issuerURL: "http://localhost:9000/application/o/devnet/"
+      audiences: ["devnet"]
+`)
+	if _, err := Load(p); err != nil {
+		t.Fatalf("load: %v", err)
 	}
 }
 
