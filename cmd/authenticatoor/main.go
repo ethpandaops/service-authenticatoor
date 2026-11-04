@@ -25,6 +25,7 @@ import (
 	"github.com/ethpandaops/service-authenticatoor/pkg/protection"
 	"github.com/ethpandaops/service-authenticatoor/pkg/protection/anyauth"
 	"github.com/ethpandaops/service-authenticatoor/pkg/protection/basic"
+	"github.com/ethpandaops/service-authenticatoor/pkg/protection/bearer"
 	"github.com/ethpandaops/service-authenticatoor/pkg/protection/cloudflare"
 	"github.com/ethpandaops/service-authenticatoor/pkg/protection/github"
 	"github.com/ethpandaops/service-authenticatoor/pkg/protection/oidc"
@@ -232,6 +233,12 @@ func buildProvider(
 			SessionTTL:        pc.OIDC.SessionTTL,
 			AllowedGroups:     pc.OIDC.AllowedGroups,
 			Scopes:            pc.OIDC.Scopes,
+		}), nil
+	case config.AuthModeBearer:
+		return bearer.New(log, bearer.Config{
+			IssuerURL:     pc.Bearer.IssuerURL,
+			Audiences:     pc.Bearer.Audiences,
+			AllowedGroups: pc.Bearer.AllowedGroups,
 		}), nil
 	default:
 		return nil, fmt.Errorf("type %q not implemented", pc.Type)

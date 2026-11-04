@@ -128,51 +128,6 @@ func (v *idTokenVerifier) verify(token, expectedNonce string) (*idTokenClaims, e
 	return claims, nil
 }
 
-// groupAllowed reports whether any of the token's groups is in the
-// allow-list.
-//
-// Matching rules (case-insensitive):
-//   - Exact match: allow-list entry "foo:bar" matches token group "foo:bar".
-//   - Org-prefix match: allow-list entry "foo" (no colon) matches both
-//     token group "foo" and any "foo:<team>". Lets ops grant access to
-//     an entire org without enumerating its teams.
-//   - An empty allow-list is treated as "permit all" — the upstream IdP's
-//     own gating (e.g. dex's connector `orgs:` filter) is then the
-//     authoritative authorization layer.
-//
-// The matching asymmetry is deliberate: dex's github connector emits
-// `<org>:<team>` even for orgs configured without a `teams:` filter, so
-// a bare "org" in the allow-list would never match without this rule.
-// The exact-match path still allows narrowing to specific teams when
-// the allow-list explicitly uses `<org>:<team>`.
-func groupAllowed(tokenGroups []string, allowed map[string]struct{}) bool {
-	if len(allowed) == 0 {
-		return true
-	}
-	for _, g := range tokenGroups {
-		gl := strings.ToLower(g)
-		if _, ok := allowed[gl]; ok {
-			return true
-		}
-		if i := strings.IndexByte(gl, ':'); i > 0 {
-			if _, ok := allowed[gl[:i]]; ok {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-// allowedGroupsSet lowercases an allow-list into a lookup set so the
-// per-request check stays O(1).
-func allowedGroupsSet(allowed []string) map[string]struct{} {
-	out := make(map[string]struct{}, len(allowed))
-	for _, g := range allowed {
-		out[strings.ToLower(g)] = struct{}{}
-	}
-	return out
-}
-
 // defaultScopes are requested when Config.Scopes is empty. `openid` is
 // required for OIDC; `email` returns the email claim; `groups` instructs
 // dex's connectors (notably github) to include the user's groups.

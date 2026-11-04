@@ -123,7 +123,8 @@ stay reachable — they just aren't offered. Useful for machine-only or
 soft-launched providers.
 
 Legacy compatibility: when `providers` is empty, each `authMode` entry
-names a provider *type* (`cloudflare`, `basic`, `any`, `github`, `oidc`)
+names a provider *type* (`cloudflare`, `basic`, `any`, `github`, `oidc`;
+`bearer` has no legacy form)
 and the matching legacy top-level block (`cloudflareAccess:`, …) is
 converted into a provider entry, named after the type (cloudflare→
 `cfaccess`, basic→`htpasswd`, any→`anyauth`, github→`github`,
@@ -142,7 +143,7 @@ from the entry's (required) `name`:
 | ------------------ | ------------------ | ---------------------------------------------------- |
 | `/<name>/login`    | all                | Login entry: authenticates, mints a signed session cookie, redirects back via `return_to`. |
 | `/<name>/callback` | `github`, `oidc`   | OAuth/OIDC callback.                                 |
-| `/<name>/token`    | `cloudflare`       | Machine token alias: `/auth/token` contract, authenticated purely from ambient CF headers (service tokens; never redirects). |
+| `/<name>/token`    | `cloudflare`, `bearer` | Machine token alias: `/auth/token` contract, authenticated purely from the request's own credential — ambient CF headers (service tokens) or a bearer token. Never redirects. |
 | `/login`           | server             | Provider selector listing the `authMode` entries. Redirects straight to the login entry when only one provider is advertised. |
 
 When no provider authenticates a request, an instance advertising a
@@ -343,6 +344,57 @@ inline `oidc.clientSecret` variant works for ad-hoc deployments via
 `AUTHENTICATOOR_OIDC_CLIENTSECRET=…`. The session HMAC key is derived
 from the JWT signing key — no separate session secret to configure.
 
+### `bearer`
+
+Accepts JWTs issued by a trusted OIDC provider, sent as
+`Authorization: Bearer <jwt>` (RFC 6750). For non-interactive clients
+that already hold an IdP token — agents, API gateways — there is no login
+flow, session cookie, or redirect, and the provider never appears on the
+`/login` selector. A token authenticates when it verifies against the
+issuer's JWKS (resolved through OIDC discovery), names one of the
+configured `audiences`, has not expired, and — when `allowedGroups` is
+set — carries a matching `groups` entry (same matching rules as `oidc`).
+The identity is the token's `email`, else `preferred_username`, else
+`sub`.
+
+Clients call the machine alias `/<name>/token` (the `/auth/token` JSON
+contract). It lives outside `/auth/*`, so it works unchanged while a CF
+Access application still covers `/auth/*` for browser users. A missing or
+invalid token answers 401, a valid token outside `allowedGroups` 403,
+both with an RFC 6750 `WWW-Authenticate: Bearer` challenge.
+
+Pick the narrowest issuer/audience pair available. The intended shape is
+an IdP application that exists only to authorize authenticatoor
+instances, whose access policy decides who may obtain its tokens; clients
+obtain such a token by exchanging their own IdP token for it. With
+Authentik that is JWT federation: an OAuth2 provider (here
+`devnet-authenticatoor`) lists the client's provider in
+`jwt_federation_providers`, and a `client_credentials` grant with
+`client_assertion=<the client's access token>` returns a token for the
+same user, after Authentik evaluates the application's policy bindings.
+Trusting the audience of a general-purpose client instead means every
+holder of such a token — and every other service that receives one — can
+mint tokens here.
+
+```yaml
+authMode: cfaccess
+providers:
+  - name: cfaccess
+    type: cloudflare
+    cloudflareAccess:
+      teamDomain: "<team>.cloudflareaccess.com"
+  - name: authentik
+    type: bearer
+    bearer:
+      issuerURL: "https://authentik.example/application/o/devnet-authenticatoor/"
+      audiences: ["devnet-authenticatoor"]
+      # allowedGroups: ["ethpandaops:Core"]
+```
+
+```bash
+curl -H "Authorization: Bearer $IDP_TOKEN" https://auth.<devnet>.example/authentik/token
+```
+
 ### Logout (`/auth/logout`)
 
 Always reachable, regardless of authentication state. With multiple
@@ -353,6 +405,7 @@ one JSON response. With a single provider, its specific behavior applies:
 - **any**: clears the username cookie (`authenticatoor_anyauth_user` by default). The next `/auth/*` request redirects back to the login form.
 - **github**: clears the session cookie. The next `/auth/*` request kicks off a fresh OAuth round-trip.
 - **oidc**: clears the session cookie. The next `/auth/*` request kicks off a fresh OIDC round-trip via dex. The IdP session is left intact (dex 2.x has no robust RP-initiated logout).
+- **bearer**: nothing to clear (`{"loggedOut":true}`); the client stops sending the token.
 - **basic**: clears the session cookie; cached HTTP Basic credentials may re-authenticate ambiently until the tab closes (the server has no reliable way to invalidate the browser cache) — deliberately no `WWW-Authenticate` challenge so the iframe-based client logout doesn't pop a credential dialog.
 
 The bundled `client.js` calls `/auth/logout` from `logout()` via a hidden

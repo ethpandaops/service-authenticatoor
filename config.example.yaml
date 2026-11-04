@@ -73,11 +73,12 @@ authMode: cfaccess
 #   /<name>/login      — login entry (authenticates, mints a signed session
 #                        cookie, redirects back via return_to)
 #   /<name>/callback   — OAuth/OIDC callback (github / oidc types)
-#   /<name>/token      — machine token alias (cloudflare type only): same
-#                        JSON contract as /auth/token, authenticated purely
-#                        from the ambient CF headers — keep this path behind
-#                        the CF Access application so service tokens work
-#                        without redirects.
+#   /<name>/token      — machine token alias (cloudflare / bearer types):
+#                        same JSON contract as /auth/token, authenticated
+#                        purely from the request's own credential (ambient CF
+#                        headers / bearer token), never redirects. For
+#                        cloudflare keep this path behind the CF Access
+#                        application so service tokens work.
 #
 # On each /auth/* request every active provider passively inspects the
 # credentials already present (session cookie, ambient CF headers, Basic
@@ -165,6 +166,20 @@ providers:
   #     # sessionCookieName: "authenticatoor_oidc_session"
   #     # stateCookieName: "authenticatoor_oidc_state"
   #     # scopes: ["openid", "email", "groups"]
+
+  # IdP-issued JWT bearer tokens for non-interactive clients (agents,
+  # gateways). No login flow: "Authorization: Bearer <jwt>" on
+  # /<name>/token (or /auth/*) authenticates when the token verifies
+  # against the issuer's JWKS and names one of the audiences. Not offered
+  # on the selector page. Trust an IdP application dedicated to
+  # authenticatoor, so the IdP's access policy for that application decides
+  # who gets a token; allowedGroups optionally narrows further.
+  # - name: authentik
+  #   type: bearer
+  #   bearer:
+  #     issuerURL: "https://authentik.example/application/o/devnet-authenticatoor/"
+  #     audiences: ["devnet-authenticatoor"]
+  #     # allowedGroups: ["ethpandaops:Core"]
 
 # Legacy form (deprecated): when `providers` is empty, authMode entries
 # name provider TYPES and the matching top-level blocks are converted
