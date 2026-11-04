@@ -126,6 +126,12 @@ func (p *Provider) Start(ctx context.Context) error {
 	}
 	p.issuer = doc.Issuer
 
+	// The keys fetched here decide who may mint tokens; the issuerURL check
+	// at config time does not cover where the document points.
+	if err := protection.RequireHTTPS(doc.JWKSURI); err != nil {
+		return fmt.Errorf("bearer: jwks_uri: %w", err)
+	}
+
 	kf, err := keyfunc.NewDefaultCtx(ctx, []string{doc.JWKSURI})
 	if err != nil {
 		return fmt.Errorf("bearer: jwks load %s: %w", doc.JWKSURI, err)

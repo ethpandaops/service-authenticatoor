@@ -23,9 +23,10 @@ const testAudience = "devnet-authenticatoor"
 // fakeIdP serves an OIDC discovery document and JWKS. The advertised
 // issuer carries a trailing slash, as Authentik's per-application issuers do.
 type fakeIdP struct {
-	srv    *httptest.Server
-	key    *rsa.PrivateKey
-	issuer string
+	srv     *httptest.Server
+	key     *rsa.PrivateKey
+	issuer  string
+	jwksURI string // overrides the advertised jwks_uri when set
 }
 
 func newFakeIdP(t *testing.T) *fakeIdP {
@@ -37,10 +38,11 @@ func newFakeIdP(t *testing.T) *fakeIdP {
 	idp := &fakeIdP{key: key}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/app/.well-known/openid-configuration", func(w http.ResponseWriter, _ *http.Request) {
-		_ = json.NewEncoder(w).Encode(map[string]string{
-			"issuer":   idp.issuer,
-			"jwks_uri": idp.srv.URL + "/app/jwks/",
-		})
+		jwks := idp.jwksURI
+		if jwks == "" {
+			jwks = idp.srv.URL + "/app/jwks/"
+		}
+		_ = json.NewEncoder(w).Encode(map[string]string{"issuer": idp.issuer, "jwks_uri": jwks})
 	})
 	mux.HandleFunc("/app/jwks/", func(w http.ResponseWriter, _ *http.Request) {
 		_ = json.NewEncoder(w).Encode(issuer.JWKS{Keys: []issuer.JWK{issuer.PublicKeyToJWK(&key.PublicKey, "k1")}})
@@ -210,6 +212,18 @@ func TestStart_RejectsIssuerMismatch(t *testing.T) {
 	p := New(log, Config{IssuerURL: idp.srv.URL + "/app/", Audiences: []string{testAudience}})
 	if err := p.Start(t.Context()); err == nil || !strings.Contains(err.Error(), "issuer mismatch") {
 		t.Fatalf("start: got %v, want issuer mismatch", err)
+	}
+}
+
+func TestStart_RejectsPlainHTTPJWKS(t *testing.T) {
+	idp := newFakeIdP(t)
+	idp.jwksURI = "http://idp.example/app/jwks/"
+	log := logrus.New()
+	log.SetOutput(io.Discard)
+
+	p := New(log, Config{IssuerURL: idp.issuer, Audiences: []string{testAudience}})
+	if err := p.Start(t.Context()); err == nil || !strings.Contains(err.Error(), "must use https") {
+		t.Fatalf("start: got %v, want https requirement on jwks_uri", err)
 	}
 }
 

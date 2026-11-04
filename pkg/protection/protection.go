@@ -25,7 +25,9 @@ package protection
 
 import (
 	"context"
+	"fmt"
 	"net/http"
+	"net/url"
 	"strings"
 
 	"github.com/gorilla/mux"
@@ -137,4 +139,21 @@ func SafeReturnTo(raw string) string {
 		return "/"
 	}
 	return raw
+}
+
+// RequireHTTPS rejects a plain-http URL unless it targets the local host.
+// Providers that derive who may authenticate from material fetched over
+// the network (discovery documents, JWKS) must not fetch it over a path
+// an on-path attacker can rewrite.
+func RequireHTTPS(rawURL string) error {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return fmt.Errorf("parse %q: %w", rawURL, err)
+	}
+	host := u.Hostname()
+	local := host == "localhost" || strings.HasSuffix(host, ".localhost") || host == "127.0.0.1" || host == "::1"
+	if u.Scheme == "https" || (u.Scheme == "http" && local) {
+		return nil
+	}
+	return fmt.Errorf("%q must use https (http is only allowed for localhost)", rawURL)
 }
