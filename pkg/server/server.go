@@ -365,6 +365,11 @@ func (s *Server) ambientTokenHandler(amb protection.AmbientAuthenticator) http.H
 			return
 		}
 		if out.Identity == nil {
+			for k, vs := range out.Challenge {
+				for _, v := range vs {
+					w.Header().Add(k, v)
+				}
+			}
 			status := out.Status
 			if status == 0 {
 				status = http.StatusUnauthorized

@@ -497,7 +497,10 @@ type ambientFakeProvider struct {
 func (p *ambientFakeProvider) AuthenticateAmbient(_ context.Context, r *http.Request) (protection.Outcome, error) {
 	email := r.Header.Get(p.ambientHeader)
 	if email == "" {
-		return protection.Outcome{Status: http.StatusUnauthorized}, nil
+		return protection.Outcome{
+			Status:    http.StatusUnauthorized,
+			Challenge: http.Header{"Www-Authenticate": {`Bearer realm="test"`}},
+		}, nil
 	}
 	return protection.Outcome{Identity: &protection.Identity{Subject: email, Email: email}}, nil
 }
@@ -643,6 +646,9 @@ func TestAmbientTokenAlias_RejectsWithoutAmbientCredentials(t *testing.T) {
 
 	if rr.Code != http.StatusUnauthorized {
 		t.Errorf("status: got %d, want 401", rr.Code)
+	}
+	if got := rr.Header().Get("WWW-Authenticate"); got != `Bearer realm="test"` {
+		t.Errorf("WWW-Authenticate: got %q, want the provider's challenge", got)
 	}
 }
 
