@@ -1,6 +1,7 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"maps"
 	"os"
@@ -1995,18 +1996,18 @@ grants:
 		Subject: "alice@example.org", Email: "alice@example.org", SubjectIsEmail: true, Provider: "cfaccess",
 		Matches: members.ForRequest(protection.Attributes{"principal": "user", "email": "alice@example.org"}),
 	}
-	if got := grants.Directive(user, ""); got != all {
+	if got, err := grants.Directive(user, ""); err != nil || got != all {
 		t.Errorf("a Cloudflare user: %q, want %q", got, all)
 	}
 	service := issuer.Identity{
 		Subject: "0123456789abcdef.access", Provider: "cfaccess",
 		Matches: members.ForRequest(protection.Attributes{"principal": "service", "common_name": "0123456789abcdef.access"}),
 	}
-	if got := grants.Directive(service, ""); got != all {
+	if got, err := grants.Directive(service, ""); err != nil || got != all {
 		t.Errorf("a Cloudflare service token: %q, want %q", got, all)
 	}
 	staff := issuer.Identity{Subject: "sub-1", Teams: []string{"ethpandaops"}, Provider: "authentik"}
-	if got := grants.Directive(staff, ""); got != all {
+	if got, err := grants.Directive(staff, ""); err != nil || got != all {
 		t.Errorf("staff through the IdP: %q, want %q", got, all)
 	}
 	// And nobody else: the same team through the wrong door, an IdP
@@ -2015,8 +2016,8 @@ grants:
 		{Subject: "sub-2", Teams: []string{"lighthouse"}, Provider: "authentik"},
 		{Subject: "x@example.org", Email: "x@example.org", Teams: []string{"ethpandaops"}, Provider: "cfaccess"},
 	} {
-		if got := grants.Directive(id, ""); got != "-all" {
-			t.Errorf("%+v: %q, want -all", id, got)
+		if got, err := grants.Directive(id, ""); !errors.Is(err, issuer.ErrNotGranted) {
+			t.Errorf("%+v: %q, %v, want ErrNotGranted (no token)", id, got, err)
 		}
 	}
 }

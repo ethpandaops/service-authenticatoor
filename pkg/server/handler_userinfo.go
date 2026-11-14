@@ -9,19 +9,25 @@ import (
 // userinfoResponse is the small introspection blob returned by /auth/userinfo.
 // Used by web UIs to display "logged in as alice@" without parsing the JWT.
 // Teams mirrors the "teams" claim a token minted right now would carry.
+// Granted says whether one would be minted at all: false for a user who
+// is logged in but named by no grants group (always true on an instance
+// without grants).
 type userinfoResponse struct {
-	Email string   `json:"email"`
-	Sub   string   `json:"sub"`
-	Teams []string `json:"teams"`
-	Aud   []string `json:"aud"`
-	Scope string   `json:"scope"`
-	Exp   int64    `json:"exp"`
-	Now   int64    `json:"now"`
+	Email   string   `json:"email"`
+	Sub     string   `json:"sub"`
+	Teams   []string `json:"teams"`
+	Granted bool     `json:"granted"`
+	Aud     []string `json:"aud"`
+	Scope   string   `json:"scope"`
+	Exp     int64    `json:"exp"`
+	Now     int64    `json:"now"`
 }
 
 // handleUserinfo returns identity & scope details for the authenticated
 // caller. Unlike /auth/token it does not mint a JWT — it's a cheap "who am
-// I" probe that frontends can call any time.
+// I" probe that frontends can call any time. It answers a user without
+// a grant too (200, "granted": false), so a UI can say who is logged in
+// and why there is no token.
 func (s *Server) handleUserinfo(w http.ResponseWriter, r *http.Request) {
 	id := identityFromContext(r.Context())
 	if id == nil || id.Subject == "" {
@@ -36,13 +42,14 @@ func (s *Server) handleUserinfo(w http.ResponseWriter, r *http.Request) {
 	}
 
 	resp := userinfoResponse{
-		Email: id.Email,
-		Sub:   id.Subject,
-		Teams: teams,
-		Aud:   s.cfg.Audience,
-		Scope: s.cfg.ScopePattern,
-		Exp:   time.Now().Add(s.cfg.TokenTTL).Unix(),
-		Now:   time.Now().Unix(),
+		Email:   id.Email,
+		Sub:     id.Subject,
+		Teams:   teams,
+		Granted: s.issuer.Granted(tokenIdentity(id)),
+		Aud:     s.cfg.Audience,
+		Scope:   s.cfg.ScopePattern,
+		Exp:     time.Now().Add(s.cfg.TokenTTL).Unix(),
+		Now:     time.Now().Unix(),
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", "no-store")

@@ -15,13 +15,21 @@ Behind the active protection provider (`/auth/*`):
   with the token in the URL fragment. `return_to` host must match
   `allowedReturnHosts`.
 - `GET /auth/userinfo` — small introspection endpoint (email, subject,
-  teams, audience, scope).
+  teams, audience, scope, and `granted`: whether this user gets tokens
+  at all).
 - `GET /auth/embed?target_origin=…` — issues a JWT and posts it to the
   parent window via `postMessage`, restricted to the validated origin.
   This is the silent token-acquisition path (loaded via an invisible
   iframe).
 - `POST /auth/logout` — provider-dispatched logout. Always reachable,
   regardless of authentication state.
+
+On an instance with a [`grants`](docs/config.md#service-grants-grants)
+section, a user who is logged in but named by no group gets **no
+token**: `/auth/token` and `/auth/embed` answer `403`, `/auth/login`
+shows a `403` page with a logout link instead of redirecting back, and
+`/auth/userinfo` still answers, with `"granted": false`. See
+[An identity no group names](docs/config.md#an-identity-no-group-names).
 
 Public (no upstream auth — reachable by JWKS verifiers and browser JS):
 
@@ -248,8 +256,12 @@ service. Two properties matter:
 With `grants` configured, authenticatoor computes the claim per user
 from the groups they are a member of — by team, by user id or by any
 attribute their provider verified, always together with that provider:
-`+all` for someone granted every service, `-all,+<service>…` for
-specific grants, and `-all` for a user in no group.
+`+all` for someone granted every service and `-all,+<service>…` for
+specific grants. A user in no group gets no token at all (`403`), so a
+tool that verifies tokens without setting `ExpectedService` does not
+take them for logged in. A bare `-all` is still possible — for a member
+of a group whose `services` list is empty, or holds only services the
+instance-wide directive denies.
 
 ### Checking features in a resource server
 

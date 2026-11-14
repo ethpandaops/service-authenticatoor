@@ -174,7 +174,7 @@ not part of the contract.
 | Status | Meaning | What to do |
 | ------ | ------- | ---------- |
 | `401`  | No `Authorization: Bearer` header (`WWW-Authenticate: Bearer`), or the token was not accepted (`WWW-Authenticate: Bearer error="invalid_token"`): malformed, bad signature, wrong issuer, an audience the instance does not accept, expired, no `sub`, header too large. | Get a fresh IdP token and try once more. If it fails again, the client id is not accepted by this instance or the issuer differs: an operator matter. |
-| `403`  | The token is valid, but its user is not in a group the instance admits (`allowedGroups`). | Tell the user; retrying does not help. |
+| `403`  | The IdP token is valid, but its user gets no devnet token: they are not in a group the instance admits (`allowedGroups`), or — on an instance with service grants — no grants group names them (body: `authenticated, but not permitted to use the services of this devnet`). No `WWW-Authenticate` header. | Tell the user that they are logged in but have no access to this devnet; a new IdP token or a new login does not help. An operator has to add them. |
 | `400`  | A requested `aud` is not allowed. | Fix the request. |
 | `404`  | The instance has no bearer endpoint under this provider name. | Check the URL; the feature may be off. |
 | `5xx`  | Server-side failure. | Retry with backoff. |
@@ -210,11 +210,16 @@ The token's claims (`sub`, `email`, `teams`, `services`, …) are described
 in the [README](../README.md#token-format). A client need not interpret
 them, with one exception worth showing to the user:
 
-**`services` starting with `-all`** and naming no service after it means
-*authenticated, but nothing granted*: the login worked, and the user is
-in no grants group of this devnet. Services that check the claim will
-refuse the token. `-all,+dora` is access to dora only; a token without the claim,
-or with `+all`, has basic access to every service.
+**No token (`403`)** is what a user gets who is authenticated but named
+by no grants group of this devnet — see the error table above. There is
+no token that says "logged in, without access".
+
+**`services` starting with `-all`** restricts the token to the services
+named after it: `-all,+dora` is access to dora only, `-all,+spamoor` to
+spamoor only. A bare `-all` — rare: the user is in a group that grants
+no service — is a token no service accepts that checks the claim. A
+token without the claim, or with `+all`, has basic access to every
+service.
 
 When a service starts refusing a token it accepted before, the token
 has most likely expired: get a new one and repeat the call once. A

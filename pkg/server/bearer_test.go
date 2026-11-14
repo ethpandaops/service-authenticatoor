@@ -84,8 +84,8 @@ func TestBearer_SameTokenAsBrowserLogin(t *testing.T) {
 			"alice@example.org", []string{"everyone"}, "-all,+spamoor",
 		},
 		{
-			"authenticated, nothing granted", oidctest.User{Subject: "u2", Email: "bob@example.org"},
-			"bob@example.org", []string{"everyone"}, "-all",
+			"in no group: no token through either", oidctest.User{Subject: "u2", Email: "bob@example.org"},
+			"bob@example.org", []string{"everyone"}, noToken,
 		},
 	}
 	for _, tc := range tests {
@@ -96,6 +96,22 @@ func TestBearer_SameTokenAsBrowserLogin(t *testing.T) {
 				GrantMembers: grants.AttributeMembers("corp"), Bearer: bearerOn(),
 			}), newBasicProvider(t, "other"))
 
+			if tc.wantServices == noToken {
+				viaBrowser := h.mint(tokenRequest(), h.oidcLogin(idp, "corp"))
+				if viaBrowser.Services != noToken || viaBrowser.Subject != tc.wantSub ||
+					!slices.Equal(viaBrowser.Teams, tc.wantTeams) {
+					t.Errorf("browser: %+v", viaBrowser)
+				}
+				rr := h.do(bearerGet("/corp/token", idp.Token(t, cliAudience)))
+				assertNotGranted(t, rr)
+				if got := rr.Header().Get("WWW-Authenticate"); got != "" {
+					t.Errorf("a refusal for want of a grant carries a challenge: %q", got)
+				}
+				if cookies := rr.Result().Cookies(); len(cookies) != 0 {
+					t.Errorf("the bearer path set cookies: %v", cookies)
+				}
+				return
+			}
 			browser := identityOf(h.token(tokenRequest(), h.oidcLogin(idp, "corp")))
 
 			rr := h.do(bearerGet("/corp/token", idp.Token(t, cliAudience)))

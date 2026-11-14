@@ -45,7 +45,10 @@ func TestLogServiceGrants(t *testing.T) {
 				"documented: htpasswd/username:ops → (nothing)",
 			},
 		},
-		{"grants present but empty: an empty table, no warning", []config.ProviderConfig{cf, oidc}, &issuer.GrantsConfig{}, nil, []string{}},
+		{
+			"grants present but empty: an empty table, and a warning that nobody gets a token",
+			[]config.ProviderConfig{cf, oidc}, &issuer.GrantsConfig{}, []string{"nobody gets a token"}, []string{},
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

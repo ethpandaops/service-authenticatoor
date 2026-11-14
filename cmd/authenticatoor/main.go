@@ -328,7 +328,8 @@ func buildGrants(log logrus.FieldLogger, cfg *config.Config) (*issuer.ServiceGra
 
 // logServiceGrants reports at startup how the "services" claim of the
 // issued tokens is decided: the resolved groups when the grants section
-// is configured, or a warning when it is not although the instance
+// is configured (with a warning when there are none, since nobody then
+// gets a token), or a warning when it is not although the instance
 // tells identities apart.
 func logServiceGrants(log logrus.FieldLogger, cfg *config.Config, grants *issuer.ServiceGrants) {
 	if grants == nil {
@@ -340,7 +341,11 @@ func logServiceGrants(log logrus.FieldLogger, cfg *config.Config, grants *issuer
 		return
 	}
 	log.WithField("groups", grants.Table()).
-		Info("service grants active: each token's services claim follows the groups its identity is a member of")
+		Info("service grants active: each token's services claim follows the groups its identity is a " +
+			"member of; an identity that no group names gets no token")
+	if len(grants.Groups()) == 0 {
+		log.Warn("grants has no groups: no identity is named, so nobody gets a token")
+	}
 }
 
 // loadOrGeneratePrivateKey loads the active RSA private key from disk. If

@@ -1,6 +1,7 @@
 package issuer
 
 import (
+	"errors"
 	"fmt"
 	"maps"
 	"math/rand"
@@ -63,6 +64,33 @@ func teamsOf(teams []string) Identity {
 		Teams:    append(slices.Clone(teams), baseTeam),
 		Provider: testProvider,
 	}
+}
+
+// noToken is what directiveOf reports for an identity that no group
+// names: there is no claim, because there is no token.
+const noToken = "(no token)"
+
+// directiveOf is g.Directive with ErrNotGranted spelled as noToken, so
+// that tables can say which identities get a claim and which get no
+// token.
+func directiveOf(t *testing.T, g *ServiceGrants, id Identity, instanceWide string) string {
+	t.Helper()
+	claim, err := g.Directive(id, instanceWide)
+	switch {
+	case errors.Is(err, ErrNotGranted):
+		if claim != "" {
+			t.Fatalf("a refusal came with the claim %q", claim)
+		}
+		if g.Member(id) {
+			t.Fatalf("Directive refused %+v, which Member says is named", id)
+		}
+		return noToken
+	case err != nil:
+		t.Fatalf("directive: %v", err)
+	case !g.Member(id):
+		t.Fatalf("Directive gave %q to %+v, which Member says no group names", claim, id)
+	}
+	return claim
 }
 
 func mustGrants(t *testing.T, table map[string][]string) *ServiceGrants {
@@ -182,26 +210,32 @@ func TestServiceGrants_Directive(t *testing.T) {
 			"-all", "",
 		},
 		{"team with an empty grant", table, []string{"nobody"}, "", "-all", ""},
-		{"team without an entry", table, []string{"reth"}, "", "-all", ""},
-		{"identity without teams", table, nil, "", "-all", ""},
-		{"identity without teams, instance-wide set", table, nil, "+all", "-all", ""},
+		{"team with an empty grant, instance-wide set", table, []string{"nobody"}, "+all", "-all", ""},
+		{"team with an empty grant next to a team without an entry", table, []string{"reth", "nobody"}, "", "-all", ""},
+		{"team without an entry", table, []string{"reth"}, "", noToken, ""},
+		{"identity without teams", table, nil, "", noToken, ""},
+		{"identity without teams, instance-wide set", table, nil, "+all", noToken, ""},
 		{"everyone grant alone", withEveryone, nil, "", "-all,+assertoor", "assertoor"},
 		{"everyone grant for an unlisted team", withEveryone, []string{"reth"}, "", "-all,+assertoor", "assertoor"},
 		{"everyone grant adds to a team's", withEveryone, []string{"lighthouse"}, "", "-all,+assertoor,+dora", "dora assertoor"},
 		{"everyone: all", everyoneAll, nil, "", "+all", probeServices},
 		{"everyone: all, bounded by the instance", everyoneAll, nil, "+all,-buildoor", "+all,-buildoor", "dora spamoor assertoor"},
-		{"empty table", map[string][]string{}, []string{"panda"}, "", "-all", ""},
-		{"team names are matched exactly, never folded", table, []string{" Lighthouse ", "LIGHTHOUSE", "lighthouse\u00a0"}, "", "-all", ""},
-		{"no prefix matching of team names", table, []string{"pand", "pandas", "lighthouse2"}, "", "-all", ""},
+		{"empty table", map[string][]string{}, []string{"panda"}, "", noToken, ""},
+		{"empty table, instance-wide set", map[string][]string{}, []string{"panda"}, "+all", noToken, ""},
+		{"team names are matched exactly, never folded", table, []string{" Lighthouse ", "LIGHTHOUSE", "lighthouse\u00a0"}, "", noToken, ""},
+		{"no prefix matching of team names", table, []string{"pand", "pandas", "lighthouse2"}, "", noToken, ""},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			got := mustGrants(t, tc.table).Directive(teamsOf(tc.teams), tc.instanceWide)
+			got := directiveOf(t, mustGrants(t, tc.table), teamsOf(tc.teams), tc.instanceWide)
 			if got != tc.want {
 				t.Errorf("directive: got %q, want %q", got, tc.want)
 			}
 			if got == "" {
 				t.Error("an empty directive means basic access to every service; it must never be emitted")
+			}
+			if got == noToken {
+				return // no claim to evaluate
 			}
 			allowed := strings.Fields(tc.allowed)
 			for _, service := range strings.Fields(probeServices) {
@@ -215,7 +249,8 @@ func TestServiceGrants_Directive(t *testing.T) {
 
 // TestIssuer_ServicesClaim covers the issuer's side: without a grant
 // table the claim is the instance-wide string as before; with one it
-// follows the token's teams.
+// follows the token's teams, and an identity that no group names gets
+// no token — which is about being named, not about what is granted.
 func TestIssuer_ServicesClaim(t *testing.T) {
 	grants := map[string][]string{"panda": {"all"}, "lighthouse": {"dora"}, baseTeam: {}}
 
@@ -224,7 +259,7 @@ func TestIssuer_ServicesClaim(t *testing.T) {
 		instanceWide string
 		grants       map[string][]string // nil: section absent
 		teams        []string
-		want         string // "": the claim must be absent from the payload
+		want         string // "": the claim must be absent from the payload; noToken: ErrNotGranted
 	}{
 		{"absent section, no instance-wide directive", "", nil, []string{"lighthouse"}, ""},
 		{"absent section, instance-wide directive", "+all,-spamoor", nil, []string{"lighthouse"}, "+all,-spamoor"},
@@ -232,10 +267,16 @@ func TestIssuer_ServicesClaim(t *testing.T) {
 		{"granted service", "", grants, []string{"lighthouse"}, "-all,+dora"},
 		{"all", "", grants, []string{"panda"}, "+all"},
 		{"all, instance-wide directive", "+all,-spamoor", grants, []string{"panda"}, "+all,-spamoor"},
+		// baseTeam is named by a group that grants nothing: every
+		// identity of this table is a member, so each gets its token.
 		{"no teams", "", grants, nil, "-all"},
 		{"unlisted team", "", grants, []string{"reth"}, "-all"},
 		{"invalid team names grant nothing", "", grants, []string{"panda!", "team:panda"}, "-all"},
-		{"present but empty section", "", map[string][]string{}, []string{"panda"}, "-all"},
+		{"named by no group", "", map[string][]string{"panda": {"all"}}, []string{"reth"}, noToken},
+		{"named by no group, instance-wide directive", "+all", map[string][]string{"panda": {"all"}}, nil, noToken},
+		{"invalid team names name nobody", "", map[string][]string{"panda": {"all"}}, []string{"panda!", "team:panda"}, noToken},
+		{"present but empty section", "", map[string][]string{}, []string{"panda"}, noToken},
+		{"present but empty section, instance-wide directive", "+all", map[string][]string{}, nil, noToken},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -259,6 +300,15 @@ func TestIssuer_ServicesClaim(t *testing.T) {
 			}
 
 			tok, claims, err := iss.IssueFor(teamsOf(tc.teams), nil)
+			if granted := iss.Granted(teamsOf(tc.teams)); granted != (tc.want != noToken) {
+				t.Errorf("Granted = %t", granted)
+			}
+			if tc.want == noToken {
+				if !errors.Is(err, ErrNotGranted) || tok != "" || claims != nil {
+					t.Fatalf("got token %q, claims %v, err %v; want ErrNotGranted and nothing else", tok, claims, err)
+				}
+				return
+			}
 			if err != nil {
 				t.Fatalf("issue: %v", err)
 			}
@@ -514,10 +564,14 @@ var featureCases = []struct {
 	},
 	{
 		"no grant", map[string][]string{"lh": {"dora:roll"}}, []string{"reth"}, "",
-		"-all", "", "",
+		noToken, "", "",
 	},
 	{
 		"no teams", map[string][]string{"panda": {"all:all"}}, nil, "",
+		noToken, "", "",
+	},
+	{
+		"named by a group that grants nothing", map[string][]string{"lh": {}}, []string{"lh"}, "",
 		"-all", "", "",
 	},
 
@@ -568,9 +622,12 @@ const (
 func TestServiceGrants_FeatureDirective(t *testing.T) {
 	for _, tc := range featureCases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := mustGrants(t, tc.table).Directive(teamsOf(tc.teams), tc.instanceWide)
+			got := directiveOf(t, mustGrants(t, tc.table), teamsOf(tc.teams), tc.instanceWide)
 			if got != tc.want {
 				t.Fatalf("directive: got %q, want %q", got, tc.want)
+			}
+			if got == noToken {
+				return // no claim to evaluate
 			}
 
 			base := strings.Fields(tc.base)
@@ -613,7 +670,7 @@ func TestServiceGrants_DirectiveIsDeterministic(t *testing.T) {
 		g := mustGrants(t, table)
 		for _, teams := range [][]string{{"a", "b"}, {"b", "a"}, {"b", "a", "b", "zzz"}} {
 			for range 20 { // map iteration order varies between runs
-				if got := g.Directive(teamsOf(teams), ""); got != want {
+				if got := directiveOf(t, g, teamsOf(teams), ""); got != want {
 					t.Fatalf("table %d, teams %v: got %q, want %q", i, teams, got, want)
 				}
 			}
@@ -638,9 +695,23 @@ func TestServiceGrants_OldVerifiersAgreeOnBaseAccess(t *testing.T) {
 	check := func(t *testing.T, table map[string][]string, teams []string, instanceWide string) {
 		t.Helper()
 		g := mustGrants(t, table)
-		claim := g.Directive(teamsOf(teams), instanceWide)
+		claim := directiveOf(t, g, teamsOf(teams), instanceWide)
 		if claim == "" {
 			t.Fatalf("empty claim for %v %v %q", table, teams, instanceWide)
+		}
+		// Named by a group, computed independently: one of the
+		// identity's teams has an entry, whatever is in it.
+		_, named := table[baseTeam]
+		for _, team := range teams {
+			if _, ok := table[team]; ok {
+				named = true
+			}
+		}
+		if named != (claim != noToken) {
+			t.Fatalf("named by a group: %t, but the claim is %q (table %v teams %v)", named, claim, table, teams)
+		}
+		if !named {
+			return // no token, so nothing for a verifier to read
 		}
 		if strings.Contains(claim, auth.FeatureBasic) {
 			t.Fatalf("claim %q spells out basic; old verifiers cannot read that", claim)
@@ -755,7 +826,9 @@ func TestServiceGrants_OldVerifiersAgreeOnBaseAccess(t *testing.T) {
 // TestIssuer_PlainIssueUnderGrants: the three-argument Issue names no
 // provider, and a member of a group always comes through one. On an
 // instance with service grants it therefore mints "-all", whatever the
-// groups say and whoever the subject is.
+// groups say and whoever the subject is. It is the one path that mints
+// for an identity no group names, kept for callers from before
+// identities; IssueFor refuses the same identity.
 func TestIssuer_PlainIssueUnderGrants(t *testing.T) {
 	sections := map[string]GrantsConfig{
 		"a team group": {Groups: []GrantGroup{{Members: []string{"oidc/team:panda"}, Services: []string{"all:all"}}}},
@@ -788,6 +861,12 @@ func TestIssuer_PlainIssueUnderGrants(t *testing.T) {
 			if claims.Services != "-all" || claims.Teams != nil {
 				t.Errorf("services=%q teams=%v, want \"-all\" and no teams", claims.Services, claims.Teams)
 			}
+			// The same identity through IssueFor — the path the server
+			// mints through — gets nothing.
+			id := Identity{Subject: "alice@example.com", Email: "alice@example.com"}
+			if tok, _, err := iss.IssueFor(id, nil); !errors.Is(err, ErrNotGranted) || tok != "" {
+				t.Errorf("IssueFor without a provider: token %q, err %v; want ErrNotGranted", tok, err)
+			}
 		})
 	}
 }
@@ -818,13 +897,13 @@ func TestServiceGrants_Members(t *testing.T) {
 		{"staff through the IdP, by its own team name", Identity{Subject: "s@ethpandaops.io", Teams: []string{"ethpandaops"}, Provider: "oidc"}, "+all,+all:all"},
 		{
 			"panda from the OIDC door is not the staff group's panda",
-			Identity{Subject: "mallory", Teams: []string{"panda"}, Provider: "oidc"}, "-all",
+			Identity{Subject: "mallory", Teams: []string{"panda"}, Provider: "oidc"}, noToken,
 		},
 		{
 			"ethpandaops from the Cloudflare door is not the staff group's either",
-			Identity{Subject: "mallory", Teams: []string{"ethpandaops"}, Provider: "cfaccess"}, "-all",
+			Identity{Subject: "mallory", Teams: []string{"ethpandaops"}, Provider: "cfaccess"}, noToken,
 		},
-		{"panda from a basic-auth door", Identity{Subject: "mallory", Teams: []string{"panda", "ethpandaops", "lighthouse"}, Provider: "htpasswd"}, "-all"},
+		{"panda from a basic-auth door", Identity{Subject: "mallory", Teams: []string{"panda", "ethpandaops", "lighthouse"}, Provider: "htpasswd"}, noToken},
 		{"a client team", Identity{Subject: "bob", Teams: []string{"lighthouse"}, Provider: "oidc"}, "-all,+dora,+spamoor,+spamoor:user*"},
 		{"two teams of one group", Identity{Subject: "bob", Teams: []string{"geth", "lighthouse"}, Provider: "oidc"}, "-all,+dora,+spamoor,+spamoor:user*"},
 		{
@@ -850,15 +929,15 @@ func TestServiceGrants_Members(t *testing.T) {
 		// looks like one — an IdP "sub" nobody verified — is not it.
 		{
 			"a raw subject that looks like an email is not that user",
-			Identity{Subject: "alice@example.org", Provider: "oidc"}, "-all",
+			Identity{Subject: "alice@example.org", Provider: "oidc"}, noToken,
 		},
 		{
 			"neither in another case",
-			Identity{Subject: "ALICE@example.org", Provider: "oidc"}, "-all",
+			Identity{Subject: "ALICE@example.org", Provider: "oidc"}, noToken,
 		},
 		{
 			"a raw email-like subject next to another verified email counts for the email only",
-			Identity{Subject: "alice@example.org", Email: "bob@example.org", Provider: "oidc"}, "-all",
+			Identity{Subject: "alice@example.org", Email: "bob@example.org", Provider: "oidc"}, noToken,
 		},
 		{
 			"a subject the provider marked as a verified email is that user",
@@ -869,24 +948,24 @@ func TestServiceGrants_Members(t *testing.T) {
 			"a raw subject without an @ still matches by subject",
 			Identity{Subject: "sub-123", Provider: "oidc"}, "-all,+assertoor",
 		},
-		{"user ids are exact", Identity{Subject: "alice@example.org.evil", Email: " alice@example.org", Provider: "oidc"}, "-all"},
-		{"a Kelvin sign is not a k", Identity{Subject: "octo\u212aat", Provider: "github"}, "-all"},
+		{"user ids are exact", Identity{Subject: "alice@example.org.evil", Email: " alice@example.org", Provider: "oidc"}, noToken},
+		{"a Kelvin sign is not a k", Identity{Subject: "octo\u212aat", Provider: "github"}, noToken},
 		{
 			"the same id through another provider is another user",
-			Identity{Subject: "alice@example.org", Email: "alice@example.org", Provider: "htpasswd"}, "-all",
+			Identity{Subject: "alice@example.org", Email: "alice@example.org", Provider: "htpasswd"}, noToken,
 		},
-		{"the same login through another provider", Identity{Subject: "octocat", Email: "octocat", Provider: "oidc"}, "-all"},
+		{"the same login through another provider", Identity{Subject: "octocat", Email: "octocat", Provider: "oidc"}, noToken},
 		{"the right login through the right provider", Identity{Subject: "octocat", Provider: "github"}, "-all,+assertoor"},
-		{"a team name is not a user id", Identity{Subject: "lighthouse", Email: "panda", Provider: "oidc"}, "-all"},
-		{"a user id is not a team", Identity{Subject: "x", Teams: []string{"sub-123"}, Provider: "oidc"}, "-all"},
-		{"an identity without a provider is in no group", Identity{Subject: "alice@example.org", Email: "alice@example.org", Teams: []string{"panda", "ethpandaops", "lighthouse"}}, "-all"},
-		{"a provider that is not configured", Identity{Subject: "alice@example.org", Teams: []string{"panda"}, Provider: "other"}, "-all"},
-		{"a group that grants nothing", Identity{Subject: "x", Teams: []string{"ops"}, Provider: "htpasswd"}, "-all"},
-		{"no match at all", Identity{Subject: "nobody", Provider: "oidc"}, "-all"},
+		{"a team name is not a user id", Identity{Subject: "lighthouse", Email: "panda", Provider: "oidc"}, noToken},
+		{"a user id is not a team", Identity{Subject: "x", Teams: []string{"sub-123"}, Provider: "oidc"}, noToken},
+		{"an identity without a provider is in no group", Identity{Subject: "alice@example.org", Email: "alice@example.org", Teams: []string{"panda", "ethpandaops", "lighthouse"}}, noToken},
+		{"a provider that is not configured", Identity{Subject: "alice@example.org", Teams: []string{"panda"}, Provider: "other"}, noToken},
+		{"a group that grants nothing still names its members", Identity{Subject: "x", Teams: []string{"ops"}, Provider: "htpasswd"}, "-all"},
+		{"no match at all", Identity{Subject: "nobody", Provider: "oidc"}, noToken},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := g.Directive(tc.id, ""); got != tc.want {
+			if got := directiveOf(t, g, tc.id, ""); got != tc.want {
 				t.Errorf("directive: got %q, want %q", got, tc.want)
 			}
 		})
@@ -1009,7 +1088,7 @@ func TestNewServiceGrants_Groups(t *testing.T) {
 	if err != nil {
 		t.Fatalf("grants: %v", err)
 	}
-	if got := g.Directive(Identity{Subject: "x", Teams: []string{"panda"}, Provider: "oidc"}, ""); got != "-all,+dora,+spamoor" {
+	if got := directiveOf(t, g, Identity{Subject: "x", Teams: []string{"panda"}, Provider: "oidc"}, ""); got != "-all,+dora,+spamoor" {
 		t.Errorf("union across groups: %q", got)
 	}
 }
@@ -1109,7 +1188,8 @@ func TestServiceGrants_NeverEmptyAndNeverBlank(t *testing.T) {
 		g := mustGrants(t, table)
 		for _, teams := range [][]string{nil, {"panda"}, {"other"}} {
 			for _, bound := range []string{"", "+all", "-all", "+all,-spamoor", "-all,+spamoor"} {
-				if got := g.Directive(teamsOf(teams), bound); strings.TrimSpace(got) == "" {
+				// directiveOf fails the test when a refusal comes with a claim.
+				if got := directiveOf(t, g, teamsOf(teams), bound); strings.TrimSpace(got) == "" {
 					t.Errorf("table %v teams %v bound %q: claim %q", table, teams, bound, got)
 				}
 			}
@@ -1198,19 +1278,19 @@ func TestServiceGrants_AttributeMembers(t *testing.T) {
 		},
 		{
 			"a match of provider A does not count at provider B",
-			Identity{Subject: "a", Provider: "github", Matches: []string{key("groups", "panda-access"), key("username", "alice")}}, "-all",
+			Identity{Subject: "a", Provider: "github", Matches: []string{key("groups", "panda-access"), key("username", "alice")}}, noToken,
 		},
-		{"an oidc match presented by a basic-auth identity", Identity{Subject: "a", Provider: "htpasswd", Matches: []string{key("groups", "panda-access")}}, "-all"},
-		{"a match without a provider", Identity{Subject: "a", Matches: []string{key("groups", "panda-access")}}, "-all"},
-		{"a match the config does not name (any more)", Identity{Subject: "a", Provider: "oidc", Matches: []string{key("groups", "removed-group")}}, "-all"},
-		{"a team name is not an attribute match", Identity{Subject: "a", Provider: "oidc", Teams: []string{"panda-access", "auditors"}}, "-all"},
-		{"an attribute match is not a team", Identity{Subject: "a", Provider: "oidc", Matches: []string{"team:geth", key("team", "geth")}}, "-all"},
-		{"an attribute match is not a user", Identity{Subject: "a", Provider: "oidc", Matches: []string{"user:carol@example.org"}}, "-all"},
-		{"the value is not a prefix", Identity{Subject: "a", Provider: "oidc", Matches: []string{key("groups", "panda-access-evil"), key("groups", "panda")}}, "-all"},
+		{"an oidc match presented by a basic-auth identity", Identity{Subject: "a", Provider: "htpasswd", Matches: []string{key("groups", "panda-access")}}, noToken},
+		{"a match without a provider", Identity{Subject: "a", Matches: []string{key("groups", "panda-access")}}, noToken},
+		{"a match the config does not name (any more)", Identity{Subject: "a", Provider: "oidc", Matches: []string{key("groups", "removed-group")}}, noToken},
+		{"a team name is not an attribute match", Identity{Subject: "a", Provider: "oidc", Teams: []string{"panda-access", "auditors"}}, noToken},
+		{"an attribute match is not a team", Identity{Subject: "a", Provider: "oidc", Matches: []string{"team:geth", key("team", "geth")}}, noToken},
+		{"an attribute match is not a user", Identity{Subject: "a", Provider: "oidc", Matches: []string{"user:carol@example.org"}}, noToken},
+		{"the value is not a prefix", Identity{Subject: "a", Provider: "oidc", Matches: []string{key("groups", "panda-access-evil"), key("groups", "panda")}}, noToken},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := g.Directive(tc.id, ""); got != tc.want {
+			if got := directiveOf(t, g, tc.id, ""); got != tc.want {
 				t.Errorf("directive: got %q, want %q", got, tc.want)
 			}
 		})
@@ -1328,7 +1408,7 @@ func TestNewServiceGrants_AttributeMemberForms(t *testing.T) {
 	if got := g.AttributeMembers("oidc"); !slices.Equal(got, want) {
 		t.Errorf("attribute members: got %v, want %v", got, want)
 	}
-	if got := g.Directive(Identity{Provider: "oidc", Teams: []string{"panda"}, Subject: "alice"}, ""); got != "-all" {
+	if got := directiveOf(t, g, Identity{Provider: "oidc", Teams: []string{"panda"}, Subject: "alice"}, ""); got != noToken {
 		t.Errorf("an attribute member named like a reserved one was read as it: %q", got)
 	}
 
@@ -1378,7 +1458,7 @@ func TestServiceGrants_NeverEmitsMalformedSegments(t *testing.T) {
 				teams = append(teams, team)
 			}
 		}
-		claim := mustGrants(t, table).Directive(teamsOf(teams), "")
+		claim := directiveOf(t, mustGrants(t, table), teamsOf(teams), "")
 		for i, d := range strings.Split(claim, ",") {
 			if !wellFormedDirective.MatchString(d) {
 				t.Fatalf("claim %q: directive %q is not well formed (table %v, teams %v)", claim, d, table, teams)
@@ -1390,5 +1470,93 @@ func TestServiceGrants_NeverEmitsMalformedSegments(t *testing.T) {
 				t.Fatalf("claim %q: a denial after the first directive", claim)
 			}
 		}
+	}
+}
+
+// TestIssuer_NotGranted is the rule that an identity no group names
+// gets no token. It is about being named: a member of a group that
+// grants nothing, or only what the instance-wide directive denies,
+// still gets its token (with "-all"); with an empty section nobody is
+// named; without a section everybody gets a token as before.
+func TestIssuer_NotGranted(t *testing.T) {
+	groups := []GrantGroup{
+		{Name: "staff", Members: []string{"oidc/team:panda"}, Services: []string{"all"}},
+		{Name: "listed", Members: []string{"oidc/team:listed", "cf/user:carol@example.org"}, Services: []string{}},
+		{Name: "dora", Members: []string{"oidc/groups:dora-users"}, Services: []string{"dora"}},
+	}
+	listed := &GrantsConfig{Groups: groups}
+	empty := &GrantsConfig{Groups: []GrantGroup{}}
+	doraMatch := protection.MatchKey("groups", "dora-users")
+
+	tests := []struct {
+		name         string
+		section      *GrantsConfig // nil: no grants section
+		instanceWide string
+		id           Identity
+		want         string // the services claim, or noToken
+	}{
+		{"named, granted", listed, "", Identity{Subject: "a", Teams: []string{"panda"}, Provider: "oidc"}, "+all"},
+		{"named by a group without services", listed, "", Identity{Subject: "a", Teams: []string{"listed"}, Provider: "oidc"}, "-all"},
+		{
+			"named as a user by a group without services", listed, "",
+			Identity{Subject: "carol@example.org", Email: "carol@example.org", SubjectIsEmail: true, Provider: "cf"}, "-all",
+		},
+		{
+			"named, and the instance denies all it is granted", listed, "-all,+spamoor",
+			Identity{Subject: "a", Matches: []string{doraMatch}, Provider: "oidc"}, "-all",
+		},
+		{"named by no group", listed, "", Identity{Subject: "mallory", Teams: []string{"reth"}, Provider: "oidc"}, noToken},
+		{"named by no group, instance-wide +all", listed, "+all", Identity{Subject: "mallory", Provider: "oidc"}, noToken},
+		{"the team of a group through another provider", listed, "", Identity{Subject: "a", Teams: []string{"panda"}, Provider: "cf"}, noToken},
+		{"no provider", listed, "", Identity{Subject: "a", Teams: []string{"panda"}, Matches: []string{doraMatch}}, noToken},
+		{"a team name that is not in normal form", listed, "", Identity{Subject: "a", Teams: []string{"Panda"}, Provider: "oidc"}, noToken},
+		{"empty section: nobody is named", empty, "", Identity{Subject: "a", Teams: []string{"panda"}, Provider: "oidc"}, noToken},
+		{"empty section, instance-wide +all", empty, "+all", Identity{Subject: "a", Provider: "oidc"}, noToken},
+		{"no section: a token without the claim", nil, "", Identity{Subject: "mallory", Provider: "oidc"}, ""},
+		{"no section, no provider", nil, "+all,-spamoor", Identity{Subject: "mallory"}, "+all,-spamoor"},
+	}
+	key, err := GenerateRSAKey()
+	if err != nil {
+		t.Fatalf("genkey: %v", err)
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := Config{
+				ActiveKey: key, Issuer: "https://auth.test.example", DefaultAudience: []string{"test.example"},
+				Services: tc.instanceWide, TTL: 30 * time.Minute,
+			}
+			if tc.section != nil {
+				grants, err := NewServiceGrants(*tc.section, provs("oidc", "cf"))
+				if err != nil {
+					t.Fatalf("grants: %v", err)
+				}
+				cfg.Grants = grants
+			}
+			iss, err := NewRS256Issuer(cfg)
+			if err != nil {
+				t.Fatalf("newissuer: %v", err)
+			}
+
+			tok, claims, err := iss.IssueFor(tc.id, nil)
+			if granted := iss.Granted(tc.id); granted != (tc.want != noToken) {
+				t.Errorf("Granted = %t", granted)
+			}
+			if tc.want == noToken {
+				if !errors.Is(err, ErrNotGranted) {
+					t.Fatalf("err = %v, want ErrNotGranted", err)
+				}
+				if tok != "" || claims != nil {
+					t.Fatalf("a refusal came with token %q, claims %v", tok, claims)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("issue: %v", err)
+			}
+			if raw, present := rawPayload(t, tok)["services"]; claims.Services != tc.want ||
+				(tc.want == "" && present) || (tc.want != "" && raw != tc.want) {
+				t.Errorf("services: claims %q, payload %v (present %t), want %q", claims.Services, raw, present, tc.want)
+			}
+		})
 	}
 }

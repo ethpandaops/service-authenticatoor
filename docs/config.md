@@ -648,7 +648,9 @@ usually without a prompt).
   about).
 
 `/auth/userinfo` reports the identity's teams in its `teams` field
-(always an array, `[]` when there are none). A complete configuration
+(always an array, `[]` when there are none), and in `granted` whether a
+token would be minted for it (see
+[An identity no group names](#an-identity-no-group-names)). A complete configuration
 with two doors is at the end of the next section.
 
 ### Service grants (`grants`)
@@ -683,14 +685,14 @@ grants:
 | Key        | Meaning                                                                    |
 | ---------- | -------------------------------------------------------------------------- |
 | `members`  | Who is in the group. Required, at least one.                               |
-| `services` | What the group may use: a list of grants (see **Features** below). Required. May be empty — `services: []` grants nothing and just documents the members. |
+| `services` | What the group may use: a list of grants (see **Features** below). Required. May be empty — `services: []` grants no service, but its members are named by a group: they get a token (with `-all`), where someone no group names gets none. |
 | `name`     | Optional label used in the startup log and in error messages. Unique.      |
 
 An identity's grants are the **union** of the `services` of every group
 it is a member of. Unknown keys in a group, wrong types, a group name
 used twice, the same member twice in one group, an empty `grants:`
-without a value — each is a startup error; write `grants: []` to grant
-nothing to anyone. The earlier shapes of this section (`teamServices`,
+without a value — each is a startup error; write `grants: []` to name
+nobody — then nobody gets a token. The earlier shapes of this section (`teamServices`,
 and `grants` with `everyone` / `teams` / `users`) are gone and fail at
 startup with a pointer to this one.
 
@@ -789,21 +791,70 @@ later entries override earlier ones). With the section present, the
 claim is computed for each token from the union of the identity's
 grants:
 
-| The identity's grants…          | `services` claim                                   |
-| ------------------------------- | -------------------------------------------------- |
-| include `all`                   | `+all`                                             |
-| are `dora` and `spamoor`        | `-all,+dora,+spamoor` (sorted)                     |
-| are empty: it is in no group    | `-all`                                             |
+| The identity…                                         | `services` claim               |
+| ----------------------------------------------------- | ------------------------------ |
+| is granted `all`                                      | `+all`                         |
+| is granted `dora` and `spamoor`                       | `-all,+dora,+spamoor` (sorted) |
+| is in a group, and granted nothing (`services: []`)   | `-all`                         |
+| is in no group                                        | *no token*                     |
 
 (Grants that name features add feature directives to these; see **The
 emitted `services` claim** below.)
 
-A user without any grant still gets a token — they are authenticated —
-but a tool that checks its service refuses it. The grants are read from
-the current config every time a token is minted (they are not stored in
-the session), so a change applies to existing sessions after a restart,
-at the next token refresh. At startup the resolved table is logged at
-info level.
+The grants are read from the current config every time a token is
+minted (they are not stored in the session), so a change applies to
+existing sessions after a restart, at the next token refresh. At startup
+the resolved table is logged at info level.
+
+#### An identity no group names
+
+With the section present, an identity that **no group names gets no
+token at all**. It used to get one with `services: "-all"`; a tool that
+verifies tokens but does not check the claim took that for a login.
+
+*Named* is about `members`, not about `services`: an identity is named
+when some group has a member that matches it at the provider it came
+through (a team, a user id, an attribute). What its groups grant plays
+no part — a member of a group with `services: []`, or of one whose
+services the instance-wide `services` directive denies, is named and
+gets its token, with `-all`. With `grants: []` there are no members, so
+nobody is named and **nobody gets a token** (the service warns about
+that at startup). Without the section nothing
+of this applies: everybody who is authenticated gets a token, without a
+`services` claim.
+
+The user is authenticated all the same, and stays logged in. What each
+endpoint answers:
+
+| Endpoint | Answer for a logged-in identity no group names |
+| -------- | ---------------------------------------------- |
+| `/auth/token`, `/<name>/token` | `403`, `text/plain`: `authenticated, but not permitted to use the services of this devnet`. Never a redirect to a login and never a `WWW-Authenticate` challenge — logging in again would not change it. |
+| `/auth/login?return_to=…` | `403` and a small HTML page instead of the redirect back: it names the subject and the provider the user is logged in with, says that the account has no access here, and links to `/auth/logout` so that another account can be used. Nothing is sent to `return_to`. |
+| `/auth/embed` | `403`, `text/plain`, and nothing is posted to the parent window. The v1 client's `checkLogin()` resolves unauthenticated when its timer runs out, as for a user who is not logged in. |
+| `/auth/userinfo` | `200` as for everyone, with `"granted": false`. It mints nothing. |
+
+`/auth/userinfo` carries `"granted"` on every instance: `true` when a
+token would be minted for the caller (always, without `grants`), `false`
+for a logged-in identity no group names. A UI can use it to tell "not
+logged in" (`/auth/userinfo` redirects or answers `401`) from "logged
+in, without access".
+
+The v2 client (`client-v2.js`) needs no change: its frame reads the
+`403` of `/auth/token` as *unauthenticated* and does not retry, so the
+app shows its logged-out state, and `login()` leads to the page above
+rather than round the login again. A token the browser already holds
+stays usable until it expires.
+
+Each refusal is logged at info level (`no token issued: the identity is
+in no grants group`, with `sub`, `provider` and `endpoint`) and counted
+in `authenticatoor_token_issue_errors_total{reason="not_granted"}`.
+
+The session is not ended by a refusal. Since the grants are read at
+every mint, a user who is added to a group gets a token at their next
+request after the restart, without logging in again — with the
+exception described under **When members are evaluated**: an *attribute*
+member added for an `oidc` or `github` user counts from their next
+login.
 
 When the section is **absent**, nothing changes from earlier versions:
 no per-team `services` claim is computed, and tokens carry no service
@@ -818,7 +869,8 @@ Two things to keep in mind:
   through — that is how verifiers have always read it — and it holds no
   granted feature (see [Features](#features)). It is what tokens look
   like without `grants`. Once the section exists, the claim is never
-  empty: an identity with no grant gets an explicit `-all`.
+  empty: a member of a group that grants nothing gets an explicit
+  `-all`, and an identity in no group gets no token.
 - **The gate binds only tools that check it.** A resource server
   enforces the claim when it sets its own name as
   `VerifierConfig.ExpectedService` in `pkg/auth` (spamoor and assertoor
@@ -925,7 +977,8 @@ union of an identity's grants:
 
 | Grants (union)                                 | `services` claim                                  |
 | ---------------------------------------------- | ------------------------------------------------- |
-| none, or no teams                              | `-all`                                            |
+| *(in no group)*                                | *no token*                                        |
+| none (only groups with `services: []`)         | `-all`                                            |
 | `dora`                                         | `-all,+dora`                                      |
 | `spamoor`, `dora:admin:api`                    | `-all,+dora,+dora:admin:api,+spamoor`             |
 | `dora`, `dora:admin`, `dora:all`               | `-all,+dora,+dora:all`                            |
@@ -1040,9 +1093,9 @@ is what an authenticatoor without `grants` mints. For operators that
 means: **an instance without `grants` hands out no default-deny
 feature to anyone**, its own staff included — configure `grants` to
 give them out (`all:all` for the internal team). An authenticatoor
-with `grants` never mints an empty claim (an identity with no grant
-gets `-all`), and `grants` is also what keeps anyone but staff out of
-a service.
+with `grants` never mints an empty claim (a member of a group that
+grants nothing gets `-all`; an identity in no group gets no token), and
+`grants` is also what keeps anyone but staff out of a service.
 
 **Teams or features?** Use the `teams` claim for *ownership*-type
 decisions — whose nodes these are, which team's dashboard to show — and
@@ -1132,17 +1185,20 @@ grants:
 | Who                                                             | `teams`           | `services`                                                  |
 | --------------------------------------------------------------- | ----------------- | ----------------------------------------------------------- |
 | A person through Cloudflare Access                              | `["panda"]`       | `+all,+all:all`                                             |
-| A service token through Cloudflare Access                       | *(none)*          | `-all`                                                      |
+| A service token through Cloudflare Access                       | —                 | *no token*                                                  |
 | Staff via `oidc`, groups `team:ethpandaops`, `panda-access`     | `["ethpandaops"]` | `+all,+all:all`                                             |
 | `alice@example.org` via `oidc`, group `team:lighthouse`         | `["lighthouse"]`  | `-all,+dora,+dora:reindex,+spamoor,+spamoor:user*`          |
 | `bob@example.org` via `oidc`, group `team:lighthouse`           | `["lighthouse"]`  | `-all,+dora,+spamoor,+spamoor:user*`                        |
 | `carol@example.org` via `oidc`, no `team:` group                | `["geth"]`        | `-all,+dora,+spamoor,+spamoor:user*`                        |
 | `dave@example.org` via `oidc`, group `panda-access` only        | *(none)*          | `-all,+assertoor`                                           |
-| Someone via `oidc` with group `team:panda`                      | `["panda"]`       | `-all`                                                      |
+| Someone via `oidc` with group `team:panda`                      | —                 | *no token*                                                  |
 
 The last row is the point of naming the door: the IdP can call someone
-`panda`, and the token says so, but the staff group lists `panda` only
-as the Cloudflare door reports it.
+`panda` — `/auth/userinfo` reports the team — but the staff group lists
+`panda` only as the Cloudflare door reports it. No group names that
+person, so they get no token (`403`); neither does the service token of
+the second row, which no member names (a `cfaccess/principal:service`
+member would).
 
 ### `cloudflare` (default)
 

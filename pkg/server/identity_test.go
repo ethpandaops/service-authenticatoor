@@ -46,27 +46,27 @@ func TestGrants_SubjectThatLooksLikeAnEmail_EndToEnd(t *testing.T) {
 		{
 			"sub is the address, no email claim",
 			oidctest.User{Subject: "alice@example.org"},
-			false, "alice@example.org", "", "-all",
+			false, "alice@example.org", "", noToken,
 		},
 		{
 			"sub is the address, email_verified: false",
 			oidctest.User{Subject: "alice@example.org", Email: "alice@example.org", Claims: map[string]any{"email_verified": false}},
-			false, "alice@example.org", "", "-all",
+			false, "alice@example.org", "", noToken,
 		},
 		{
 			"sub is the address, email_verified absent",
 			oidctest.User{Subject: "alice@example.org", Email: "alice@example.org", Claims: map[string]any{"email_verified": nil}},
-			false, "alice@example.org", "", "-all",
+			false, "alice@example.org", "", noToken,
 		},
 		{
 			"sub is the address in another case",
 			oidctest.User{Subject: "Alice@Example.ORG"},
-			false, "Alice@Example.ORG", "", "-all",
+			false, "Alice@Example.ORG", "", noToken,
 		},
 		{
 			"sub is the address, another verified email",
 			oidctest.User{Subject: "alice@example.org", Email: "mallory@example.org"},
-			false, "mallory@example.org", "mallory@example.org", "-all",
+			false, "mallory@example.org", "mallory@example.org", noToken,
 		},
 		{
 			"the verified owner of the address",
@@ -100,7 +100,7 @@ func TestGrants_SubjectThatLooksLikeAnEmail_EndToEnd(t *testing.T) {
 			h := newSectionHarness(t, &section, "", newOIDCProvider(idp, "oidc", oidc.Config{
 				GrantMembers: grants.AttributeMembers("oidc"), TrustUnverifiedEmail: tc.trust,
 			}))
-			claims := h.verify(h.rawToken(tokenRequest(), h.oidcLogin(idp, "oidc")))
+			claims := h.mint(tokenRequest(), h.oidcLogin(idp, "oidc"))
 			if claims.Subject != tc.wantSub || claims.Email != tc.wantEmail {
 				t.Errorf("identity: sub=%q email=%q, want %q / %q", claims.Subject, claims.Email, tc.wantSub, tc.wantEmail)
 			}
@@ -153,9 +153,9 @@ func TestGrants_ClaimNamesAreExact_EndToEnd(t *testing.T) {
 			h := newSectionHarness(t, &section, "", newOIDCProvider(idp, "oidc", oidc.Config{
 				GrantMembers: grants.AttributeMembers("oidc"),
 			}))
-			claims := h.verify(h.rawToken(tokenRequest(), h.oidcLogin(idp, "oidc")))
-			if claims.Subject != "sub-of-mallory" || claims.Email != "" || claims.Services != "-all" {
-				t.Errorf("sub=%q email=%q services=%q, want the IdP subject, no email and -all",
+			claims := h.mint(tokenRequest(), h.oidcLogin(idp, "oidc"))
+			if claims.Subject != "sub-of-mallory" || claims.Email != "" || claims.Services != noToken {
+				t.Errorf("sub=%q email=%q services=%q, want the IdP subject, no email and no token",
 					claims.Subject, claims.Email, claims.Services)
 			}
 		})
@@ -210,9 +210,9 @@ func TestGrants_SharedCloudflareDoor_EndToEnd(t *testing.T) {
 	}
 
 	// The other door is still told apart: a client developer through
-	// the IdP is not staff.
-	claims := h.verify(h.rawToken(tokenRequest(), h.oidcLogin(idp, "authentik")))
-	if !slices.Equal(claims.Teams, []string{"lighthouse"}) || claims.Services != "-all" {
+	// the IdP is not staff, and — named by no group — gets no token.
+	claims := h.mint(tokenRequest(), h.oidcLogin(idp, "authentik"))
+	if !slices.Equal(claims.Teams, []string{"lighthouse"}) || claims.Services != noToken {
 		t.Errorf("a client developer through the IdP: teams %v services %q", claims.Teams, claims.Services)
 	}
 

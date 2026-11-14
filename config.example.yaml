@@ -271,8 +271,14 @@ providers:
 #
 #   grants include `all`      → "+all"
 #   dora and spamoor          → "-all,+dora,+spamoor"
-#   in no group               → "-all"  (token still minted; tools that
-#                                        check their service refuse it)
+#   in no group               → no token at all: /auth/token answers 403,
+#                               /auth/login shows a 403 page with a logout
+#                               link (the session is kept; /auth/userinfo
+#                               says "granted": false)
+#
+# "In no group" means that no member of any group names the identity. A
+# member of a group whose services are empty (`services: []`) is named:
+# it gets a token, with "-all".
 #
 # A member names the door and what the door vouched for:
 #
@@ -299,7 +305,7 @@ providers:
 # — every authenticated identity gets tokens valid for every service
 # (basic access only: no default-deny feature of any tool),
 # and the service warns about that at startup when several providers or
-# any teams are configured. `grants: []` grants nothing to anyone.
+# any teams are configured. `grants: []` names nobody: nobody gets a token.
 #
 # Only tools that verify with their own name as ExpectedService (spamoor,
 # assertoor; buildoor once its branch pk910/services-gate is merged)

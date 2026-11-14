@@ -31,8 +31,11 @@ type Issuer interface {
 	// The token is that of an identity about which nothing else is
 	// known: it carries no teams, and since service grants name their
 	// members by provider, it is a member of no group — on an instance
-	// with grants its services claim is "-all". See IdentityIssuer for
-	// the full form.
+	// with grants its services claim is "-all". Issue is the one path
+	// that mints for an identity no group names; it is here for callers
+	// from before identities. Nothing that serves a user may use it:
+	// the server mints through IdentityIssuer.IssueFor only, which
+	// refuses such an identity (ErrNotGranted).
 	Issue(subject, email string, audience []string) (token string, claims *auth.Claims, err error)
 	// JWKS returns the set of public keys (active + previous) as serialized
 	// JSON.
@@ -80,7 +83,15 @@ type IdentityIssuer interface {
 	Issuer
 	// IssueFor mints a token for the identity. If audience is non-nil
 	// it overrides the issuer's default audience for this token.
+	//
+	// With service grants configured, an identity that no group names
+	// gets no token: the error is ErrNotGranted (test it with
+	// errors.Is). Without grants every identity gets one.
 	IssueFor(id Identity, audience []string) (token string, claims *auth.Claims, err error)
+	// Granted reports whether IssueFor would mint a token for the
+	// identity as far as the grants go: always true without service
+	// grants, otherwise whether a group names the identity.
+	Granted(id Identity) bool
 }
 
 // PreviousKey is a public-only key kept in the JWKS during rotation so
@@ -115,7 +126,8 @@ type Config struct {
 	Services string
 	// Grants, when non-nil, makes the "services" claim depend on the
 	// identity: each token carries the directive computed by
-	// ServiceGrants.Directive, with Services as the upper bound. When
+	// ServiceGrants.Directive, with Services as the upper bound, and an
+	// identity that no group names gets no token (ErrNotGranted). When
 	// nil, every token carries Services as it is.
 	Grants *ServiceGrants
 	// TTL is how long issued tokens are valid for.
@@ -183,14 +195,50 @@ func NewRS256Issuer(cfg Config) (*RS256Issuer, error) {
 var _ IdentityIssuer = (*RS256Issuer)(nil)
 
 // Issue mints and signs a JWT for the supplied subject and email, with
-// no teams. It is IssueFor for an identity about which nothing else is
-// known.
+// no teams. It is the token of an identity about which nothing else is
+// known; with service grants its services claim is "-all" (see
+// Issuer.Issue).
 func (i *RS256Issuer) Issue(subject, email string, audience []string) (string, *auth.Claims, error) {
-	return i.IssueFor(Identity{Subject: subject, Email: email}, audience)
+	services := i.cfg.Services
+	if i.cfg.Grants != nil {
+		services = noServices
+	}
+	return i.mint(Identity{Subject: subject, Email: email}, nil, services, audience)
 }
 
-// IssueFor mints and signs a JWT for the identity.
+// Granted reports whether a group of the service grants names the
+// identity; true when there are no service grants.
+func (i *RS256Issuer) Granted(id Identity) bool {
+	if i.cfg.Grants == nil {
+		return true
+	}
+	id.Teams = claimTeams(id.Teams)
+	return i.cfg.Grants.Member(id)
+}
+
+// IssueFor mints and signs a JWT for the identity. With service grants
+// it returns ErrNotGranted, and no token, for an identity that no group
+// names.
 func (i *RS256Issuer) IssueFor(id Identity, audience []string) (string, *auth.Claims, error) {
+	// The grant is computed from the teams as they go into the token.
+	teams := claimTeams(id.Teams)
+	services := i.cfg.Services
+	if i.cfg.Grants != nil {
+		id.Teams = teams
+		directive, err := i.cfg.Grants.Directive(id, i.cfg.Services)
+		if err != nil {
+			return "", nil, err
+		}
+		services = directive
+	}
+	return i.mint(id, teams, services, audience)
+}
+
+// mint signs a JWT for the identity with the teams and services claims
+// the caller decided on.
+func (i *RS256Issuer) mint(
+	id Identity, teams []string, services string, audience []string,
+) (string, *auth.Claims, error) {
 	subject, email := id.Subject, id.Email
 	if subject == "" {
 		return "", nil, fmt.Errorf("issuer: subject is required")
@@ -205,14 +253,6 @@ func (i *RS256Issuer) IssueFor(id Identity, audience []string) (string, *auth.Cl
 	jti, err := randomJTI()
 	if err != nil {
 		return "", nil, fmt.Errorf("issuer: jti: %w", err)
-	}
-
-	// The grant is computed from the teams as they go into the token.
-	teams := claimTeams(id.Teams)
-	services := i.cfg.Services
-	if i.cfg.Grants != nil {
-		id.Teams = teams
-		services = i.cfg.Grants.Directive(id, i.cfg.Services)
 	}
 
 	claims := &auth.Claims{

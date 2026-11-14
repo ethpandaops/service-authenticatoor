@@ -5,6 +5,7 @@ import (
 	"crypto/sha1"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"io"
 	"maps"
 	"net/http"
@@ -19,6 +20,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/sirupsen/logrus"
+	logtest "github.com/sirupsen/logrus/hooks/test"
 
 	"github.com/ethpandaops/service-authenticatoor/pkg/auth"
 	"github.com/ethpandaops/service-authenticatoor/pkg/cfaccess"
@@ -41,6 +43,21 @@ type teamsHarness struct {
 	verifier *auth.JWKSVerifier
 	jwksURL  string
 	issuer   string
+	// logs records what the server logged.
+	logs *logtest.Hook
+}
+
+// identityIssuerOnly is the issuer of every harness: the real one, with
+// a plain Issue that fails the test. Issue mints for an identity no
+// grants group names; nothing that serves a user may reach it.
+type identityIssuerOnly struct {
+	issuer.IdentityIssuer
+	t *testing.T
+}
+
+func (i identityIssuerOnly) Issue(subject, _ string, _ []string) (string, *auth.Claims, error) {
+	i.t.Errorf("the server called the plain Issue for %q; it must mint through IssueFor only", subject)
+	return "", nil, errors.New("plain Issue is not for the server")
 }
 
 // newTeamsHarness starts the given providers and wires them into a
@@ -144,9 +161,10 @@ func newSectionHarness(
 
 	log := logrus.New()
 	log.SetOutput(io.Discard)
+	logs := logtest.NewLocal(log)
 	s, err := New(Options{
 		Config:    cfg,
-		Issuer:    iss,
+		Issuer:    identityIssuerOnly{IdentityIssuer: iss, t: t},
 		Providers: providers,
 		Log:       log,
 		Registry:  prometheus.NewRegistry(),
@@ -168,7 +186,7 @@ func newSectionHarness(
 	}
 	return &teamsHarness{
 		t: t, handler: handler, verifier: verifier,
-		jwksURL: jwks.URL + "/jwks.json", issuer: cfg.Issuer,
+		jwksURL: jwks.URL + "/jwks.json", issuer: cfg.Issuer, logs: logs,
 	}
 }
 
@@ -739,8 +757,12 @@ func TestGrants_EndToEnd(t *testing.T) {
 			"two teams: the union", grants, "", []string{"team:lighthouse", "team:geth"},
 			"-all,+dora,+spamoor", []string{"dora", "spamoor"},
 		},
-		{"a team without a grant: nothing", grants, "", []string{"team:reth"}, "-all", nil},
-		{"no teams at all: nothing", grants, "", []string{}, "-all", nil},
+		{"a team no group names: no token", grants, "", []string{"team:reth"}, noToken, nil},
+		{"no teams at all: no token", grants, "", []string{}, noToken, nil},
+		{
+			"a team whose services the instance denies: a token for nothing", grants, "-all,+spamoor",
+			[]string{"team:lighthouse"}, "-all", nil,
+		},
 		{
 			"instance-wide directive bounds staff", grants, "+all,-spamoor", nil,
 			"+all,-spamoor", []string{"dora", "assertoor", "buildoor"},
@@ -763,6 +785,13 @@ func TestGrants_EndToEnd(t *testing.T) {
 				newOIDCProvider(idp, "oidc", oidc.Config{TeamRules: teamRules(prefixRule)}),
 			)
 
+			if tc.wantClaim == noToken {
+				// Authenticated, and named by no group: nothing is
+				// minted that a verifier could accept.
+				assertNotGranted(t, h.do(tokenRequest(), h.oidcLogin(idp, "oidc")))
+				return
+			}
+
 			var token string
 			if tc.groups == nil {
 				req := tokenRequest()
@@ -772,8 +801,9 @@ func TestGrants_EndToEnd(t *testing.T) {
 				token = h.rawToken(tokenRequest(), h.oidcLogin(idp, "oidc"))
 			}
 
-			// The user is authenticated either way: the token itself is
-			// valid for a verifier that does not gate on a service.
+			// A member of a group is authenticated whatever it is
+			// granted: the token itself is valid for a verifier that
+			// does not gate on a service.
 			claims := h.verify(token)
 			if claims.Services != tc.wantClaim {
 				t.Errorf("services claim: got %q, want %q", claims.Services, tc.wantClaim)
@@ -868,13 +898,15 @@ func TestGrants_FollowCurrentConfig(t *testing.T) {
 		want         string
 	}{
 		{"grant widened", map[string][]string{"lighthouse": {"dora", "spamoor"}}, "-all,+dora,+spamoor"},
-		{"grant revoked", map[string][]string{"lighthouse": {}}, "-all"},
+		{"services taken away, the team still named", map[string][]string{"lighthouse": {}}, "-all"},
+		{"the group removed: no token", map[string][]string{"geth": {"dora"}}, noToken},
+		{"every group removed: no token", map[string][]string{}, noToken},
 		{"section removed", nil, ""},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			after := newGrantsHarness(t, tc.teamServices, "", provider())
-			claims := after.verify(after.rawToken(tokenRequest(), session))
+			claims := after.mint(tokenRequest(), session)
 			if claims.Services != tc.want {
 				t.Errorf("services: got %q, want %q", claims.Services, tc.want)
 			}
@@ -895,6 +927,7 @@ func TestGrants_Features_EndToEnd(t *testing.T) {
 		"panda":      {"all:all"},
 		"lighthouse": {"dora"},
 		"geth":       {"dora:roll"},
+		"reth":       {},
 	}
 
 	tests := []struct {
@@ -911,7 +944,7 @@ func TestGrants_Features_EndToEnd(t *testing.T) {
 		{"team with a feature", []string{"team:geth"}, "-all,+dora,+dora:roll", true, true, false, true, false},
 		{"both teams", []string{"team:geth", "team:lighthouse"}, "-all,+dora,+dora:roll", true, true, false, true, false},
 		{"the internal team: everything", nil, "+all,+all:all", true, true, true, true, true},
-		{"a team without a grant", []string{"team:reth"}, "-all", false, false, false, false, false},
+		{"a team in a group without services", []string{"team:reth"}, "-all", false, false, false, false, false},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1148,33 +1181,33 @@ func TestGrants_ProviderQualified_EndToEnd(t *testing.T) {
 
 	tests := []struct {
 		name         string
-		claims       *auth.Claims
+		claims       minted
 		wantTeams    []string
 		wantServices string
 	}{
 		{
 			"panda through the Cloudflare door: the staff group",
-			h.verify(h.rawToken(cfReq("staff@ethpandaops.io"))),
+			h.mint(cfReq("staff@ethpandaops.io")),
 			[]string{"panda"}, "+all,+all:all",
 		},
 		{
 			"panda through the OIDC door: the team is in the token, the staff grant is not",
-			h.verify(h.rawToken(tokenRequest(), h.oidcLogin(idp, "oidc"))),
+			h.mint(tokenRequest(), h.oidcLogin(idp, "oidc")),
 			[]string{"panda"}, "-all,+assertoor,+dora,+dora:reindex",
 		},
 		{
 			"panda through the basic door, named like the OIDC user: its own group only",
-			h.verify(h.rawToken(basicReq("alice@example.org"))),
+			h.mint(basicReq("alice@example.org")),
 			[]string{"panda"}, "-all,+spamoor",
 		},
 		{
-			"a basic-auth user named like the IdP group",
-			h.verify(h.rawToken(basicReq("panda-access"))),
-			[]string{"panda"}, "-all",
+			"a basic-auth user named like the IdP group: in no group",
+			h.mint(basicReq("panda-access")),
+			[]string{"panda"}, noToken,
 		},
 		{
 			"the OIDC user's email through the Cloudflare door: staff by team, not alice's group",
-			h.verify(h.rawToken(cfReq("alice@example.org"))),
+			h.mint(cfReq("alice@example.org")),
 			[]string{"panda"}, "+all,+all:all",
 		},
 	}
@@ -1240,7 +1273,7 @@ func TestGrants_AttributeMembers_Sessions(t *testing.T) {
 	before := build(groups(internal, ops))
 	session := before.oidcLogin(idp, "oidc")
 	services := func(h *teamsHarness, cookies ...*http.Cookie) string {
-		return h.verify(h.rawToken(tokenRequest(), cookies...)).Services
+		return h.mint(tokenRequest(), cookies...).Services
 	}
 	if got := services(before, session); got != "-all,+assertoor,+spamoor" {
 		t.Fatalf("at login: %q", got)
@@ -1267,7 +1300,8 @@ func TestGrants_AttributeMembers_Sessions(t *testing.T) {
 		{"unchanged", groups(internal, ops), "-all,+assertoor,+spamoor"},
 		{"a group's services changed: at the next mint", groups(issuer.GrantGroup{Members: internal.Members, Services: []string{"assertoor", "dora:roll"}}, ops), "-all,+assertoor,+dora,+dora:roll,+spamoor"},
 		{"a member removed: at the next mint", groups(ops), "-all,+spamoor"},
-		{"all groups removed", groups(), "-all"},
+		{"all groups removed: no token", groups(), noToken},
+		{"only a group of another member left: no token", groups(auditors), noToken},
 		{"a member added: not for the running session", groups(internal, ops, auditors), "-all,+assertoor,+spamoor"},
 	}
 	for _, tc := range tests {
@@ -1294,7 +1328,7 @@ func TestGrants_AttributeMembers_Sessions(t *testing.T) {
 		if len(cookies) != 1 {
 			t.Fatalf("login cookies: %v", cookies)
 		}
-		if got := services(without, cookies[0]); got != "-all" {
+		if got := services(without, cookies[0]); got != noToken {
 			t.Fatalf("before the member exists: %q", got)
 		}
 
@@ -1348,9 +1382,8 @@ func TestGrants_AmbientAlias(t *testing.T) {
 	}
 	req = httptest.NewRequest(http.MethodGet, "/other/token", nil)
 	req.Header.Set(cloudflare.DefaultUserHeader, "someone@ethpandaops.io")
-	if got := h.verify(h.rawToken(req)).Services; got != "-all" {
-		t.Errorf("/other/token for another person: %q", got)
-	}
+	// Nobody names that person at the second door: no token there.
+	assertNotGranted(t, h.do(req))
 }
 
 // accessVerifier stands in for the Cloudflare JWKS check: it accepts any
@@ -1414,7 +1447,7 @@ func TestDevnetExample(t *testing.T) {
 		{
 			"A service token through Cloudflare Access",
 			map[string]any{"common_name": "abc123.access"}, nil,
-			nil, "-all",
+			nil, noToken,
 		},
 		{
 			"Staff via `oidc`, groups `team:ethpandaops`, `panda-access`",
@@ -1444,7 +1477,7 @@ func TestDevnetExample(t *testing.T) {
 		{
 			"Someone via `oidc` with group `team:panda`",
 			nil, newIdP("mallory@example.org", "team:panda"),
-			[]string{"panda"}, "-all",
+			[]string{"panda"}, noToken,
 		},
 	}
 
@@ -1460,8 +1493,15 @@ func TestDevnetExample(t *testing.T) {
 			if tc.wantTeams != nil {
 				wantTeamsCell = "`[\"" + strings.Join(tc.wantTeams, "\", \"") + "\"]`"
 			}
-			if row[0] != tc.name || row[1] != wantTeamsCell || row[2] != "`"+tc.wantServices+"`" {
-				t.Errorf("docs row %d is %q, this test expects [%q %q %q]", i, row, tc.name, wantTeamsCell, "`"+tc.wantServices+"`")
+			wantServicesCell := "`" + tc.wantServices + "`"
+			if tc.wantServices == noToken {
+				// No token, so no claims: the docs print that across
+				// both columns. The teams are still checked below, as
+				// /auth/userinfo reports them.
+				wantTeamsCell, wantServicesCell = "—", "*no token*"
+			}
+			if row[0] != tc.name || row[1] != wantTeamsCell || row[2] != wantServicesCell {
+				t.Errorf("docs row %d is %q, this test expects [%q %q %q]", i, row, tc.name, wantTeamsCell, wantServicesCell)
 			}
 
 			idp := tc.idp
@@ -1496,15 +1536,14 @@ func TestDevnetExample(t *testing.T) {
 			full := newSectionHarness(t, &section, "",
 				NamedProvider{Name: "cfaccess", Provider: unstartedCloudflare{cfProvider}}, oidcDoor)
 
-			var token string
+			var claims minted
 			if tc.cloudflare != nil {
 				req := tokenRequest()
 				req.Header.Set(cfaccess.DefaultJWTHeader, accessAssertion(t, tc.cloudflare))
-				token = full.rawToken(req)
+				claims = full.mint(req)
 			} else {
-				token = full.rawToken(tokenRequest(), full.oidcLogin(idp, "oidc"))
+				claims = full.mint(tokenRequest(), full.oidcLogin(idp, "oidc"))
 			}
-			claims := full.verify(token)
 			if !slices.Equal(claims.Teams, tc.wantTeams) {
 				t.Errorf("teams: got %v, want %v", claims.Teams, tc.wantTeams)
 			}
@@ -1588,8 +1627,8 @@ func TestGrants_UnverifiedEmail_EndToEnd(t *testing.T) {
 		wantServices string
 	}{
 		{"verified", nil, "alice@example.org", "alice@example.org", []string{"lighthouse"}, "-all,+assertoor,+dora,+dora:reindex,+spamoor"},
-		{"email_verified: false", map[string]any{"email_verified": false}, "sub-of-mallory", "", nil, "-all"},
-		{"email_verified absent", map[string]any{"email_verified": nil}, "sub-of-mallory", "", nil, "-all"},
+		{"email_verified: false", map[string]any{"email_verified": false}, "sub-of-mallory", "", nil, noToken},
+		{"email_verified absent", map[string]any{"email_verified": nil}, "sub-of-mallory", "", nil, noToken},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1597,8 +1636,8 @@ func TestGrants_UnverifiedEmail_EndToEnd(t *testing.T) {
 			h := newSectionHarness(t, &section, "", newOIDCProvider(idp, "oidc", oidc.Config{
 				TeamRules: rules, GrantMembers: grants.AttributeMembers("oidc"),
 			}))
-			raw := h.rawToken(tokenRequest(), h.oidcLogin(idp, "oidc"))
-			claims := h.verify(raw)
+			session := h.oidcLogin(idp, "oidc")
+			claims := h.mint(tokenRequest(), session)
 			if claims.Subject != tc.wantSub || claims.Email != tc.wantEmail {
 				t.Errorf("identity: sub=%q email=%q, want %q / %q", claims.Subject, claims.Email, tc.wantSub, tc.wantEmail)
 			}
@@ -1606,9 +1645,11 @@ func TestGrants_UnverifiedEmail_EndToEnd(t *testing.T) {
 				t.Errorf("teams=%v services=%q, want %v / %q", claims.Teams, claims.Services, tc.wantTeams, tc.wantServices)
 			}
 			if tc.wantEmail == "" {
-				payload, _ := base64.RawURLEncoding.DecodeString(strings.Split(raw, ".")[1])
-				if strings.Contains(string(payload), "alice@example.org") {
-					t.Errorf("the unverified address is in the token: %s", payload)
+				// No token; what the service says about the user must
+				// not carry the unverified address either.
+				body := h.do(httptest.NewRequest(http.MethodGet, "/auth/userinfo", nil), session).Body.String()
+				if strings.Contains(body, "alice@example.org") {
+					t.Errorf("the unverified address is in the userinfo answer: %s", body)
 				}
 			}
 		})

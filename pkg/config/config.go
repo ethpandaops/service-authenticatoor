@@ -108,7 +108,8 @@ type Config struct {
 	// set, the token's "services" claim is computed per identity from
 	// it (see issuer.ServiceGrants). nil means the section is absent
 	// and tokens carry no per-identity constraint; a present but empty
-	// section is non-nil and grants nothing to anyone.
+	// section is non-nil and names nobody. With the section, an
+	// identity that no group names gets no token.
 	//
 	// Read from the YAML document by loadGrants rather than through
 	// viper: its members are data and must arrive as written.

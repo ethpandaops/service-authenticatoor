@@ -1,6 +1,7 @@
 package issuer
 
 import (
+	"errors"
 	"fmt"
 	"maps"
 	"regexp"
@@ -102,7 +103,8 @@ var featurePrefixPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9-]*\*$`)
 //	all:all      every service, every feature
 //
 // A nil *ServiceGrants means the section is absent: tokens then carry
-// the instance-wide services directive unchanged.
+// the instance-wide services directive unchanged. With the section, an
+// identity that no group names gets no token at all (ErrNotGranted).
 type ServiceGrants struct {
 	// byTeam, byUser and byMatch map a subject — a provider with a
 	// team, with an ASCII-lowercased id, with an attribute match key —
@@ -196,8 +198,8 @@ func sortedServices(s grantSet) []string {
 
 // NewServiceGrants validates a grants section. providers are the
 // configured providers; every member has to name one of them. Anything
-// malformed is an error. A section without groups is valid: it grants
-// nothing to anyone.
+// malformed is an error. A section without groups is valid: it names
+// nobody, so nobody gets a token.
 func NewServiceGrants(cfg GrantsConfig, providers []Provider) (*ServiceGrants, error) {
 	g := &ServiceGrants{
 		byTeam:     make(map[subject]grantSet, len(cfg.Groups)),
@@ -466,19 +468,71 @@ func (s grantSet) addEntry(raw string) error {
 	return nil
 }
 
+// ErrNotGranted is returned for an identity that no group of the grants
+// section names. Such an identity is authenticated, but it gets no
+// token: a token with a "-all" services claim would still be a login to
+// every tool that verifies tokens without reading that claim.
+var ErrNotGranted = errors.New("issuer: the identity is a member of no grants group")
+
+// noServices is the "services" claim that denies every service.
+const noServices = "-" + GrantAll
+
+// granted returns the union of the grants of every group the identity
+// is a member of, and whether it is a member of any.
+//
+// Membership is always at the provider that authenticated the identity:
+// through any of its teams, through its subject or email (see userIDs
+// for which of them count), or through an attribute member the provider
+// found it to satisfy (id.Matches). An identity without a provider — as
+// the plain Issuer.Issue mints tokens for — is a member of no group.
+//
+// Being a member is about being named, not about what is granted: a
+// group whose services list is empty still has its members.
+func (g *ServiceGrants) granted(id Identity) (granted grantSet, member bool) {
+	granted = make(grantSet, 4)
+	if id.Provider == "" {
+		return granted, false
+	}
+	add := func(index map[subject]grantSet, name string) {
+		if set, ok := index[subject{provider: id.Provider, name: name}]; ok {
+			member = true
+			granted.merge(set)
+		}
+	}
+	for _, team := range id.Teams {
+		// Exact names: nothing is folded.
+		add(g.byTeam, team)
+	}
+	for _, userID := range id.userIDs() {
+		add(g.byUser, asciiLower(userID))
+	}
+	// A match that the current config no longer names — a session
+	// remembers the matches of the config it was opened under — finds
+	// nothing here.
+	for _, key := range id.Matches {
+		add(g.byMatch, key)
+	}
+	return granted, member
+}
+
+// Member reports whether any group of the section names the identity
+// (see granted). With a section without groups nobody is a member.
+func (g *ServiceGrants) Member(id Identity) bool {
+	_, member := g.granted(id)
+	return member
+}
+
 // Directive returns the "services" claim for an identity. instanceWide
 // is the instance-wide services directive, which stays an upper bound
 // on the base access any identity gets.
 //
-// The identity's grant is the union of the grants of every group it is
-// a member of — always at the provider that authenticated it: through
-// any of its teams, through its subject or email (see userIDs for
-// which of them count), or through an attribute member the provider
-// found it to satisfy (id.Matches).
-// An identity without a provider — as the plain Issuer.Issue mints
-// tokens for — is a member of no group:
+// An identity that is a member of no group (see Member) has no claim:
+// the error is ErrNotGranted, and no token is minted for it. For a
+// member, the grant is the union of the grants of every group it is a
+// member of:
 //
-//   - nothing granted: "-all";
+//   - nothing granted (groups without services, or only services the
+//     instance-wide directive denies): "-all";
 //   - specific services only: "-all", then for each granted service the
 //     instance-wide directive allows, in sorted order, "+svc" and — when
 //     features are granted — "+svc:f1:f2" (sorted) or "+svc:all";
@@ -503,35 +557,23 @@ func (s grantSet) addEntry(raw string) error {
 // instance-wide directive denies gets no directive at all, hence no
 // features either. The result is never empty, because an
 // empty claim means basic access to every service to a verifier.
-func (g *ServiceGrants) Directive(id Identity, instanceWide string) string {
-	granted := make(grantSet, 4)
-	if id.Provider != "" {
-		for _, team := range id.Teams {
-			// Exact names: nothing is folded.
-			granted.merge(g.byTeam[subject{provider: id.Provider, name: team}])
-		}
-		for _, userID := range id.userIDs() {
-			granted.merge(g.byUser[subject{provider: id.Provider, name: asciiLower(userID)}])
-		}
-		// A match that the current config no longer names — a session
-		// remembers the matches of the config it was opened under —
-		// finds nothing here.
-		for _, key := range id.Matches {
-			granted.merge(g.byMatch[subject{provider: id.Provider, name: key}])
-		}
+func (g *ServiceGrants) Directive(id Identity, instanceWide string) (string, error) {
+	granted, member := g.granted(id)
+	if !member {
+		return "", ErrNotGranted
 	}
 
 	everywhere, allServices := granted[GrantAll]
 	if !allServices {
-		return specificDirective(granted, instanceWide)
+		return specificDirective(granted, instanceWide), nil
 	}
-	return allServicesDirective(granted, everywhere, instanceWide)
+	return allServicesDirective(granted, everywhere, instanceWide), nil
 }
 
 // specificDirective builds the claim for an identity that is granted
 // individual services only (or nothing).
 func specificDirective(granted grantSet, instanceWide string) string {
-	out := []string{"-" + GrantAll}
+	out := []string{noServices}
 	for _, service := range sortedServices(granted) {
 		if !auth.ServiceAllowed(instanceWide, service) {
 			continue
