@@ -8,9 +8,11 @@ import (
 
 // userinfoResponse is the small introspection blob returned by /auth/userinfo.
 // Used by web UIs to display "logged in as alice@" without parsing the JWT.
+// Teams mirrors the "teams" claim a token minted right now would carry.
 type userinfoResponse struct {
 	Email string   `json:"email"`
 	Sub   string   `json:"sub"`
+	Teams []string `json:"teams"`
 	Aud   []string `json:"aud"`
 	Scope string   `json:"scope"`
 	Exp   int64    `json:"exp"`
@@ -27,9 +29,16 @@ func (s *Server) handleUserinfo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Always an array (never null) so frontends can iterate it as-is.
+	teams := id.Teams
+	if teams == nil {
+		teams = []string{}
+	}
+
 	resp := userinfoResponse{
 		Email: id.Email,
 		Sub:   id.Subject,
+		Teams: teams,
 		Aud:   s.cfg.Audience,
 		Scope: s.cfg.ScopePattern,
 		Exp:   time.Now().Add(s.cfg.TokenTTL).Unix(),

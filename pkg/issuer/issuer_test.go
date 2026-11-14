@@ -2,7 +2,9 @@ package issuer
 
 import (
 	"crypto/rsa"
+	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"slices"
 	"strings"
 	"testing"
@@ -176,5 +178,130 @@ func TestIssuer_RejectsEmptySubject(t *testing.T) {
 	_, _, err := iss.Issue("", "", nil)
 	if err == nil {
 		t.Error("expected error for empty subject")
+	}
+}
+
+// rawPayload decodes the token's payload segment without verifying it,
+// returning the JSON object exactly as a verifier would receive it.
+func rawPayload(t *testing.T, tok string) map[string]any {
+	t.Helper()
+	parts := strings.Split(tok, ".")
+	if len(parts) != 3 {
+		t.Fatalf("token has %d segments", len(parts))
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		t.Fatalf("decode payload: %v", err)
+	}
+	out := map[string]any{}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatalf("unmarshal payload: %v", err)
+	}
+	return out
+}
+
+func TestIssuer_TeamsClaim(t *testing.T) {
+	iss, _ := newTestIssuer(t, 30*time.Minute)
+
+	many := make([]string, 0, 40)
+	for i := range 40 {
+		many = append(many, fmt.Sprintf("team-%02d", i))
+	}
+
+	tests := []struct {
+		name string
+		in   []string
+		want []string // nil: the claim must be absent from the payload
+	}{
+		{"nil omits the claim", nil, nil},
+		{"empty omits the claim", []string{}, nil},
+		{"only invalid names omits the claim", []string{"not valid", ""}, nil},
+		{"teams", []string{"lighthouse", "panda"}, []string{"lighthouse", "panda"}},
+		{"sorted and de-duplicated", []string{"panda", "geth", "panda"}, []string{"geth", "panda"}},
+		{"names are never folded: only the normal form passes", []string{" Panda ", "PANDA", "panda\u00a0", "geth"}, []string{"geth"}},
+		{"invalid names never reach the token", []string{"panda", "team:x"}, []string{"panda"}},
+		{"bounded", many, many[:auth.MaxTeams]},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			tok, claims, err := iss.IssueFor(Identity{Subject: "alice@example.com", Email: "alice@example.com", Teams: tc.in}, nil)
+			if err != nil {
+				t.Fatalf("issue: %v", err)
+			}
+			if !slices.Equal(claims.Teams, tc.want) {
+				t.Errorf("returned claims: got %v, want %v", claims.Teams, tc.want)
+			}
+
+			payload := rawPayload(t, tok)
+			raw, present := payload["teams"]
+			if tc.want == nil {
+				if present {
+					t.Fatalf("teams claim must be omitted, payload has %v", raw)
+				}
+				return
+			}
+			list, ok := raw.([]any)
+			if !ok {
+				t.Fatalf("teams claim is %T, want a JSON array", raw)
+			}
+			got := make([]string, 0, len(list))
+			for _, v := range list {
+				s, ok := v.(string)
+				if !ok {
+					t.Fatalf("teams entry is %T, want a string", v)
+				}
+				got = append(got, s)
+			}
+			if !slices.Equal(got, tc.want) {
+				t.Errorf("payload teams: got %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// plainIssuer has exactly the method set of Issuer as it was before the
+// teams claim (upstream/main, v0.0.3). Code outside this repository
+// implements that interface and calls Issue with three arguments; this
+// compile-time check and the call below keep both working.
+type plainIssuer struct{}
+
+func (plainIssuer) Issue(subject, email string, audience []string) (string, *auth.Claims, error) {
+	return "", nil, nil
+}
+func (plainIssuer) JWKS() ([]byte, error) { return nil, nil }
+func (plainIssuer) ActiveKeyID() string   { return "" }
+
+var _ Issuer = plainIssuer{}
+
+// TestIssuer_IssueKeepsItsOldMeaning: the three-argument Issue mints
+// what it always minted — no teams claim — and, on an instance with
+// per-team service grants, a token for an identity without teams.
+func TestIssuer_IssueKeepsItsOldMeaning(t *testing.T) {
+	iss, _ := newTestIssuer(t, 30*time.Minute)
+	var plain Issuer = iss
+
+	tok, claims, err := plain.Issue("alice@example.com", "alice@example.com", nil)
+	if err != nil {
+		t.Fatalf("issue: %v", err)
+	}
+	if claims.Teams != nil {
+		t.Errorf("teams: %v", claims.Teams)
+	}
+	payload := rawPayload(t, tok)
+	for _, claim := range []string{"teams", "services"} {
+		if _, present := payload[claim]; present {
+			t.Errorf("payload carries %q: %v", claim, payload)
+		}
+	}
+
+	same, sameClaims, err := iss.IssueFor(Identity{Subject: "alice@example.com", Email: "alice@example.com"}, nil)
+	if err != nil {
+		t.Fatalf("issue for: %v", err)
+	}
+	if sameClaims.Subject != claims.Subject || sameClaims.Email != claims.Email || sameClaims.Scope != claims.Scope {
+		t.Errorf("Issue and IssueFor disagree: %+v vs %+v", claims, sameClaims)
+	}
+	if got := rawPayload(t, same); len(got) != len(payload) {
+		t.Errorf("payload shapes differ: %v vs %v", payload, got)
 	}
 }

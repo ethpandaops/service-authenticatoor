@@ -1,0 +1,203 @@
+# authenticatoor — example configuration
+#
+# Loaded from the path passed via --config (default: /etc/authenticatoor/config.yaml).
+# Every field can also be set via env var: AUTHENTICATOOR_<UPPER_PATH> with
+# dots replaced by underscores. For example, signing.rs256.privateKeyFile
+# becomes AUTHENTICATOOR_SIGNING_RS256_PRIVATEKEYFILE.
+
+# ─── server ───────────────────────────────────────────────────────────────────
+
+# Bind address. Default: ":8080".
+listen: ":8080"
+
+# REQUIRED. The canonical URL of this service. Used as the JWT "iss" claim.
+# Several other fields are derived from this when not configured explicitly:
+#   - audience          → the parent zone (i.e. with the "auth." stripped)
+#   - scopePattern      → "*.<parent zone>"
+#   - allowedReturnHosts → ["*.<parent zone>"]
+#   - cors.allowedOrigins → same as allowedReturnHosts
+issuer: "https://auth.example.com"
+
+# Optional. URL used in the OIDC discovery document and in the jwks_uri.
+# Defaults to the issuer URL.
+# externalURL: "https://auth.example.com"
+
+# ─── token shape ──────────────────────────────────────────────────────────────
+
+# The "aud" claim. Verifiers must accept this value. Defaults to the parent
+# zone of the issuer host.
+# audience:
+#   - "example.com"
+
+# The "scope" claim — a host wildcard pattern. Verifiers match their own
+# externally visible host against this pattern. Defaults to "*.<parent zone>".
+# scopePattern: "*.example.com"
+
+# Token lifetime. Default: "30m".
+tokenTTL: "30m"
+
+# ─── browser-callback / CORS allow-list ───────────────────────────────────────
+
+# Hosts that the /auth/login endpoint will redirect to via `return_to`.
+# Patterns use the same DNS-label glob syntax as scopePattern. Defaults to
+# ["*.<parent zone of issuer>"].
+# allowedReturnHosts:
+#   - "*.example.com"
+
+# Browsers that are allowed to call /auth/* with credentials via CORS. Defaults
+# to allowedReturnHosts.
+# cors:
+#   allowedOrigins:
+#     - "*.example.com"
+
+# ─── auth providers ───────────────────────────────────────────────────────────
+
+# All providers defined in the `providers` list are enabled: they all
+# authenticate requests, and their login routes are always reachable.
+#
+# authMode: string | string list. Names the provider(s) actively
+# ADVERTISED to unauthenticated users, by instance name. With a single
+# entry, unauthenticated /auth/* requests go straight into that
+# provider's login flow; with several, they land on the /login provider
+# selection page listing exactly these entries (in this order). Providers
+# left out stay fully functional via their direct /<name>/login paths —
+# they just aren't offered. Unset = advertise all defined providers.
+# Env override accepts a comma-separated value
+# (AUTHENTICATOOR_AUTHMODE="cfaccess,oidc").
+authMode: cfaccess
+
+# providers: the provider instances. Each entry has a required, unique
+# `name`, a `type`, and the type's config block. All interactive routes
+# live under the instance's own path prefix:
+#
+#   /<name>/login      — login entry (authenticates, mints a signed session
+#                        cookie, redirects back via return_to)
+#   /<name>/callback   — OAuth/OIDC callback (github / oidc types)
+#   /<name>/token      — machine token alias (cloudflare type only): same
+#                        JSON contract as /auth/token, authenticated purely
+#                        from the ambient CF headers — keep this path behind
+#                        the CF Access application so service tokens work
+#                        without redirects.
+#
+# On each /auth/* request every active provider passively inspects the
+# credentials already present (session cookie, ambient CF headers, Basic
+# Authorization header) and the first match wins. /auth/* itself needs NO
+# edge protection — only the cloudflare type's /cfaccess/* prefix does. An
+# edge that (still) covers /auth/* keeps working: the CF headers
+# authenticate ambiently and the login redirect never triggers.
+#
+# Session cookies are HMAC-signed with per-provider keys derived from the
+# JWT signing key — no separate session secret to manage.
+providers:
+  # Cloudflare Access: the edge authenticates and injects identity headers.
+  # verifyJWT (default true) verifies the Cf-Access-Jwt-Assertion against
+  # the team's JWKS — strongly recommended. allowServiceTokens (default
+  # true) lets non-identity CF service tokens authenticate with their
+  # common_name as subject.
+  - name: cfaccess
+    type: cloudflare
+    cloudflareAccess:
+      teamDomain: "<team>.cloudflareaccess.com"
+      # Optional. When set, assertions whose aud doesn't match are rejected.
+      # When empty, signature + issuer still tie the assertion to the team.
+      # audTag: ""
+      # verifyJWT: true
+      # allowServiceTokens: true
+      # jwtHeader: "Cf-Access-Jwt-Assertion"
+      # userHeader: "Cf-Access-Authenticated-User-Email"
+      # sessionCookieName: "authenticatoor_cfaccess_session"
+      # sessionTTL: "12h"   # CF policy re-checked only on cookie expiry
+
+  # HTTP Basic auth backed by an htpasswd file. Self-contained. An
+  # Authorization header on /auth/* authenticates directly; the login
+  # entry converts credentials into a session cookie (needed alongside
+  # other providers).
+  # - name: htpasswd
+  #   type: basic
+  #   basicAuth:
+  #     htpasswdFile: "/etc/authenticatoor/htpasswd"
+  #     realm: "authenticatoor"
+  #     # sessionCookieName: "authenticatoor_htpasswd_session"
+  #     # sessionTTL: "12h"
+
+  # DEV ONLY: a form where the user picks any username.
+  # - name: anyauth
+  #   type: any
+  #   anyAuth:
+  #     # cookieName: "authenticatoor_anyauth_user"
+  #     # cookieTTL:  "12h"
+
+  # GitHub OAuth with org-membership gating. Register the OAuth app's
+  # redirect URI as <issuer>/github/callback. Mount clientSecret from a
+  # Kubernetes Secret in production; the inline variant accepts the value
+  # via env var for ad-hoc deployments.
+  # - name: github
+  #   type: github
+  #   githubOAuth:
+  #     clientId: "Iv1.…"
+  #     clientSecretFile: "/etc/authenticatoor/gh-secret"
+  #     sessionTTL: "12h"
+  #     allowedOrgs:
+  #       - "ethpandaops"
+  #     # callbackPath: "/github/callback"
+  #     # sessionCookieName: "authenticatoor_github_session"
+  #     # stateCookieName: "authenticatoor_github_state"
+
+  # Standard OIDC against any IdP (designed against the central
+  # ethpandaops dex + oidc-relay; see docs/config.md for the relay/state
+  # contract). callbackURL is the relay's URL, or
+  # <externalURL>/oidc/callback for direct (relay-less) deployments.
+  # Group membership is checked against the id_token `groups` claim.
+  # Same type twice is fine — give each instance its own name, e.g. a
+  # second entry trusting a different IdP.
+  # - name: oidc
+  #   type: oidc
+  #   oidc:
+  #     issuerURL: "https://dex.primary.production.platform.ethpandaops.io"
+  #     callbackURL: "https://oidc-relay.primary.production.platform.ethpandaops.io/oidc/callback"
+  #     clientId: "authenticatoor"
+  #     clientSecretFile: "/etc/authenticatoor/oidc-client-secret"
+  #     sessionTTL: "12h"
+  #     allowedGroups:
+  #       - "ethpandaops"
+  #       - "EthDevOpsAccess:validatorops"
+  #     # callbackPath: "/oidc/callback"
+  #     # sessionCookieName: "authenticatoor_oidc_session"
+  #     # stateCookieName: "authenticatoor_oidc_state"
+  #     # scopes: ["openid", "email", "groups"]
+
+# Legacy form (deprecated): when `providers` is empty, authMode entries
+# name provider TYPES and the matching top-level blocks are converted
+# into provider entries (with names cloudflare→cfaccess, basic→htpasswd,
+# any→anyauth, github→github, oidc→oidc) — an old config with
+# `authMode: cloudflare` plus a top-level `cloudflareAccess:` block keeps
+# working unchanged. Prefer the providers list for new configs.
+
+# ─── signing keys ─────────────────────────────────────────────────────────────
+
+signing:
+  mode: rs256
+  rs256:
+    # PEM-encoded RSA-2048+ private key, PKCS#1 or PKCS#8.
+    privateKeyFile: "/etc/authenticatoor/keys/private.pem"
+    # Optional. Defaults to a SHA-256 hash of the public key.
+    # keyId: "k1"
+    # If true and the file is missing, generate a new key on startup. DEV ONLY —
+    # production deployments must use a Kubernetes Secret with a stable key.
+    generateIfMissing: false
+    # During key rotation, list the previous public keys here so verifiers can
+    # still validate already-issued tokens until they expire. Drop entries
+    # after `tokenTTL` has passed.
+    # previousKeys:
+    #   - keyId: "k0"
+    #     publicKeyFile: "/etc/authenticatoor/keys/k0.pub.pem"
+
+# ─── observability ────────────────────────────────────────────────────────────
+
+logging:
+  level: info       # debug | info | warn | error
+  format: text      # text | json
+
+metrics:
+  enabled: false
+  listen: ":9090"

@@ -1,0 +1,49 @@
+# Local test instance — run via `make start-dev` from the repo root, or
+# `./run.sh` from this directory.
+#
+# Reachable at http://auth.localhost:18080. On most Linux distros (systemd-
+# resolved / nss-myhostname) and on macOS, *.localhost already resolves to
+# 127.0.0.1; otherwise add `127.0.0.1 auth.localhost` to /etc/hosts.
+
+listen: ":18080"
+issuer: "http://auth.localhost:18080"
+
+# Pinned explicitly even though it would derive to the same value from the
+# issuer's parent zone — keeps the test config self-documenting.
+audience:
+  - "localhost"
+
+scopePattern: "*.localhost"
+tokenTTL: "30m"
+
+# Host patterns are matched against the URL hostname only — port is ignored
+# (see auth.MatchHost / cors.originAllowed). So "localhost" here covers
+# localhost:3000, localhost:5173, etc., and "*.localhost" covers
+# app.localhost:8000 and friends.
+allowedReturnHosts:
+  - "*.localhost"
+  - "localhost"
+  - "127.0.0.1"
+
+cors:
+  allowedOrigins:
+    - "*.localhost"
+    - "localhost"
+    - "127.0.0.1"
+
+# anyAuth: hitting any /auth/* endpoint redirects to a tiny login form
+# where you type whatever username you want. The chosen name is stored in
+# a cookie and reused as the identity until you POST /auth/logout (which
+# clears the cookie). All defaults are sensible for local dev — no
+# anyAuth: block needed.
+authMode: any
+
+signing:
+  mode: rs256
+  rs256:
+    privateKeyFile: "./private.pem"
+    generateIfMissing: true
+
+logging:
+  level: debug
+  format: text

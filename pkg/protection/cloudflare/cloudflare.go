@@ -27,6 +27,7 @@ import (
 	"net/http"
 	"net/url"
 	"slices"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -107,6 +108,19 @@ type Config struct {
 	// user passes through LoginPath again.
 	SessionTTL time.Duration
 
+	// Teams are the static teams given to every identity this provider
+	// authenticates — users and, when allowed, service tokens alike
+	// (normalized at New; invalid names fail Start).
+	Teams []string
+	// TeamRules derive further teams from the attributes this provider
+	// verified about the user (see the package documentation of each
+	// provider for its attributes).
+	TeamRules []protection.TeamRule
+	// GrantMembers are the attribute members the grants section names
+	// for this provider ("<provider>/<attribute>:<value>"). The provider
+	// reports which of them an identity satisfies.
+	GrantMembers []protection.AttributeMember
+
 	// Now overrides time.Now for deterministic tests.
 	Now func() time.Time
 }
@@ -117,6 +131,9 @@ type Provider struct {
 	log      logrus.FieldLogger
 	verifier cfaccess.Verifier
 	meta     cfaccess.MetaVerifier
+	teams    protection.Teams
+	members  protection.Members
+	door     session.Door
 
 	// AUD tag detection state (see detect.go). detectMu serializes
 	// attempts and guards lastDetect.
@@ -158,8 +175,13 @@ func New(log logrus.FieldLogger, cfg Config) *Provider {
 		cfg.HTTPClient = &http.Client{Timeout: detectTimeout}
 	}
 	return &Provider{
-		cfg: cfg,
-		log: log.WithField("package", "protection/cloudflare"),
+		cfg:     cfg,
+		log:     log.WithField("package", "protection/cloudflare"),
+		teams:   protection.NewTeams(cfg.Teams, cfg.TeamRules),
+		members: protection.NewMembers(cfg.GrantMembers),
+		// Another Cloudflare team is another door; whether assertions
+		// are verified changes what stands behind the session, too.
+		door: session.NewDoor("cloudflare", cfg.TeamDomain, strconv.FormatBool(cfg.VerifyJWT)),
 	}
 }
 
@@ -171,6 +193,17 @@ func (p *Provider) Name() string { return "cloudflare" }
 func (p *Provider) Start(ctx context.Context) error {
 	if len(p.cfg.SessionKey) < 16 {
 		return errors.New("cloudflare: SessionKey must be at least 16 bytes")
+	}
+	if err := p.teams.Err(); err != nil {
+		return fmt.Errorf("cloudflare: %w", err)
+	}
+	if teams := p.teams.Static(); len(teams) > 0 || p.teams.Rules() > 0 {
+		p.log.WithField("teams", teams).WithField("teamRules", p.teams.Rules()).
+			Info("cf access identities get teams")
+	}
+	if !p.cfg.VerifyJWT && p.teams.Rules() > 0 {
+		p.log.Warn("team rules with CF Access JWT verification disabled: the only attributes are the " +
+			"email header and principal=user, which rest on the edge being trusted to set that header")
 	}
 	if !p.cfg.VerifyJWT {
 		p.log.Warn("CF Access JWT verification is DISABLED — only safe when the service is unreachable outside the trusted ingress")
@@ -253,17 +286,20 @@ func (p *Provider) Logout(w http.ResponseWriter, r *http.Request) {
 // A present-but-invalid assertion fails hard with 401 (it signals
 // misconfiguration or forgery, not an unauthenticated browser).
 func (p *Provider) Authenticate(ctx context.Context, r *http.Request) (protection.Outcome, error) {
-	out, hardFail := p.ambient(ctx, r, false)
+	out, _, hardFail := p.ambient(ctx, r, false)
 	if out.Identity != nil || hardFail {
 		return out, nil
 	}
 
 	if c, err := r.Cookie(p.cfg.SessionCookieName); err == nil {
-		sub, email, perr := session.Parse(p.cfg.SessionKey, c.Value, p.cfg.Now())
+		sess, perr := session.Parse(p.cfg.SessionKey, p.door, c.Value, p.cfg.Now())
 		if perr == nil {
 			return protection.Outcome{Identity: &protection.Identity{
-				Subject: sub,
-				Email:   email,
+				Subject:        sess.Subject,
+				Email:          sess.Email,
+				SubjectIsEmail: sess.SubjectIsEmail,
+				Teams:          p.teams.With(sess.Teams),
+				Matches:        sess.Matches,
 			}}, nil
 		}
 		p.log.WithError(perr).Debug("session cookie invalid; redirecting to login")
@@ -278,65 +314,121 @@ func (p *Provider) Authenticate(ctx context.Context, r *http.Request) (protectio
 // a direct JSON endpoint behind the edge-protected prefix. Callers are
 // the provider's own prefix, so a detected AUD tag is enforced.
 func (p *Provider) AuthenticateAmbient(ctx context.Context, r *http.Request) (protection.Outcome, error) {
-	out, _ := p.ambient(ctx, r, true)
+	out, _, _ := p.ambient(ctx, r, true)
 	if out.Identity == nil && out.Status == 0 {
 		out.Status = http.StatusUnauthorized
 	}
 	return out, nil
 }
 
-// ambient runs the CF Access header check. hardFail reports that the
+// Attribute names this provider adds to the claims of the Access token.
+const (
+	// AttrPrincipal tells a person from a machine: PrincipalUser for an
+	// identity with an email, PrincipalService for a service token.
+	AttrPrincipal = "principal"
+	// PrincipalUser and PrincipalService are the values of
+	// AttrPrincipal.
+	PrincipalUser    = "user"
+	PrincipalService = "service"
+)
+
+// attributes are what this provider knows about an authenticated
+// identity, for the team rules.
+//
+// With VerifyJWT, they are the claims of the verified Access token
+// ("email", "sub", "country", "custom.<…>", "common_name" for a service
+// token, and whatever else Cloudflare puts there), addressed by name,
+// plus:
+//
+//	principal   "user" for a person, "service" for a service token
+//
+// Without VerifyJWT there is no verified token: the attributes are just
+// "email" — the header the edge is trusted to set — and principal=user.
+func (p *Provider) attributes(cfJWT, email, commonName string) protection.Attributes {
+	attrs := protection.Attributes{}
+	if p.cfg.VerifyJWT && cfJWT != "" {
+		if claims, err := protection.TokenAttributes(cfJWT); err == nil {
+			attrs = claims
+		}
+	}
+	// What the verifier itself returned wins over the decoded payload.
+	if email != "" {
+		attrs["email"] = email
+		attrs[AttrPrincipal] = PrincipalUser
+	} else {
+		delete(attrs, "email")
+		attrs["common_name"] = commonName
+		attrs[AttrPrincipal] = PrincipalService
+	}
+	return attrs
+}
+
+// ambient runs the CF Access header check. attrs are the attributes of
+// the authenticated identity (nil without one). hardFail reports that the
 // request carried an assertion that failed verification — callers must
 // not fall through to weaker checks in that case. ownPrefix marks
 // requests to the provider's login entry or token alias: with AUD tag
 // detection active, those require the detected tag (503 until known).
 func (p *Provider) ambient(
 	ctx context.Context, r *http.Request, ownPrefix bool,
-) (out protection.Outcome, hardFail bool) {
+) (out protection.Outcome, attrs protection.Attributes, hardFail bool) {
 	email := r.Header.Get(p.cfg.UserHeader)
 	commonName := ""
+	cfJWT := ""
 
 	if p.cfg.VerifyJWT {
-		cfJWT := r.Header.Get(p.cfg.JwtHeader)
+		cfJWT = r.Header.Get(p.cfg.JwtHeader)
 		if cfJWT == "" {
-			return protection.Outcome{}, false
+			return protection.Outcome{}, nil, false
 		}
 		claims, err := p.verifier.Verify(ctx, cfJWT)
 		if err != nil {
 			p.log.WithError(err).Debug("cf access verification failed")
-			return protection.Outcome{Status: http.StatusUnauthorized}, true
+			return protection.Outcome{Status: http.StatusUnauthorized}, nil, true
 		}
 		if ownPrefix && p.detecting() {
 			aud := p.ensureAud(ctx)
 			if aud == "" {
-				return protection.Outcome{Status: http.StatusServiceUnavailable}, true
+				return protection.Outcome{Status: http.StatusServiceUnavailable}, nil, true
 			}
 			if !slices.Contains(claims.Audience, aud) {
 				p.log.WithField("aud", claims.Audience).Debug("cf access assertion for another application")
-				return protection.Outcome{Status: http.StatusUnauthorized}, true
+				return protection.Outcome{Status: http.StatusUnauthorized}, nil, true
 			}
 		}
 		email = claims.Email
 		commonName = claims.CommonName
 	}
 
+	// The identity comes from this request, so the team rules run on
+	// every request, against the current config.
 	if email != "" {
+		attrs = p.attributes(cfJWT, email, "")
+		// The subject is the email Cloudflare Access authenticated the
+		// user with.
 		return protection.Outcome{Identity: &protection.Identity{
-			Subject: email,
-			Email:   email,
-		}}, false
+			Subject:        email,
+			Email:          email,
+			SubjectIsEmail: true,
+			Teams:          p.teams.ForRequest(attrs),
+			Matches:        p.members.ForRequest(attrs),
+		}}, attrs, false
 	}
 
 	// No email means a Cloudflare Access service token (non-identity)
 	// request. When opted in, authenticate it using the token's common_name
 	// (its client ID) as the subject; there is no email to populate.
 	if p.cfg.AllowServiceTokens && commonName != "" {
+		attrs = p.attributes(cfJWT, "", commonName)
+		// A raw subject: the client id of the service token.
 		return protection.Outcome{Identity: &protection.Identity{
 			Subject: commonName,
-		}}, false
+			Teams:   p.teams.ForRequest(attrs),
+			Matches: p.members.ForRequest(attrs),
+		}}, attrs, false
 	}
 
-	return protection.Outcome{}, false
+	return protection.Outcome{}, nil, false
 }
 
 // handleLogin converts the ambient CF Access identity into a signed
@@ -344,12 +436,7 @@ func (p *Provider) ambient(
 // the CF Access application — an unauthenticated request landing here
 // means the edge configuration is wrong, so the response says so.
 func (p *Provider) handleLogin(w http.ResponseWriter, r *http.Request) {
-	out, err := p.AuthenticateAmbient(r.Context(), r)
-	if err != nil {
-		p.log.WithError(err).Error("cf login ambient check")
-		http.Error(w, "auth provider error", http.StatusInternalServerError)
-		return
-	}
+	out, attrs, _ := p.ambient(r.Context(), r, true)
 	if out.Status == http.StatusServiceUnavailable {
 		http.Error(w,
 			"Cloudflare Access application not detected yet — the CF Access application must cover this path",
@@ -363,8 +450,26 @@ func (p *Provider) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	signed, err := session.Sign(p.cfg.SessionKey, out.Identity.Subject, out.Identity.Email,
+	// The Access token is only here now, so what the team rules derive
+	// from it is captured in the session; the static teams are applied
+	// from the current config on every request.
+	loginLog := p.log.WithField("sub", out.Identity.Subject)
+	teams := p.teams.Capture(loginLog, attrs)
+	matches := p.members.Capture(loginLog, attrs, teams)
+	signed, err := session.SignCookie(p.cfg.SessionCookieName, p.cfg.SessionKey, p.door,
+		session.Payload{
+			Subject:        out.Identity.Subject,
+			Email:          out.Identity.Email,
+			SubjectIsEmail: out.Identity.SubjectIsEmail,
+			Teams:          teams,
+			Matches:        matches,
+		},
 		p.cfg.SessionTTL, p.cfg.Now())
+	if errors.Is(err, session.ErrTooLarge) {
+		loginLog.WithError(err).Warn("login refused: the session does not fit a cookie")
+		http.Error(w, protection.SessionTooLargeMessage, http.StatusForbidden)
+		return
+	}
 	if err != nil {
 		p.log.WithError(err).Error("session cookie signing failed")
 		http.Error(w, "session error", http.StatusInternalServerError)

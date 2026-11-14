@@ -141,6 +141,25 @@ type Config struct {
 	// Scopes overrides the OIDC scopes requested. Defaults to
 	// ["openid", "email", "groups"]. `openid` is required.
 	Scopes []string
+	// TrustUnverifiedEmail makes the provider use the id_token's email
+	// although the token does not say email_verified: true. Off by
+	// default: an unverified email is whatever its user typed, so
+	// using it as the identity, in team rules or in grants lets a user
+	// of an IdP that does not confirm addresses become someone else.
+	// Only for an IdP that verifies emails without saying so.
+	TrustUnverifiedEmail bool
+
+	// Teams are the static teams given to every identity this provider
+	// authenticates (normalized at New; invalid names fail Start).
+	Teams []string
+	// TeamRules derive further teams from the attributes this provider
+	// verified about the user (see the package documentation of each
+	// provider for its attributes).
+	TeamRules []protection.TeamRule
+	// GrantMembers are the attribute members the grants section names
+	// for this provider ("<provider>/<attribute>:<value>"). The provider
+	// reports which of them an identity satisfies.
+	GrantMembers []protection.AttributeMember
 
 	// HTTPClient is the http.Client used for discovery / token endpoint
 	// calls. Defaults to a 10s-timeout client.
@@ -159,6 +178,9 @@ type Provider struct {
 	disco         *discovery
 	verifier      *idTokenVerifier
 	allowedGroups map[string]struct{}
+	teams         protection.Teams
+	members       protection.Members
+	door          session.Door
 	scopeList     string
 	cookieSecure  bool
 }
@@ -198,8 +220,12 @@ func New(log logrus.FieldLogger, cfg Config) *Provider {
 		log:           log.WithField("package", "protection/oidc"),
 		httpClient:    cfg.HTTPClient,
 		allowedGroups: allowedGroupsSet(cfg.AllowedGroups),
-		scopeList:     strings.Join(scopes(cfg.Scopes), " "),
-		cookieSecure:  strings.HasPrefix(cfg.PublicURL, "https://"),
+		teams:         protection.NewTeams(cfg.Teams, cfg.TeamRules),
+		members:       protection.NewMembers(cfg.GrantMembers),
+		// Another IdP, or another client at it, is another door.
+		door:         session.NewDoor("oidc", strings.TrimRight(cfg.IssuerURL, "/"), cfg.ClientID),
+		scopeList:    strings.Join(scopes(cfg.Scopes), " "),
+		cookieSecure: strings.HasPrefix(cfg.PublicURL, "https://"),
 	}
 }
 
@@ -220,6 +246,9 @@ func (p *Provider) Start(ctx context.Context) error {
 	}
 	if p.cfg.ClientID == "" {
 		return errors.New("oidc: ClientID is required")
+	}
+	if err := p.teams.Err(); err != nil {
+		return fmt.Errorf("oidc: %w", err)
 	}
 
 	cs, err := session.LoadSecret(p.cfg.ClientSecret, p.cfg.ClientSecretFile, "ClientSecret")
@@ -245,6 +274,10 @@ func (p *Provider) Start(ctx context.Context) error {
 	}
 	p.verifier = verifier
 
+	if p.cfg.TrustUnverifiedEmail {
+		p.log.Warn("trustUnverifiedEmail is on: emails are used as identity, in team rules and in grants " +
+			"even when the id_token does not mark them email_verified")
+	}
 	p.log.WithFields(logrus.Fields{
 		"issuer":       disco.Issuer,
 		"callbackURL":  p.cfg.CallbackURL,
@@ -252,6 +285,8 @@ func (p *Provider) Start(ctx context.Context) error {
 		"clientID":     p.cfg.ClientID,
 		"groups":       p.cfg.AllowedGroups,
 		"scopes":       p.scopeList,
+		"teams":        p.teams.Static(),
+		"teamRules":    p.teams.Rules(),
 	}).Info("oidc provider ready")
 	return nil
 }
@@ -278,11 +313,14 @@ func (p *Provider) LoginURL(returnTo string) string {
 // outcome redirects to the login entry, which starts the OIDC flow.
 func (p *Provider) Authenticate(_ context.Context, r *http.Request) (protection.Outcome, error) {
 	if c, err := r.Cookie(p.cfg.SessionCookieName); err == nil {
-		sub, email, perr := session.Parse(p.sessionSecret, c.Value, p.cfg.Now())
+		sess, perr := session.Parse(p.sessionSecret, p.door, c.Value, p.cfg.Now())
 		if perr == nil {
 			return protection.Outcome{Identity: &protection.Identity{
-				Subject: sub,
-				Email:   email,
+				Subject:        sess.Subject,
+				Email:          sess.Email,
+				SubjectIsEmail: sess.SubjectIsEmail,
+				Teams:          p.teams.With(sess.Teams),
+				Matches:        sess.Matches,
 			}}, nil
 		}
 		p.log.WithError(perr).Debug("session cookie invalid; redirecting to login")
@@ -452,11 +490,61 @@ func (p *Provider) handleCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	subject := claims.Email
-	if subject == "" {
-		subject = claims.Subject
+	// The email counts only when the IdP vouches for it. An unverified
+	// one is not the identity, is not put into tokens and is not shown
+	// to team rules or grant members; the subject then is the IdP's
+	// own "sub".
+	email := claims.Email
+	if email != "" && !bool(claims.EmailVerified) && !p.cfg.TrustUnverifiedEmail {
+		p.log.WithField("sub", claims.Subject).
+			Info("id_token email is not marked email_verified: the email is dropped and the user is " +
+				"identified by the IdP subject (oidc.trustUnverifiedEmail is off)")
+		email = ""
 	}
-	cookie, err := p.signSessionCookie(subject, claims.Email)
+	subject := email
+	if subject == "" {
+		// A raw IdP subject. It is marked as such on the identity
+		// (SubjectIsEmail false), so a grants member that names an
+		// email address never matches it — some IdPs can be set up to
+		// use the user's address as "sub", verified or not. The token's
+		// "sub" claim has no such mark, hence the warning: a tool that
+		// reads "sub" as an email would take this one for verified.
+		subject = claims.Subject
+		if strings.Contains(subject, "@") {
+			p.log.WithField("sub", subject).
+				Warn("the IdP subject looks like an email address but is not a verified email; it becomes " +
+					"the token's sub as it is and matches no user: member of a grants group")
+		}
+	}
+	// Teams derived by the team rules from the id_token are captured now
+	// and travel in the session; the static teams are applied per
+	// request. The attributes are the claims of the id_token that was
+	// just verified — every claim, by its name ("groups", "email",
+	// "sub", nested ones by dotted path) — and nothing else: no
+	// userinfo call is made.
+	attrs, err := protection.TokenAttributes(idToken)
+	if err != nil {
+		p.log.WithError(err).Warn("id_token claims unreadable for team rules; none applied")
+	}
+	if email == "" {
+		delete(attrs, "email")
+	}
+	loginLog := p.log.WithField("sub", subject)
+	teams := p.teams.Capture(loginLog, attrs)
+	// The grant members the id_token satisfies are captured the same
+	// way: which members matched, not the claims.
+	matches := p.members.Capture(loginLog, attrs, teams)
+	p.log.WithFields(logrus.Fields{
+		"sub":   subject,
+		"teams": p.teams.With(teams),
+	}).Debug("oidc login resolved teams")
+
+	cookie, err := p.signSessionCookie(subject, email, teams, matches)
+	if errors.Is(err, session.ErrTooLarge) {
+		loginLog.WithError(err).Warn("login refused: the session does not fit a cookie")
+		http.Error(w, protection.SessionTooLargeMessage, http.StatusForbidden)
+		return
+	}
 	if err != nil {
 		p.log.WithError(err).Error("session cookie signing failed")
 		http.Error(w, "session error", http.StatusInternalServerError)
@@ -479,8 +567,15 @@ func (p *Provider) handleCallback(w http.ResponseWriter, r *http.Request) {
 // read and overwrite the cookie. Browsers treat *.localhost as a
 // secure context, so Secure=true works for HTTP local dev too —
 // non-localhost plain HTTP isn't a supported deployment.
-func (p *Provider) signSessionCookie(sub, email string) (*http.Cookie, error) {
-	signed, err := session.Sign(p.sessionSecret, sub, email, p.cfg.SessionTTL, p.cfg.Now())
+func (p *Provider) signSessionCookie(sub, email string, teams, matches []string) (*http.Cookie, error) {
+	// The subject is the email exactly when there is one (see
+	// handleCallback); otherwise it is the IdP's raw "sub".
+	signed, err := session.SignCookie(p.cfg.SessionCookieName, p.sessionSecret, p.door,
+		session.Payload{
+			Subject: sub, Email: email, SubjectIsEmail: email != "" && sub == email,
+			Teams: teams, Matches: matches,
+		},
+		p.cfg.SessionTTL, p.cfg.Now())
 	if err != nil {
 		return nil, err
 	}

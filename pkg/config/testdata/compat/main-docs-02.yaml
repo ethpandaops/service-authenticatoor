@@ -1,0 +1,17 @@
+# Multi-provider example: CF Access for the edge-protected path plus a
+# second OIDC IdP; both advertised, so unauthenticated users pick one
+# on /login.
+authMode: [cfaccess, oidc]
+providers:
+  - name: cfaccess
+    type: cloudflare
+    cloudflareAccess:
+      teamDomain: "<team>.cloudflareaccess.com"
+  - name: oidc
+    type: oidc
+    oidc:
+      issuerURL: "https://dex.primary.production.platform.ethpandaops.io"
+      callbackURL: "https://oidc-relay.primary.production.platform.ethpandaops.io/oidc/callback"
+      clientId: "authenticatoor"
+      clientSecretFile: "/etc/authenticatoor/oidc-client-secret"
+      allowedGroups: ["ethpandaops"]

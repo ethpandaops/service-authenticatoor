@@ -12,6 +12,7 @@ package anyauth
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"html/template"
 	"net/http"
 	"net/url"
@@ -46,14 +47,28 @@ type Config struct {
 	LoginPath string
 	// CookieTTL is the cookie lifetime. Defaults to 12h.
 	CookieTTL time.Duration
+
+	// Teams are the static teams given to every identity this provider
+	// authenticates (normalized at New; invalid names fail Start).
+	Teams []string
+	// TeamRules derive further teams from the attributes this provider
+	// verified about the user (see the package documentation of each
+	// provider for its attributes).
+	TeamRules []protection.TeamRule
+	// GrantMembers are the attribute members the grants section names
+	// for this provider ("<provider>/<attribute>:<value>"). The provider
+	// reports which of them an identity satisfies.
+	GrantMembers []protection.AttributeMember
 }
 
 // Provider implements protection.Provider as a username-only passthrough
 // backed by a clearable cookie.
 type Provider struct {
-	cfg  Config
-	log  logrus.FieldLogger
-	tmpl *template.Template
+	cfg     Config
+	log     logrus.FieldLogger
+	tmpl    *template.Template
+	teams   protection.Teams
+	members protection.Members
 }
 
 var (
@@ -73,18 +88,24 @@ func New(log logrus.FieldLogger, cfg Config) *Provider {
 		cfg.CookieTTL = DefaultCookieTTL
 	}
 	return &Provider{
-		cfg:  cfg,
-		log:  log.WithField("package", "protection/anyauth"),
-		tmpl: template.Must(template.New("login").Parse(loginFormTmpl)),
+		cfg:     cfg,
+		log:     log.WithField("package", "protection/anyauth"),
+		tmpl:    template.Must(template.New("login").Parse(loginFormTmpl)),
+		teams:   protection.NewTeams(cfg.Teams, cfg.TeamRules),
+		members: protection.NewMembers(cfg.GrantMembers),
 	}
 }
 
 // Name returns "any".
 func (p *Provider) Name() string { return "any" }
 
-// Start logs the warning and returns.
+// Start validates the static teams, logs the warning and returns.
 func (p *Provider) Start(_ context.Context) error {
-	p.log.Warn("ANYAUTH ENABLED — ANY USERNAME GRANTS ACCESS, DO NOT USE IN PRODUCTION")
+	if err := p.teams.Err(); err != nil {
+		return fmt.Errorf("anyauth: %w", err)
+	}
+	p.log.WithField("teams", p.teams.Static()).WithField("teamRules", p.teams.Rules()).
+		Warn("ANYAUTH ENABLED — ANY USERNAME GRANTS ACCESS, DO NOT USE IN PRODUCTION")
 	return nil
 }
 
@@ -127,9 +148,15 @@ func (p *Provider) Logout(w http.ResponseWriter, _ *http.Request) {
 func (p *Provider) Authenticate(_ context.Context, r *http.Request) (protection.Outcome, error) {
 	if c, err := r.Cookie(p.cfg.CookieName); err == nil {
 		if user := sanitizeUsername(c.Value); user != "" {
+			// The cookie is unsigned and carries nothing but the
+			// username; teams and grant-member matches come from the
+			// config alone, applied to that name (attribute "username").
+			attrs := protection.Attributes{"username": user}
 			return protection.Outcome{Identity: &protection.Identity{
 				Subject: user,
 				Email:   user,
+				Teams:   p.teams.ForRequest(attrs),
+				Matches: p.members.ForRequest(attrs),
 			}}, nil
 		}
 	}

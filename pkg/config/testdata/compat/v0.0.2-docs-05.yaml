@@ -1,0 +1,6 @@
+authMode: github
+githubOAuth:
+  clientId: "Iv1.…"
+  clientSecretFile: "/etc/authenticatoor/gh-secret"
+  allowedOrgs:
+    - "ethpandaops"

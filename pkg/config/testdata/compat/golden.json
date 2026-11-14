@@ -1,0 +1,1527 @@
+{
+ "deprecated-anyauth-loginpath.yaml": {
+  "claims": {
+   "aud": [
+    "example.com"
+   ],
+   "email": "alice@example.org",
+   "iss": "https://auth.example.com",
+   "scope": "*.example.com",
+   "sub": "alice@example.org",
+   "ttl": 1800
+  },
+  "config": {
+   "AllowedReturnHosts": [
+    "*.example.com"
+   ],
+   "AnyAuth": {
+    "CookieName": "authenticatoor_anyauth_user",
+    "CookieTTL": 43200000000000
+   },
+   "Audience": [
+    "example.com"
+   ],
+   "AuthMode": [
+    "anyauth"
+   ],
+   "CORS": {
+    "AllowedOrigins": [
+     "*.example.com"
+    ]
+   },
+   "CloudflareAccess": {
+    "JwtHeader": "Cf-Access-Jwt-Assertion",
+    "UserHeader": "Cf-Access-Authenticated-User-Email"
+   },
+   "DevMode": false,
+   "ExternalURL": "https://auth.example.com",
+   "Issuer": "https://auth.example.com",
+   "Listen": ":8080",
+   "Logging": {
+    "Format": "text",
+    "Level": "info"
+   },
+   "Metrics": {
+    "Enabled": false,
+    "Listen": ":9090"
+   },
+   "Providers": [
+    {
+     "AnyAuth": {
+      "CookieName": "authenticatoor_anyauth_user",
+      "CookieTTL": 43200000000000
+     },
+     "CloudflareAccess": {
+      "JwtHeader": "Cf-Access-Jwt-Assertion",
+      "UserHeader": "Cf-Access-Authenticated-User-Email"
+     },
+     "Name": "anyauth",
+     "Type": "any"
+    }
+   ],
+   "ScopePattern": "*.example.com",
+   "Signing": {
+    "Mode": "rs256",
+    "RS256": {
+     "GenerateIfMissing": false,
+     "PrivateKeyFile": "/etc/authenticatoor/keys/private.pem"
+    }
+   },
+   "TokenTTL": 1800000000000,
+   "UserHeader": "Cf-Access-Authenticated-User-Email"
+  }
+ },
+ "deprecated-github-sessionsecret.yaml": {
+  "claims": {
+   "aud": [
+    "example.com"
+   ],
+   "email": "alice@example.org",
+   "iss": "https://auth.example.com",
+   "scope": "*.example.com",
+   "sub": "alice@example.org",
+   "ttl": 1800
+  },
+  "config": {
+   "AllowedReturnHosts": [
+    "*.example.com"
+   ],
+   "Audience": [
+    "example.com"
+   ],
+   "AuthMode": [
+    "github"
+   ],
+   "CORS": {
+    "AllowedOrigins": [
+     "*.example.com"
+    ]
+   },
+   "CloudflareAccess": {
+    "JwtHeader": "Cf-Access-Jwt-Assertion",
+    "UserHeader": "Cf-Access-Authenticated-User-Email"
+   },
+   "DevMode": false,
+   "ExternalURL": "https://auth.example.com",
+   "GitHubOAuth": {
+    "AllowedOrgs": [
+     "ethpandaops"
+    ],
+    "ClientID": "Iv1.0000000000000000",
+    "ClientSecretFile": "/etc/authenticatoor/gh-secret"
+   },
+   "Issuer": "https://auth.example.com",
+   "Listen": ":8080",
+   "Logging": {
+    "Format": "text",
+    "Level": "info"
+   },
+   "Metrics": {
+    "Enabled": false,
+    "Listen": ":9090"
+   },
+   "Providers": [
+    {
+     "CloudflareAccess": {
+      "JwtHeader": "Cf-Access-Jwt-Assertion",
+      "UserHeader": "Cf-Access-Authenticated-User-Email"
+     },
+     "GitHubOAuth": {
+      "AllowedOrgs": [
+       "ethpandaops"
+      ],
+      "CallbackPath": "/auth/oauth/callback",
+      "ClientID": "Iv1.0000000000000000",
+      "ClientSecretFile": "/etc/authenticatoor/gh-secret",
+      "SessionCookieName": "authenticatoor_session",
+      "StateCookieName": "authenticatoor_oauth_state"
+     },
+     "Name": "github",
+     "Type": "github"
+    }
+   ],
+   "ScopePattern": "*.example.com",
+   "Signing": {
+    "Mode": "rs256",
+    "RS256": {
+     "GenerateIfMissing": false,
+     "PrivateKeyFile": "/etc/authenticatoor/keys/private.pem"
+    }
+   },
+   "TokenTTL": 1800000000000,
+   "UserHeader": "Cf-Access-Authenticated-User-Email"
+  }
+ },
+ "helm-master-default.yaml": {
+  "claims": {
+   "aud": [
+    "devnet.example.org"
+   ],
+   "email": "alice@example.org",
+   "iss": "https://auth.devnet.example.org",
+   "scope": "*.devnet.example.org",
+   "sub": "alice@example.org",
+   "ttl": 1800
+  },
+  "config": {
+   "AllowedReturnHosts": [
+    "*.devnet.example.org"
+   ],
+   "Audience": [
+    "devnet.example.org"
+   ],
+   "AuthMode": [
+    "cfaccess"
+   ],
+   "CORS": {
+    "AllowedOrigins": [
+     "*.devnet.example.org"
+    ]
+   },
+   "CloudflareAccess": {
+    "JwtHeader": "Cf-Access-Jwt-Assertion",
+    "TeamDomain": "ethpandaops.cloudflareaccess.com",
+    "UserHeader": "Cf-Access-Authenticated-User-Email",
+    "VerifyJWT": true
+   },
+   "DevMode": false,
+   "ExternalURL": "https://auth.devnet.example.org",
+   "Issuer": "https://auth.devnet.example.org",
+   "Listen": "0.0.0.0:8080",
+   "Logging": {
+    "Format": "json",
+    "Level": "info"
+   },
+   "Metrics": {
+    "Enabled": false,
+    "Listen": "0.0.0.0:9090"
+   },
+   "Providers": [
+    {
+     "CloudflareAccess": {
+      "JwtHeader": "Cf-Access-Jwt-Assertion",
+      "TeamDomain": "ethpandaops.cloudflareaccess.com",
+      "UserHeader": "Cf-Access-Authenticated-User-Email",
+      "VerifyJWT": true
+     },
+     "Name": "cfaccess",
+     "Type": "cloudflare"
+    }
+   ],
+   "ScopePattern": "*.devnet.example.org",
+   "Signing": {
+    "Mode": "rs256",
+    "RS256": {
+     "GenerateIfMissing": true,
+     "PrivateKeyFile": "/etc/authenticatoor/keys/active.pem"
+    }
+   },
+   "TokenTTL": 1800000000000,
+   "UserHeader": "Cf-Access-Authenticated-User-Email"
+  }
+ },
+ "helm-master-full.yaml": {
+  "claims": {
+   "aud": [
+    "devnet.example.org",
+    "other.example.org"
+   ],
+   "email": "alice@example.org",
+   "iss": "https://auth.devnet.example.org",
+   "scope": "*.devnet.example.org",
+   "sub": "alice@example.org",
+   "ttl": 1800
+  },
+  "config": {
+   "AllowedReturnHosts": [
+    "*.devnet.example.org"
+   ],
+   "Audience": [
+    "devnet.example.org",
+    "other.example.org"
+   ],
+   "AuthMode": [
+    "cfaccess"
+   ],
+   "CORS": {
+    "AllowedOrigins": [
+     "*.devnet.example.org"
+    ]
+   },
+   "CloudflareAccess": {
+    "AudTag": "0123456789abcdef",
+    "JwtHeader": "Cf-Access-Jwt-Assertion",
+    "TeamDomain": "ethpandaops.cloudflareaccess.com",
+    "UserHeader": "Cf-Access-Authenticated-User-Email",
+    "VerifyJWT": true
+   },
+   "DevMode": false,
+   "ExternalURL": "https://auth-ext.devnet.example.org",
+   "Issuer": "https://auth.devnet.example.org",
+   "Listen": "0.0.0.0:8080",
+   "Logging": {
+    "Format": "json",
+    "Level": "info"
+   },
+   "Metrics": {
+    "Enabled": true,
+    "Listen": "0.0.0.0:9090"
+   },
+   "Providers": [
+    {
+     "CloudflareAccess": {
+      "AudTag": "0123456789abcdef",
+      "JwtHeader": "Cf-Access-Jwt-Assertion",
+      "TeamDomain": "ethpandaops.cloudflareaccess.com",
+      "UserHeader": "Cf-Access-Authenticated-User-Email",
+      "VerifyJWT": true
+     },
+     "Name": "cfaccess",
+     "Type": "cloudflare"
+    }
+   ],
+   "ScopePattern": "*.devnet.example.org",
+   "Signing": {
+    "Mode": "rs256",
+    "RS256": {
+     "GenerateIfMissing": false,
+     "KeyID": "k1",
+     "PreviousKeys": [
+      {
+       "KeyID": "k0",
+       "PublicKeyFile": "/etc/authenticatoor/keys-prev/prev-k0.pub.pem"
+      }
+     ],
+     "PrivateKeyFile": "/etc/authenticatoor/keys/active.pem"
+    }
+   },
+   "TokenTTL": 1800000000000,
+   "UserHeader": "Cf-Access-Authenticated-User-Email"
+  }
+ },
+ "legacy-all-blocks.yaml": {
+  "claims": {
+   "aud": [
+    "example.com"
+   ],
+   "email": "alice@example.org",
+   "iss": "https://auth.example.com",
+   "scope": "*.example.com",
+   "sub": "alice@example.org",
+   "ttl": 1800
+  },
+  "config": {
+   "AllowedReturnHosts": [
+    "*.example.com"
+   ],
+   "Audience": [
+    "example.com"
+   ],
+   "AuthMode": [
+    "oidc"
+   ],
+   "BasicAuth": {
+    "HtpasswdFile": "/etc/authenticatoor/htpasswd",
+    "Realm": "authenticatoor"
+   },
+   "CORS": {
+    "AllowedOrigins": [
+     "*.example.com"
+    ]
+   },
+   "CloudflareAccess": {
+    "JwtHeader": "Cf-Access-Jwt-Assertion",
+    "UserHeader": "X-Forwarded-Email",
+    "VerifyJWT": false
+   },
+   "DevMode": false,
+   "ExternalURL": "https://auth.example.com",
+   "GitHubOAuth": {
+    "AllowedOrgs": [
+     "ethpandaops"
+    ],
+    "ClientID": "Iv1.0000000000000000",
+    "ClientSecret": "not-a-real-secret"
+   },
+   "Issuer": "https://auth.example.com",
+   "Listen": ":8080",
+   "Logging": {
+    "Format": "text",
+    "Level": "info"
+   },
+   "Metrics": {
+    "Enabled": false,
+    "Listen": ":9090"
+   },
+   "OIDC": {
+    "AllowedGroups": [
+     "ethpandaops"
+    ],
+    "CallbackURL": "https://oidc-relay.example.com/oidc/callback",
+    "ClientID": "authenticatoor",
+    "ClientSecret": "not-a-real-secret",
+    "IssuerURL": "https://dex.example.com"
+   },
+   "Providers": [
+    {
+     "BasicAuth": {
+      "HtpasswdFile": "/etc/authenticatoor/htpasswd",
+      "Realm": "authenticatoor"
+     },
+     "CloudflareAccess": {
+      "JwtHeader": "Cf-Access-Jwt-Assertion",
+      "UserHeader": "X-Forwarded-Email",
+      "VerifyJWT": false
+     },
+     "GitHubOAuth": {
+      "AllowedOrgs": [
+       "ethpandaops"
+      ],
+      "ClientID": "Iv1.0000000000000000",
+      "ClientSecret": "not-a-real-secret"
+     },
+     "Name": "oidc",
+     "OIDC": {
+      "AllowedGroups": [
+       "ethpandaops"
+      ],
+      "CallbackPath": "/auth/oidc/callback",
+      "CallbackURL": "https://oidc-relay.example.com/oidc/callback",
+      "ClientID": "authenticatoor",
+      "ClientSecret": "not-a-real-secret",
+      "IssuerURL": "https://dex.example.com",
+      "SessionCookieName": "authenticatoor_oidc_session",
+      "StateCookieName": "authenticatoor_oidc_state"
+     },
+     "Type": "oidc"
+    }
+   ],
+   "ScopePattern": "*.example.com",
+   "Signing": {
+    "Mode": "rs256",
+    "RS256": {
+     "GenerateIfMissing": false,
+     "PrivateKeyFile": "/etc/authenticatoor/keys/private.pem"
+    }
+   },
+   "TokenTTL": 1800000000000,
+   "UserHeader": "X-Forwarded-Email"
+  }
+ },
+ "main-docs-01.yaml": {
+  "claims": {
+   "aud": [
+    "example.com"
+   ],
+   "email": "alice@example.org",
+   "iss": "https://auth.example.com",
+   "scope": "*.example.com",
+   "sub": "alice@example.org",
+   "ttl": 1800
+  },
+  "config": {
+   "AllowedReturnHosts": [
+    "*.example.com"
+   ],
+   "Audience": [
+    "example.com"
+   ],
+   "AuthMode": [
+    "cfaccess"
+   ],
+   "CORS": {
+    "AllowedOrigins": [
+     "*.example.com"
+    ]
+   },
+   "CloudflareAccess": {
+    "JwtHeader": "Cf-Access-Jwt-Assertion",
+    "UserHeader": "Cf-Access-Authenticated-User-Email"
+   },
+   "DevMode": false,
+   "ExternalURL": "https://auth.example.com",
+   "Issuer": "https://auth.example.com",
+   "Listen": ":8080",
+   "Logging": {
+    "Format": "text",
+    "Level": "info"
+   },
+   "Metrics": {
+    "Enabled": false,
+    "Listen": ":9090"
+   },
+   "Providers": [
+    {
+     "CloudflareAccess": {
+      "AudTag": "<from CF Access app config>",
+      "TeamDomain": "<team>.cloudflareaccess.com"
+     },
+     "Name": "cfaccess",
+     "Type": "cloudflare"
+    }
+   ],
+   "ScopePattern": "*.example.com",
+   "Signing": {
+    "Mode": "rs256",
+    "RS256": {
+     "GenerateIfMissing": false,
+     "PrivateKeyFile": "/etc/authenticatoor/keys/private.pem"
+    }
+   },
+   "TokenTTL": 1800000000000,
+   "UserHeader": "Cf-Access-Authenticated-User-Email"
+  }
+ },
+ "main-docs-02.yaml": {
+  "claims": {
+   "aud": [
+    "example.com"
+   ],
+   "email": "alice@example.org",
+   "iss": "https://auth.example.com",
+   "scope": "*.example.com",
+   "sub": "alice@example.org",
+   "ttl": 1800
+  },
+  "config": {
+   "AllowedReturnHosts": [
+    "*.example.com"
+   ],
+   "Audience": [
+    "example.com"
+   ],
+   "AuthMode": [
+    "cfaccess",
+    "oidc"
+   ],
+   "CORS": {
+    "AllowedOrigins": [
+     "*.example.com"
+    ]
+   },
+   "CloudflareAccess": {
+    "JwtHeader": "Cf-Access-Jwt-Assertion",
+    "UserHeader": "Cf-Access-Authenticated-User-Email"
+   },
+   "DevMode": false,
+   "ExternalURL": "https://auth.example.com",
+   "Issuer": "https://auth.example.com",
+   "Listen": ":8080",
+   "Logging": {
+    "Format": "text",
+    "Level": "info"
+   },
+   "Metrics": {
+    "Enabled": false,
+    "Listen": ":9090"
+   },
+   "Providers": [
+    {
+     "CloudflareAccess": {
+      "TeamDomain": "<team>.cloudflareaccess.com"
+     },
+     "Name": "cfaccess",
+     "Type": "cloudflare"
+    },
+    {
+     "Name": "oidc",
+     "OIDC": {
+      "AllowedGroups": [
+       "ethpandaops"
+      ],
+      "CallbackURL": "https://oidc-relay.primary.production.platform.ethpandaops.io/oidc/callback",
+      "ClientID": "authenticatoor",
+      "ClientSecretFile": "/etc/authenticatoor/oidc-client-secret",
+      "IssuerURL": "https://dex.primary.production.platform.ethpandaops.io"
+     },
+     "Type": "oidc"
+    }
+   ],
+   "ScopePattern": "*.example.com",
+   "Signing": {
+    "Mode": "rs256",
+    "RS256": {
+     "GenerateIfMissing": false,
+     "PrivateKeyFile": "/etc/authenticatoor/keys/private.pem"
+    }
+   },
+   "TokenTTL": 1800000000000,
+   "UserHeader": "Cf-Access-Authenticated-User-Email"
+  }
+ },
+ "main-docs-05.yaml": {
+  "claims": {
+   "aud": [
+    "example.com"
+   ],
+   "email": "alice@example.org",
+   "iss": "https://auth.example.com",
+   "scope": "*.example.com",
+   "sub": "alice@example.org",
+   "ttl": 1800
+  },
+  "config": {
+   "AllowedReturnHosts": [
+    "*.example.com"
+   ],
+   "Audience": [
+    "example.com"
+   ],
+   "AuthMode": [
+    "anyauth"
+   ],
+   "CORS": {
+    "AllowedOrigins": [
+     "*.example.com"
+    ]
+   },
+   "CloudflareAccess": {
+    "JwtHeader": "Cf-Access-Jwt-Assertion",
+    "UserHeader": "Cf-Access-Authenticated-User-Email"
+   },
+   "DevMode": false,
+   "ExternalURL": "https://auth.example.com",
+   "Issuer": "https://auth.example.com",
+   "Listen": ":8080",
+   "Logging": {
+    "Format": "text",
+    "Level": "info"
+   },
+   "Metrics": {
+    "Enabled": false,
+    "Listen": ":9090"
+   },
+   "Providers": [
+    {
+     "CloudflareAccess": {
+      "JwtHeader": "Cf-Access-Jwt-Assertion",
+      "UserHeader": "Cf-Access-Authenticated-User-Email"
+     },
+     "Name": "anyauth",
+     "Type": "any"
+    }
+   ],
+   "ScopePattern": "*.example.com",
+   "Signing": {
+    "Mode": "rs256",
+    "RS256": {
+     "GenerateIfMissing": false,
+     "PrivateKeyFile": "/etc/authenticatoor/keys/private.pem"
+    }
+   },
+   "TokenTTL": 1800000000000,
+   "UserHeader": "Cf-Access-Authenticated-User-Email"
+  }
+ },
+ "main-example.yaml": {
+  "claims": {
+   "aud": [
+    "example.com"
+   ],
+   "email": "alice@example.org",
+   "iss": "https://auth.example.com",
+   "scope": "*.example.com",
+   "sub": "alice@example.org",
+   "ttl": 1800
+  },
+  "config": {
+   "AllowedReturnHosts": [
+    "*.example.com"
+   ],
+   "Audience": [
+    "example.com"
+   ],
+   "AuthMode": [
+    "cfaccess"
+   ],
+   "CORS": {
+    "AllowedOrigins": [
+     "*.example.com"
+    ]
+   },
+   "CloudflareAccess": {
+    "JwtHeader": "Cf-Access-Jwt-Assertion",
+    "UserHeader": "Cf-Access-Authenticated-User-Email"
+   },
+   "DevMode": false,
+   "ExternalURL": "https://auth.example.com",
+   "Issuer": "https://auth.example.com",
+   "Listen": ":8080",
+   "Logging": {
+    "Format": "text",
+    "Level": "info"
+   },
+   "Metrics": {
+    "Enabled": false,
+    "Listen": ":9090"
+   },
+   "Providers": [
+    {
+     "CloudflareAccess": {
+      "TeamDomain": "<team>.cloudflareaccess.com"
+     },
+     "Name": "cfaccess",
+     "Type": "cloudflare"
+    }
+   ],
+   "ScopePattern": "*.example.com",
+   "Signing": {
+    "Mode": "rs256",
+    "RS256": {
+     "GenerateIfMissing": false,
+     "PrivateKeyFile": "/etc/authenticatoor/keys/private.pem"
+    }
+   },
+   "TokenTTL": 1800000000000,
+   "UserHeader": "Cf-Access-Authenticated-User-Email"
+  }
+ },
+ "v0.0.1-docs-01.yaml": {
+  "claims": {
+   "aud": [
+    "example.com"
+   ],
+   "email": "alice@example.org",
+   "iss": "https://auth.example.com",
+   "scope": "*.example.com",
+   "sub": "alice@example.org",
+   "ttl": 1800
+  },
+  "config": {
+   "AllowedReturnHosts": [
+    "*.example.com"
+   ],
+   "Audience": [
+    "example.com"
+   ],
+   "AuthMode": [
+    "cfaccess"
+   ],
+   "CORS": {
+    "AllowedOrigins": [
+     "*.example.com"
+    ]
+   },
+   "CloudflareAccess": {
+    "AudTag": "<from CF Access app config>",
+    "JwtHeader": "Cf-Access-Jwt-Assertion",
+    "TeamDomain": "<team>.cloudflareaccess.com",
+    "UserHeader": "Cf-Access-Authenticated-User-Email"
+   },
+   "DevMode": false,
+   "ExternalURL": "https://auth.example.com",
+   "Issuer": "https://auth.example.com",
+   "Listen": ":8080",
+   "Logging": {
+    "Format": "text",
+    "Level": "info"
+   },
+   "Metrics": {
+    "Enabled": false,
+    "Listen": ":9090"
+   },
+   "Providers": [
+    {
+     "CloudflareAccess": {
+      "AudTag": "<from CF Access app config>",
+      "JwtHeader": "Cf-Access-Jwt-Assertion",
+      "TeamDomain": "<team>.cloudflareaccess.com",
+      "UserHeader": "Cf-Access-Authenticated-User-Email"
+     },
+     "Name": "cfaccess",
+     "Type": "cloudflare"
+    }
+   ],
+   "ScopePattern": "*.example.com",
+   "Signing": {
+    "Mode": "rs256",
+    "RS256": {
+     "GenerateIfMissing": false,
+     "PrivateKeyFile": "/etc/authenticatoor/keys/private.pem"
+    }
+   },
+   "TokenTTL": 1800000000000,
+   "UserHeader": "Cf-Access-Authenticated-User-Email"
+  }
+ },
+ "v0.0.1-example.yaml": {
+  "claims": {
+   "aud": [
+    "example.com"
+   ],
+   "email": "alice@example.org",
+   "iss": "https://auth.example.com",
+   "scope": "*.example.com",
+   "sub": "alice@example.org",
+   "ttl": 1800
+  },
+  "config": {
+   "AllowedReturnHosts": [
+    "*.example.com"
+   ],
+   "Audience": [
+    "example.com"
+   ],
+   "AuthMode": [
+    "cfaccess"
+   ],
+   "CORS": {
+    "AllowedOrigins": [
+     "*.example.com"
+    ]
+   },
+   "CloudflareAccess": {
+    "JwtHeader": "Cf-Access-Jwt-Assertion",
+    "TeamDomain": "<team>.cloudflareaccess.com",
+    "UserHeader": "Cf-Access-Authenticated-User-Email",
+    "VerifyJWT": true
+   },
+   "DevMode": false,
+   "ExternalURL": "https://auth.example.com",
+   "Issuer": "https://auth.example.com",
+   "Listen": ":8080",
+   "Logging": {
+    "Format": "text",
+    "Level": "info"
+   },
+   "Metrics": {
+    "Enabled": false,
+    "Listen": ":9090"
+   },
+   "Providers": [
+    {
+     "CloudflareAccess": {
+      "JwtHeader": "Cf-Access-Jwt-Assertion",
+      "TeamDomain": "<team>.cloudflareaccess.com",
+      "UserHeader": "Cf-Access-Authenticated-User-Email",
+      "VerifyJWT": true
+     },
+     "Name": "cfaccess",
+     "Type": "cloudflare"
+    }
+   ],
+   "ScopePattern": "*.example.com",
+   "Signing": {
+    "Mode": "rs256",
+    "RS256": {
+     "GenerateIfMissing": false,
+     "PrivateKeyFile": "/etc/authenticatoor/keys/private.pem"
+    }
+   },
+   "TokenTTL": 1800000000000,
+   "UserHeader": "Cf-Access-Authenticated-User-Email"
+  }
+ },
+ "v0.0.1-readme-01.yaml": {
+  "claims": {
+   "aud": [
+    "example.com"
+   ],
+   "email": "alice@example.org",
+   "iss": "https://auth.example.com",
+   "scope": "*.example.com",
+   "sub": "alice@example.org",
+   "ttl": 1800
+  },
+  "config": {
+   "AllowedReturnHosts": [
+    "*.example.com"
+   ],
+   "Audience": [
+    "example.com"
+   ],
+   "AuthMode": [
+    "cfaccess"
+   ],
+   "CORS": {
+    "AllowedOrigins": [
+     "*.example.com"
+    ]
+   },
+   "CloudflareAccess": {
+    "AudTag": "<CF Access app AUD tag>",
+    "JwtHeader": "Cf-Access-Jwt-Assertion",
+    "TeamDomain": "<team>.cloudflareaccess.com",
+    "UserHeader": "Cf-Access-Authenticated-User-Email"
+   },
+   "DevMode": false,
+   "ExternalURL": "https://auth.example.com",
+   "Issuer": "https://auth.example.com",
+   "Listen": ":8080",
+   "Logging": {
+    "Format": "text",
+    "Level": "info"
+   },
+   "Metrics": {
+    "Enabled": false,
+    "Listen": ":9090"
+   },
+   "Providers": [
+    {
+     "CloudflareAccess": {
+      "AudTag": "<CF Access app AUD tag>",
+      "JwtHeader": "Cf-Access-Jwt-Assertion",
+      "TeamDomain": "<team>.cloudflareaccess.com",
+      "UserHeader": "Cf-Access-Authenticated-User-Email"
+     },
+     "Name": "cfaccess",
+     "Type": "cloudflare"
+    }
+   ],
+   "ScopePattern": "*.example.com",
+   "Signing": {
+    "Mode": "rs256",
+    "RS256": {
+     "GenerateIfMissing": false,
+     "PrivateKeyFile": "/etc/authenticatoor/keys/private.pem"
+    }
+   },
+   "TokenTTL": 1800000000000,
+   "UserHeader": "Cf-Access-Authenticated-User-Email"
+  }
+ },
+ "v0.0.1-readme-02.yaml": {
+  "claims": {
+   "aud": [
+    "example.com"
+   ],
+   "email": "alice@example.org",
+   "iss": "https://auth.example.com",
+   "scope": "*.example.com",
+   "sub": "alice@example.org",
+   "ttl": 1800
+  },
+  "config": {
+   "AllowedReturnHosts": [
+    "*.example.com"
+   ],
+   "Audience": [
+    "example.com"
+   ],
+   "AuthMode": [
+    "cfaccess"
+   ],
+   "CORS": {
+    "AllowedOrigins": [
+     "*.example.com"
+    ]
+   },
+   "CloudflareAccess": {
+    "JwtHeader": "Cf-Access-Jwt-Assertion",
+    "UserHeader": "Cf-Access-Authenticated-User-Email",
+    "VerifyJWT": false
+   },
+   "DevMode": false,
+   "ExternalURL": "https://auth.example.com",
+   "Issuer": "https://auth.example.com",
+   "Listen": ":8080",
+   "Logging": {
+    "Format": "text",
+    "Level": "info"
+   },
+   "Metrics": {
+    "Enabled": false,
+    "Listen": ":9090"
+   },
+   "Providers": [
+    {
+     "CloudflareAccess": {
+      "JwtHeader": "Cf-Access-Jwt-Assertion",
+      "UserHeader": "Cf-Access-Authenticated-User-Email",
+      "VerifyJWT": false
+     },
+     "Name": "cfaccess",
+     "Type": "cloudflare"
+    }
+   ],
+   "ScopePattern": "*.example.com",
+   "Signing": {
+    "Mode": "rs256",
+    "RS256": {
+     "GenerateIfMissing": false,
+     "PrivateKeyFile": "/etc/authenticatoor/keys/private.pem"
+    }
+   },
+   "TokenTTL": 1800000000000,
+   "UserHeader": "Cf-Access-Authenticated-User-Email"
+  }
+ },
+ "v0.0.2-docs-02.yaml": {
+  "claims": {
+   "aud": [
+    "example.com"
+   ],
+   "email": "alice@example.org",
+   "iss": "https://auth.example.com",
+   "scope": "*.example.com",
+   "sub": "alice@example.org",
+   "ttl": 1800
+  },
+  "config": {
+   "AllowedReturnHosts": [
+    "*.example.com"
+   ],
+   "Audience": [
+    "example.com"
+   ],
+   "AuthMode": [
+    "cfaccess"
+   ],
+   "CORS": {
+    "AllowedOrigins": [
+     "*.example.com"
+    ]
+   },
+   "CloudflareAccess": {
+    "AudTag": "<from CF Access app config>",
+    "JwtHeader": "Cf-Access-Jwt-Assertion",
+    "TeamDomain": "<team>.cloudflareaccess.com",
+    "UserHeader": "Cf-Access-Authenticated-User-Email",
+    "VerifyJWT": true
+   },
+   "DevMode": false,
+   "ExternalURL": "https://auth.example.com",
+   "Issuer": "https://auth.example.com",
+   "Listen": ":8080",
+   "Logging": {
+    "Format": "text",
+    "Level": "info"
+   },
+   "Metrics": {
+    "Enabled": false,
+    "Listen": ":9090"
+   },
+   "Providers": [
+    {
+     "CloudflareAccess": {
+      "AudTag": "<from CF Access app config>",
+      "JwtHeader": "Cf-Access-Jwt-Assertion",
+      "TeamDomain": "<team>.cloudflareaccess.com",
+      "UserHeader": "Cf-Access-Authenticated-User-Email",
+      "VerifyJWT": true
+     },
+     "Name": "cfaccess",
+     "Type": "cloudflare"
+    }
+   ],
+   "ScopePattern": "*.example.com",
+   "Signing": {
+    "Mode": "rs256",
+    "RS256": {
+     "GenerateIfMissing": false,
+     "PrivateKeyFile": "/etc/authenticatoor/keys/private.pem"
+    }
+   },
+   "TokenTTL": 1800000000000,
+   "UserHeader": "Cf-Access-Authenticated-User-Email"
+  }
+ },
+ "v0.0.2-docs-03.yaml": {
+  "claims": {
+   "aud": [
+    "example.com"
+   ],
+   "email": "alice@example.org",
+   "iss": "https://auth.example.com",
+   "scope": "*.example.com",
+   "sub": "alice@example.org",
+   "ttl": 1800
+  },
+  "config": {
+   "AllowedReturnHosts": [
+    "*.example.com"
+   ],
+   "Audience": [
+    "example.com"
+   ],
+   "AuthMode": [
+    "htpasswd"
+   ],
+   "BasicAuth": {
+    "HtpasswdFile": "/etc/authenticatoor/htpasswd",
+    "Realm": "authenticatoor"
+   },
+   "CORS": {
+    "AllowedOrigins": [
+     "*.example.com"
+    ]
+   },
+   "CloudflareAccess": {
+    "JwtHeader": "Cf-Access-Jwt-Assertion",
+    "UserHeader": "Cf-Access-Authenticated-User-Email"
+   },
+   "DevMode": false,
+   "ExternalURL": "https://auth.example.com",
+   "Issuer": "https://auth.example.com",
+   "Listen": ":8080",
+   "Logging": {
+    "Format": "text",
+    "Level": "info"
+   },
+   "Metrics": {
+    "Enabled": false,
+    "Listen": ":9090"
+   },
+   "Providers": [
+    {
+     "BasicAuth": {
+      "HtpasswdFile": "/etc/authenticatoor/htpasswd",
+      "Realm": "authenticatoor"
+     },
+     "CloudflareAccess": {
+      "JwtHeader": "Cf-Access-Jwt-Assertion",
+      "UserHeader": "Cf-Access-Authenticated-User-Email"
+     },
+     "Name": "htpasswd",
+     "Type": "basic"
+    }
+   ],
+   "ScopePattern": "*.example.com",
+   "Signing": {
+    "Mode": "rs256",
+    "RS256": {
+     "GenerateIfMissing": false,
+     "PrivateKeyFile": "/etc/authenticatoor/keys/private.pem"
+    }
+   },
+   "TokenTTL": 1800000000000,
+   "UserHeader": "Cf-Access-Authenticated-User-Email"
+  }
+ },
+ "v0.0.2-docs-04.yaml": {
+  "claims": {
+   "aud": [
+    "example.com"
+   ],
+   "email": "alice@example.org",
+   "iss": "https://auth.example.com",
+   "scope": "*.example.com",
+   "sub": "alice@example.org",
+   "ttl": 1800
+  },
+  "config": {
+   "AllowedReturnHosts": [
+    "*.example.com"
+   ],
+   "Audience": [
+    "example.com"
+   ],
+   "AuthMode": [
+    "anyauth"
+   ],
+   "CORS": {
+    "AllowedOrigins": [
+     "*.example.com"
+    ]
+   },
+   "CloudflareAccess": {
+    "JwtHeader": "Cf-Access-Jwt-Assertion",
+    "UserHeader": "Cf-Access-Authenticated-User-Email"
+   },
+   "DevMode": false,
+   "ExternalURL": "https://auth.example.com",
+   "Issuer": "https://auth.example.com",
+   "Listen": ":8080",
+   "Logging": {
+    "Format": "text",
+    "Level": "info"
+   },
+   "Metrics": {
+    "Enabled": false,
+    "Listen": ":9090"
+   },
+   "Providers": [
+    {
+     "CloudflareAccess": {
+      "JwtHeader": "Cf-Access-Jwt-Assertion",
+      "UserHeader": "Cf-Access-Authenticated-User-Email"
+     },
+     "Name": "anyauth",
+     "Type": "any"
+    }
+   ],
+   "ScopePattern": "*.example.com",
+   "Signing": {
+    "Mode": "rs256",
+    "RS256": {
+     "GenerateIfMissing": false,
+     "PrivateKeyFile": "/etc/authenticatoor/keys/private.pem"
+    }
+   },
+   "TokenTTL": 1800000000000,
+   "UserHeader": "Cf-Access-Authenticated-User-Email"
+  }
+ },
+ "v0.0.2-docs-05.yaml": {
+  "claims": {
+   "aud": [
+    "example.com"
+   ],
+   "email": "alice@example.org",
+   "iss": "https://auth.example.com",
+   "scope": "*.example.com",
+   "sub": "alice@example.org",
+   "ttl": 1800
+  },
+  "config": {
+   "AllowedReturnHosts": [
+    "*.example.com"
+   ],
+   "Audience": [
+    "example.com"
+   ],
+   "AuthMode": [
+    "github"
+   ],
+   "CORS": {
+    "AllowedOrigins": [
+     "*.example.com"
+    ]
+   },
+   "CloudflareAccess": {
+    "JwtHeader": "Cf-Access-Jwt-Assertion",
+    "UserHeader": "Cf-Access-Authenticated-User-Email"
+   },
+   "DevMode": false,
+   "ExternalURL": "https://auth.example.com",
+   "GitHubOAuth": {
+    "AllowedOrgs": [
+     "ethpandaops"
+    ],
+    "ClientID": "Iv1.\u2026",
+    "ClientSecretFile": "/etc/authenticatoor/gh-secret"
+   },
+   "Issuer": "https://auth.example.com",
+   "Listen": ":8080",
+   "Logging": {
+    "Format": "text",
+    "Level": "info"
+   },
+   "Metrics": {
+    "Enabled": false,
+    "Listen": ":9090"
+   },
+   "Providers": [
+    {
+     "CloudflareAccess": {
+      "JwtHeader": "Cf-Access-Jwt-Assertion",
+      "UserHeader": "Cf-Access-Authenticated-User-Email"
+     },
+     "GitHubOAuth": {
+      "AllowedOrgs": [
+       "ethpandaops"
+      ],
+      "CallbackPath": "/auth/oauth/callback",
+      "ClientID": "Iv1.\u2026",
+      "ClientSecretFile": "/etc/authenticatoor/gh-secret",
+      "SessionCookieName": "authenticatoor_session",
+      "StateCookieName": "authenticatoor_oauth_state"
+     },
+     "Name": "github",
+     "Type": "github"
+    }
+   ],
+   "ScopePattern": "*.example.com",
+   "Signing": {
+    "Mode": "rs256",
+    "RS256": {
+     "GenerateIfMissing": false,
+     "PrivateKeyFile": "/etc/authenticatoor/keys/private.pem"
+    }
+   },
+   "TokenTTL": 1800000000000,
+   "UserHeader": "Cf-Access-Authenticated-User-Email"
+  }
+ },
+ "v0.0.2-docs-06.yaml": {
+  "claims": {
+   "aud": [
+    "example.com"
+   ],
+   "email": "alice@example.org",
+   "iss": "https://auth.example.com",
+   "scope": "*.example.com",
+   "sub": "alice@example.org",
+   "ttl": 1800
+  },
+  "config": {
+   "AllowedReturnHosts": [
+    "*.example.com"
+   ],
+   "Audience": [
+    "example.com"
+   ],
+   "AuthMode": [
+    "oidc"
+   ],
+   "CORS": {
+    "AllowedOrigins": [
+     "*.example.com"
+    ]
+   },
+   "CloudflareAccess": {
+    "JwtHeader": "Cf-Access-Jwt-Assertion",
+    "UserHeader": "Cf-Access-Authenticated-User-Email"
+   },
+   "DevMode": false,
+   "ExternalURL": "https://auth.<devnet>.ethpandaops.io",
+   "Issuer": "https://auth.example.com",
+   "Listen": ":8080",
+   "Logging": {
+    "Format": "text",
+    "Level": "info"
+   },
+   "Metrics": {
+    "Enabled": false,
+    "Listen": ":9090"
+   },
+   "OIDC": {
+    "AllowedGroups": [
+     "ethpandaops",
+     "EthDevOpsAccess:validatorops",
+     "sigp"
+    ],
+    "CallbackURL": "https://oidc-relay.primary.production.platform.ethpandaops.io/oidc/callback",
+    "ClientID": "authenticatoor",
+    "ClientSecretFile": "/etc/authenticatoor/oidc-client-secret",
+    "IssuerURL": "https://dex.primary.production.platform.ethpandaops.io"
+   },
+   "Providers": [
+    {
+     "CloudflareAccess": {
+      "JwtHeader": "Cf-Access-Jwt-Assertion",
+      "UserHeader": "Cf-Access-Authenticated-User-Email"
+     },
+     "Name": "oidc",
+     "OIDC": {
+      "AllowedGroups": [
+       "ethpandaops",
+       "EthDevOpsAccess:validatorops",
+       "sigp"
+      ],
+      "CallbackPath": "/auth/oidc/callback",
+      "CallbackURL": "https://oidc-relay.primary.production.platform.ethpandaops.io/oidc/callback",
+      "ClientID": "authenticatoor",
+      "ClientSecretFile": "/etc/authenticatoor/oidc-client-secret",
+      "IssuerURL": "https://dex.primary.production.platform.ethpandaops.io",
+      "SessionCookieName": "authenticatoor_oidc_session",
+      "StateCookieName": "authenticatoor_oidc_state"
+     },
+     "Type": "oidc"
+    }
+   ],
+   "ScopePattern": "*.example.com",
+   "Signing": {
+    "Mode": "rs256",
+    "RS256": {
+     "GenerateIfMissing": false,
+     "PrivateKeyFile": "/etc/authenticatoor/keys/private.pem"
+    }
+   },
+   "TokenTTL": 1800000000000,
+   "UserHeader": "Cf-Access-Authenticated-User-Email"
+  }
+ },
+ "v0.0.2-example.yaml": {
+  "claims": {
+   "aud": [
+    "example.com"
+   ],
+   "email": "alice@example.org",
+   "iss": "https://auth.example.com",
+   "scope": "*.example.com",
+   "sub": "alice@example.org",
+   "ttl": 1800
+  },
+  "config": {
+   "AllowedReturnHosts": [
+    "*.example.com"
+   ],
+   "Audience": [
+    "example.com"
+   ],
+   "AuthMode": [
+    "cfaccess"
+   ],
+   "CORS": {
+    "AllowedOrigins": [
+     "*.example.com"
+    ]
+   },
+   "CloudflareAccess": {
+    "AllowServiceTokens": true,
+    "JwtHeader": "Cf-Access-Jwt-Assertion",
+    "TeamDomain": "<team>.cloudflareaccess.com",
+    "UserHeader": "Cf-Access-Authenticated-User-Email",
+    "VerifyJWT": true
+   },
+   "DevMode": false,
+   "ExternalURL": "https://auth.example.com",
+   "Issuer": "https://auth.example.com",
+   "Listen": ":8080",
+   "Logging": {
+    "Format": "text",
+    "Level": "info"
+   },
+   "Metrics": {
+    "Enabled": false,
+    "Listen": ":9090"
+   },
+   "Providers": [
+    {
+     "CloudflareAccess": {
+      "AllowServiceTokens": true,
+      "JwtHeader": "Cf-Access-Jwt-Assertion",
+      "TeamDomain": "<team>.cloudflareaccess.com",
+      "UserHeader": "Cf-Access-Authenticated-User-Email",
+      "VerifyJWT": true
+     },
+     "Name": "cfaccess",
+     "Type": "cloudflare"
+    }
+   ],
+   "ScopePattern": "*.example.com",
+   "Signing": {
+    "Mode": "rs256",
+    "RS256": {
+     "GenerateIfMissing": false,
+     "PrivateKeyFile": "/etc/authenticatoor/keys/private.pem"
+    }
+   },
+   "TokenTTL": 1800000000000,
+   "UserHeader": "Cf-Access-Authenticated-User-Email"
+  }
+ },
+ "v0.0.2-hack-local.yaml": {
+  "claims": {
+   "aud": [
+    "localhost"
+   ],
+   "email": "alice@example.org",
+   "iss": "http://auth.localhost:18080",
+   "scope": "*.localhost",
+   "sub": "alice@example.org",
+   "ttl": 1800
+  },
+  "config": {
+   "AllowedReturnHosts": [
+    "*.localhost",
+    "localhost",
+    "127.0.0.1"
+   ],
+   "Audience": [
+    "localhost"
+   ],
+   "AuthMode": [
+    "anyauth"
+   ],
+   "CORS": {
+    "AllowedOrigins": [
+     "*.localhost",
+     "localhost",
+     "127.0.0.1"
+    ]
+   },
+   "CloudflareAccess": {
+    "JwtHeader": "Cf-Access-Jwt-Assertion",
+    "UserHeader": "Cf-Access-Authenticated-User-Email"
+   },
+   "DevMode": false,
+   "ExternalURL": "http://auth.localhost:18080",
+   "Issuer": "http://auth.localhost:18080",
+   "Listen": ":18080",
+   "Logging": {
+    "Format": "text",
+    "Level": "debug"
+   },
+   "Metrics": {
+    "Enabled": false,
+    "Listen": ":9090"
+   },
+   "Providers": [
+    {
+     "CloudflareAccess": {
+      "JwtHeader": "Cf-Access-Jwt-Assertion",
+      "UserHeader": "Cf-Access-Authenticated-User-Email"
+     },
+     "Name": "anyauth",
+     "Type": "any"
+    }
+   ],
+   "ScopePattern": "*.localhost",
+   "Signing": {
+    "Mode": "rs256",
+    "RS256": {
+     "GenerateIfMissing": true,
+     "PrivateKeyFile": "./private.pem"
+    }
+   },
+   "TokenTTL": 1800000000000,
+   "UserHeader": "Cf-Access-Authenticated-User-Email"
+  }
+ },
+ "v0.0.2-readme-02.yaml": {
+  "claims": {
+   "aud": [
+    "example.com"
+   ],
+   "email": "alice@example.org",
+   "iss": "https://auth.example.com",
+   "scope": "*.example.com",
+   "sub": "alice@example.org",
+   "ttl": 1800
+  },
+  "config": {
+   "AllowedReturnHosts": [
+    "*.example.com"
+   ],
+   "Audience": [
+    "example.com"
+   ],
+   "AuthMode": [
+    "anyauth"
+   ],
+   "CORS": {
+    "AllowedOrigins": [
+     "*.example.com"
+    ]
+   },
+   "CloudflareAccess": {
+    "JwtHeader": "Cf-Access-Jwt-Assertion",
+    "UserHeader": "Cf-Access-Authenticated-User-Email"
+   },
+   "DevMode": false,
+   "ExternalURL": "https://auth.example.com",
+   "Issuer": "https://auth.example.com",
+   "Listen": ":8080",
+   "Logging": {
+    "Format": "text",
+    "Level": "info"
+   },
+   "Metrics": {
+    "Enabled": false,
+    "Listen": ":9090"
+   },
+   "Providers": [
+    {
+     "CloudflareAccess": {
+      "JwtHeader": "Cf-Access-Jwt-Assertion",
+      "UserHeader": "Cf-Access-Authenticated-User-Email"
+     },
+     "Name": "anyauth",
+     "Type": "any"
+    }
+   ],
+   "ScopePattern": "*.example.com",
+   "Signing": {
+    "Mode": "rs256",
+    "RS256": {
+     "GenerateIfMissing": false,
+     "PrivateKeyFile": "/etc/authenticatoor/keys/private.pem"
+    }
+   },
+   "TokenTTL": 1800000000000,
+   "UserHeader": "Cf-Access-Authenticated-User-Email"
+  }
+ }
+}

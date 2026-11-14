@@ -1,0 +1,36 @@
+# Every legacy top-level block at once, with a single-string authMode.
+# The blocks authMode does not name are unused; their deprecated keys
+# must not stop the service either.
+listen: ":8080"
+issuer: "https://auth.example.com"
+authMode: oidc
+userHeader: "X-Forwarded-Email"
+cloudflareAccess:
+  verifyJWT: false
+  jwtHeader: "Cf-Access-Jwt-Assertion"
+basicAuth:
+  htpasswdFile: "/etc/authenticatoor/htpasswd"
+  realm: "authenticatoor"
+anyAuth:
+  loginPath: "/auth/anyauth/login"
+githubOAuth:
+  clientId: "Iv1.0000000000000000"
+  clientSecret: "not-a-real-secret"
+  sessionSecretFile: "/etc/authenticatoor/gh-session-secret"
+  allowedOrgs: ["ethpandaops"]
+oidc:
+  issuerURL: "https://dex.example.com"
+  callbackURL: "https://oidc-relay.example.com/oidc/callback"
+  clientId: "authenticatoor"
+  clientSecret: "not-a-real-secret"
+  allowedGroups: ["ethpandaops"]
+signing:
+  mode: rs256
+  rs256:
+    privateKeyFile: "/etc/authenticatoor/keys/private.pem"
+logging:
+  level: info
+  format: text
+metrics:
+  enabled: false
+  listen: ":9090"

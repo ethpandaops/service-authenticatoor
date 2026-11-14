@@ -10,3 +10,4 @@
 .vscode/
 .plan/
 .hack/local/custom-config.yaml
+/.tmp/

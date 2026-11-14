@@ -1,0 +1,4 @@
+authMode: basic
+basicAuth:
+  htpasswdFile: "/etc/authenticatoor/htpasswd"
+  realm: "authenticatoor"

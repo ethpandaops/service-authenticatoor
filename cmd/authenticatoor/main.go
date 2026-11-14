@@ -90,18 +90,30 @@ func run(ctx context.Context, cfgPath string) error {
 	for _, w := range cfg.DeprecationWarnings {
 		log.Warn(w)
 	}
+	for _, w := range cfg.Warnings {
+		log.Warn("config: " + w)
+	}
 
 	priv, err := loadOrGeneratePrivateKey(log, cfg.Signing.RS256.PrivateKeyFile, cfg.Signing.RS256.GenerateIfMissing)
 	if err != nil {
 		return fmt.Errorf("load signing key: %w", err)
 	}
 
-	iss, err := buildIssuer(log, cfg, priv)
+	// The grants section is needed twice: by the issuer, which turns an
+	// identity's memberships into the services claim, and by the
+	// providers, which find out which attribute members an identity
+	// satisfies.
+	grants, err := buildGrants(log, cfg)
+	if err != nil {
+		return fmt.Errorf("grants: %w", err)
+	}
+
+	iss, err := buildIssuer(log, cfg, priv, grants)
 	if err != nil {
 		return fmt.Errorf("build issuer: %w", err)
 	}
 
-	providers, err := buildProviders(log, cfg, priv)
+	providers, err := buildProviders(log, cfg, priv, grants)
 	if err != nil {
 		return fmt.Errorf("build providers: %w", err)
 	}
@@ -124,7 +136,7 @@ func run(ctx context.Context, cfgPath string) error {
 // providers entry. Provider.Start (heavy initialization) is deferred to
 // server.Start.
 func buildProviders(
-	log logrus.FieldLogger, cfg *config.Config, priv *rsa.PrivateKey,
+	log logrus.FieldLogger, cfg *config.Config, priv *rsa.PrivateKey, grants *issuer.ServiceGrants,
 ) ([]server.NamedProvider, error) {
 	out := make([]server.NamedProvider, 0, len(cfg.Providers))
 	for i := range cfg.Providers {
@@ -141,7 +153,7 @@ func buildProviders(
 			return nil, fmt.Errorf("derive session key for %s: %w", pc.Name, err)
 		}
 
-		prov, err := buildProvider(log, cfg, pc, sessionKey)
+		prov, err := buildProvider(log, cfg, pc, sessionKey, grants.AttributeMembers(pc.Name))
 		if err != nil {
 			return nil, fmt.Errorf("provider %s: %w", pc.Name, err)
 		}
@@ -155,6 +167,7 @@ func buildProviders(
 // every provider lives under its own /<name>/ prefix.
 func buildProvider(
 	log logrus.FieldLogger, cfg *config.Config, pc *config.ProviderConfig, sessionKey []byte,
+	members []protection.AttributeMember,
 ) (protection.Provider, error) {
 	// The login entry is not configurable — it is always the provider's
 	// own prefix, derived from the instance name.
@@ -186,6 +199,9 @@ func buildProvider(
 			SessionKey:         sessionKey,
 			SessionCookieName:  cookieName(pc.CloudflareAccess.SessionCookieName, "_session"),
 			SessionTTL:         pc.CloudflareAccess.SessionTTL,
+			Teams:              pc.CloudflareAccess.Teams,
+			TeamRules:          pc.CloudflareAccess.TeamRules,
+			GrantMembers:       members,
 		}), nil
 	case config.AuthModeBasic:
 		return basic.New(log, basic.Config{
@@ -195,12 +211,18 @@ func buildProvider(
 			SessionKey:        sessionKey,
 			SessionCookieName: cookieName(pc.BasicAuth.SessionCookieName, "_session"),
 			SessionTTL:        pc.BasicAuth.SessionTTL,
+			Teams:             pc.BasicAuth.Teams,
+			TeamRules:         pc.BasicAuth.TeamRules,
+			GrantMembers:      members,
 		}), nil
 	case config.AuthModeAny:
 		return anyauth.New(log, anyauth.Config{
-			CookieName: pc.AnyAuth.CookieName,
-			LoginPath:  loginPath,
-			CookieTTL:  pc.AnyAuth.CookieTTL,
+			CookieName:   pc.AnyAuth.CookieName,
+			LoginPath:    loginPath,
+			CookieTTL:    pc.AnyAuth.CookieTTL,
+			Teams:        pc.AnyAuth.Teams,
+			TeamRules:    pc.AnyAuth.TeamRules,
+			GrantMembers: members,
 		}), nil
 	case config.AuthModeGitHub:
 		return github.New(log, github.Config{
@@ -215,23 +237,30 @@ func buildProvider(
 			StateCookieName:   cookieName(pc.GitHubOAuth.StateCookieName, "_state"),
 			SessionTTL:        pc.GitHubOAuth.SessionTTL,
 			AllowedOrgs:       pc.GitHubOAuth.AllowedOrgs,
+			Teams:             pc.GitHubOAuth.Teams,
+			TeamRules:         pc.GitHubOAuth.TeamRules,
+			GrantMembers:      members,
 		}), nil
 	case config.AuthModeOIDC:
 		return oidc.New(log, oidc.Config{
-			IssuerURL:         pc.OIDC.IssuerURL,
-			CallbackURL:       pc.OIDC.CallbackURL,
-			PublicURL:         cfg.ExternalURL,
-			ClientID:          pc.OIDC.ClientID,
-			ClientSecret:      pc.OIDC.ClientSecret,
-			ClientSecretFile:  pc.OIDC.ClientSecretFile,
-			SessionKey:        sessionKey,
-			LoginPath:         loginPath,
-			CallbackPath:      callbackPath(pc.OIDC.CallbackPath),
-			SessionCookieName: cookieName(pc.OIDC.SessionCookieName, "_session"),
-			StateCookieName:   cookieName(pc.OIDC.StateCookieName, "_state"),
-			SessionTTL:        pc.OIDC.SessionTTL,
-			AllowedGroups:     pc.OIDC.AllowedGroups,
-			Scopes:            pc.OIDC.Scopes,
+			IssuerURL:            pc.OIDC.IssuerURL,
+			CallbackURL:          pc.OIDC.CallbackURL,
+			PublicURL:            cfg.ExternalURL,
+			ClientID:             pc.OIDC.ClientID,
+			ClientSecret:         pc.OIDC.ClientSecret,
+			ClientSecretFile:     pc.OIDC.ClientSecretFile,
+			SessionKey:           sessionKey,
+			LoginPath:            loginPath,
+			CallbackPath:         callbackPath(pc.OIDC.CallbackPath),
+			SessionCookieName:    cookieName(pc.OIDC.SessionCookieName, "_session"),
+			StateCookieName:      cookieName(pc.OIDC.StateCookieName, "_state"),
+			SessionTTL:           pc.OIDC.SessionTTL,
+			AllowedGroups:        pc.OIDC.AllowedGroups,
+			Scopes:               pc.OIDC.Scopes,
+			TrustUnverifiedEmail: pc.OIDC.TrustsUnverifiedEmail(),
+			Teams:                pc.OIDC.Teams,
+			TeamRules:            pc.OIDC.TeamRules,
+			GrantMembers:         members,
 		}), nil
 	default:
 		return nil, fmt.Errorf("type %q not implemented", pc.Type)
@@ -240,7 +269,9 @@ func buildProvider(
 
 // buildIssuer loads any previous public keys for rotation and constructs
 // an RS256Issuer around the supplied private key.
-func buildIssuer(log logrus.FieldLogger, cfg *config.Config, priv *rsa.PrivateKey) (issuer.Issuer, error) {
+func buildIssuer(
+	log logrus.FieldLogger, cfg *config.Config, priv *rsa.PrivateKey, grants *issuer.ServiceGrants,
+) (issuer.Issuer, error) {
 	rs256 := cfg.Signing.RS256
 
 	previous := make([]issuer.PreviousKey, 0, len(rs256.PreviousKeys))
@@ -259,6 +290,7 @@ func buildIssuer(log logrus.FieldLogger, cfg *config.Config, priv *rsa.PrivateKe
 		Issuer:          cfg.Issuer,
 		DefaultAudience: cfg.Audience,
 		Scope:           cfg.ScopePattern,
+		Grants:          grants,
 		TTL:             cfg.TokenTTL,
 	})
 	if err != nil {
@@ -269,6 +301,38 @@ func buildIssuer(log logrus.FieldLogger, cfg *config.Config, priv *rsa.PrivateKe
 		WithField("previous_keys", len(previous)).
 		Info("issuer ready")
 	return iss, nil
+}
+
+// buildGrants validates the grants section (nil when it is absent) and
+// reports at startup how the services claim is decided.
+func buildGrants(log logrus.FieldLogger, cfg *config.Config) (*issuer.ServiceGrants, error) {
+	var grants *issuer.ServiceGrants
+	if cfg.Grants != nil {
+		g, err := issuer.NewServiceGrants(*cfg.Grants, cfg.GrantProviders())
+		if err != nil {
+			return nil, err
+		}
+		grants = g
+	}
+	logServiceGrants(log, cfg, grants)
+	return grants, nil
+}
+
+// logServiceGrants reports at startup how the "services" claim of the
+// issued tokens is decided: the resolved groups when the grants section
+// is configured, or a warning when it is not although the instance
+// tells identities apart.
+func logServiceGrants(log logrus.FieldLogger, cfg *config.Config, grants *issuer.ServiceGrants) {
+	if grants == nil {
+		if cfg.ServicesUngated() {
+			log.WithField("providers", len(cfg.Providers)).
+				Warn("grants is not configured: every authenticated identity, from any provider and " +
+					"whatever its teams, receives tokens valid for every service")
+		}
+		return
+	}
+	log.WithField("groups", grants.Table()).
+		Info("service grants active: each token's services claim follows the groups its identity is a member of")
 }
 
 // loadOrGeneratePrivateKey loads the active RSA private key from disk. If

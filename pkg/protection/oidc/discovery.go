@@ -69,10 +69,66 @@ type idTokenClaims struct {
 	jwt.RegisteredClaims
 
 	Email         string   `json:"email,omitempty"`
-	EmailVerified bool     `json:"email_verified,omitempty"`
+	EmailVerified verified `json:"email_verified,omitempty"`
 	Name          string   `json:"name,omitempty"`
 	Groups        []string `json:"groups,omitempty"`
 	Nonce         string   `json:"nonce,omitempty"`
+}
+
+// idTokenClaimNames are the claims idTokenClaims reads, spelled as the
+// specifications spell them.
+var idTokenClaimNames = []string{
+	"iss", "sub", "aud", "exp", "nbf", "iat", "jti",
+	"email", "email_verified", "name", "groups", "nonce",
+}
+
+// UnmarshalJSON reads the claims by their exact names. encoding/json
+// on its own matches the keys of an object to struct fields without
+// regard to case, so "Email_Verified": true would verify an email and
+// "Sub" would be a subject — while team rules and grant members, which
+// read the same token as a map, take claim names exactly. A claim is
+// the one the specification names, or it is another claim.
+func (c *idTokenClaims) UnmarshalJSON(data []byte) error {
+	var all map[string]json.RawMessage
+	if err := json.Unmarshal(data, &all); err != nil {
+		return err
+	}
+	exact := make(map[string]json.RawMessage, len(idTokenClaimNames))
+	for _, name := range idTokenClaimNames {
+		if value, ok := all[name]; ok {
+			exact[name] = value
+		}
+	}
+	filtered, err := json.Marshal(exact)
+	if err != nil {
+		return err
+	}
+	// plain has the fields of idTokenClaims without this method.
+	type plain idTokenClaims
+	var out plain
+	if err := json.Unmarshal(filtered, &out); err != nil {
+		return err
+	}
+	*c = idTokenClaims(out)
+	return nil
+}
+
+// verified is the id_token's email_verified claim. OpenID Connect
+// defines it as a JSON boolean; some identity providers send the string
+// "true" instead. Both count as verified. Anything else — false, a
+// missing claim, another string, another type — does not, and never
+// makes the token unreadable.
+type verified bool
+
+// UnmarshalJSON accepts true and "true" as verified.
+func (v *verified) UnmarshalJSON(data []byte) error {
+	switch strings.TrimSpace(string(data)) {
+	case "true", `"true"`:
+		*v = true
+	default:
+		*v = false
+	}
+	return nil
 }
 
 // idTokenVerifier validates dex-issued id_tokens against the published

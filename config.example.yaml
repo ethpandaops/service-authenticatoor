@@ -88,6 +88,39 @@ authMode: cfaccess
 #
 # Session cookies are HMAC-signed with per-provider keys derived from the
 # JWT signing key — no separate session secret to manage.
+#
+# Teams: every type block takes `teams`, a static list put into the
+# token's "teams" claim for every identity that provider authenticates
+# (e.g. [panda] on a Cloudflare Access door only staff can pass), and
+# `teamRules`, which derive teams from the attributes the provider
+# verified about the user:
+#
+#   teamRules:
+#     - claim: groups           # attribute (dotted path for nested ones)
+#       prefix: "team:"         # value starts with it → the rest is the team
+#     - claim: groups
+#       map:                    # whole value → teams; * = any run of characters
+#         ethpandaops: [panda]
+#         "ethpandaops:*": [panda]
+#     - claim: department
+#       regex: "^eng-([a-z0-9-]+)$"   # RE2, one capture group = the team
+#     - claim: realm_access.roles
+#       value: true             # every value is itself a team
+#     - claim: scope
+#       split: " "              # split a string into several values first
+#       prefix: "team-"
+#     - claim: email
+#       map: { "alice@example.org": [lighthouse] }
+#
+# Attributes: oidc — every id_token claim; cloudflare — every Access
+# token claim plus `principal` (user | service); github — login, email,
+# orgs; basic / any — username. A rule sets exactly one of prefix / map /
+# regex / value; an unknown, empty or missing key is a startup error,
+# never "every value is a team". Names taken from a value must already be
+# lowercase [a-z0-9][a-z0-9._-]{0,62} — nothing is trimmed or lowercased.
+# A token carries the teams of the provider that authenticated the
+# request, never a union across providers. An invalid name or rule in the
+# config fails startup. See docs/config.md (Teams).
 providers:
   # Cloudflare Access: the edge authenticates and injects identity headers.
   # verifyJWT (default true) verifies the Cf-Access-Jwt-Assertion against
@@ -98,8 +131,12 @@ providers:
     type: cloudflare
     cloudflareAccess:
       teamDomain: "<team>.cloudflareaccess.com"
-      # Optional. When set, assertions whose aud doesn't match are rejected.
-      # When empty, signature + issuer still tie the assertion to the team.
+      # The AUD tag of this Access application. Optional. When set,
+      # assertions whose aud doesn't match are rejected. When empty,
+      # signature + issuer still tie the assertion to the Cloudflare team
+      # — but to ANY of its Access applications: the teams and grants of
+      # this provider then apply to everyone admitted to any of them, and
+      # the service says so in a startup warning.
       # audTag: ""
       # verifyJWT: true
       # allowServiceTokens: true
@@ -107,6 +144,14 @@ providers:
       # userHeader: "Cf-Access-Authenticated-User-Email"
       # sessionCookieName: "authenticatoor_cfaccess_session"
       # sessionTTL: "12h"   # CF policy re-checked only on cookie expiry
+      # Static teams for everyone (and every service token) passing this
+      # door. Read from the config on every request, so a change applies
+      # to existing sessions after a restart.
+      # teams: [door]
+      # Staff team for people only, not for service tokens:
+      # teamRules:
+      #   - claim: principal
+      #     map: { user: [panda] }
 
   # HTTP Basic auth backed by an htpasswd file. Self-contained. An
   # Authorization header on /auth/* authenticates directly; the login
@@ -119,6 +164,10 @@ providers:
   #     realm: "authenticatoor"
   #     # sessionCookieName: "authenticatoor_htpasswd_session"
   #     # sessionTTL: "12h"
+  #     # teams: [panda]        # static teams for every htpasswd user
+  #     # teamRules:            # attribute: username
+  #     #   - claim: username
+  #     #     map: { alice: [lighthouse] }
 
   # DEV ONLY: a form where the user picks any username.
   # - name: anyauth
@@ -126,6 +175,7 @@ providers:
   #   anyAuth:
   #     # cookieName: "authenticatoor_anyauth_user"
   #     # cookieTTL:  "12h"
+  #     # teams: [panda]        # static teams for ANY username — dev only
 
   # GitHub OAuth with org-membership gating. Register the OAuth app's
   # redirect URI as <issuer>/github/callback. Mount clientSecret from a
@@ -142,6 +192,16 @@ providers:
   #     # callbackPath: "/github/callback"
   #     # sessionCookieName: "authenticatoor_github_session"
   #     # stateCookieName: "authenticatoor_github_state"
+  #     # Static teams for every user of this provider.
+  #     # teams: [devnet]
+  #     # Teams by org membership (attributes: login, email, orgs). Uses
+  #     # the orgs already fetched for allowedOrgs; captured at login and
+  #     # kept until the session expires.
+  #     # teamRules:
+  #     #   - claim: orgs
+  #     #     map:
+  #     #       ethpandaops: [panda]
+  #     #       sigp: [lighthouse]
 
   # Standard OIDC against any IdP (designed against the central
   # ethpandaops dex + oidc-relay; see docs/config.md for the relay/state
@@ -165,6 +225,24 @@ providers:
   #     # sessionCookieName: "authenticatoor_oidc_session"
   #     # stateCookieName: "authenticatoor_oidc_state"
   #     # scopes: ["openid", "email", "groups"]
+  #     # The id_token's email counts only with email_verified: true.
+  #     # Without it the IdP's sub is the identity and there is no email
+  #     # (earlier versions used the email regardless). Leave the key out
+  #     # and the service warns about this at startup; false keeps the
+  #     # rule and silences the warning; true is only for an IdP that
+  #     # verifies emails but does not say so.
+  #     # trustUnverifiedEmail: false
+  #     # Static teams for every user of this provider.
+  #     # teams: [devnet]
+  #     # Teams from the id_token (any claim; nested ones by dotted path).
+  #     # Captured at login and kept until the session expires.
+  #     # teamRules:
+  #     #   - claim: groups
+  #     #     prefix: "team:"         # "team:lighthouse" → lighthouse
+  #     #   - claim: groups
+  #     #     map:                    # groups without the prefix
+  #     #       ethpandaops: [panda]
+  #     #       "ethpandaops:*": [panda]
 
 # Legacy form (deprecated): when `providers` is empty, authMode entries
 # name provider TYPES and the matching top-level blocks are converted
@@ -172,6 +250,82 @@ providers:
 # any→anyauth, github→github, oidc→oidc) — an old config with
 # `authMode: cloudflare` plus a top-level `cloudflareAccess:` block keeps
 # working unchanged. Prefer the providers list for new configs.
+
+# ─── service grants ───────────────────────────────────────────────────────────
+
+# Teams say who you are; grants say what you may use. `grants` is a list
+# of groups; an identity gets the union of the `services` of every group
+# it is a member of. When set, each token's "services" claim is computed
+# from it:
+#
+#   grants include `all`      → "+all"
+#   dora and spamoor          → "-all,+dora,+spamoor"
+#   in no group               → "-all"  (token still minted; tools that
+#                                        check their service refuse it)
+#
+# A member names the door and what the door vouched for:
+#
+#   <provider>/team:<team>          the team, as that provider resolves it
+#                                   (its `teams` and `teamRules`)
+#   <provider>/user:<id>            the token's sub or email at that provider;
+#                                   an id with an "@" matches only an email
+#                                   the provider verified, never a raw
+#                                   subject that looks like one
+#   <provider>/<attribute>:<value>  any attribute that provider verified,
+#                                   by the names teamRules use:
+#                                   oidc/groups:panda-access,
+#                                   github/orgs:ethpandaops,
+#                                   cfaccess/principal:user
+#
+# <provider> is a `name` from the providers list — always required: the
+# same team or id through another provider is somebody else. Matching is
+# exact (ASCII case-insensitive for ids and values); no wildcards — to
+# grant by a pattern, make it a team with a teamRules entry.
+#
+# Read from the config at every mint, so a change applies to existing
+# sessions after a restart (attribute members: at the user's next login
+# for oidc/github). Absent (the default): no per-identity constraint
+# — every authenticated identity gets tokens valid for every service,
+# and the service warns about that at startup when several providers or
+# any teams are configured. `grants: []` grants nothing to anyone.
+#
+# Only tools that verify with their own name as ExpectedService (spamoor,
+# assertoor; buildoor once its branch pk910/services-gate is merged)
+# enforce the claim; others accept any valid token.
+#
+# Features: naming a service grants BASIC access to it; a grant can add
+# named features of the tool on top. Positive forms only — "-svc" or
+# "svc:-f1" is a startup error (the grants of several groups are a union,
+# so a denial would depend on their order).
+#
+#   svc            basic access to svc
+#   svc:f1:f2      basic + features f1, f2    → "-all,+svc,+svc:f1:f2"
+#   svc:user*      basic + every feature whose name starts with "user"
+#                  (a trailing * only; a lone * is `all`)
+#   svc:all        basic + every feature      → "-all,+svc,+svc:all"
+#   all            basic access to every service             → "+all"
+#   all:f1         every service: basic + f1                 → "+all,+all:f1"
+#   all:all        everything, every feature                 → "+all,+all:all"
+#
+# The bare "+svc" is always emitted next to a feature directive, so tools
+# built before features existed keep reading basic access correctly.
+# A group with the bare service gets the tool's default-allow features and
+# none of its default-deny (privileged) ones; a single default-allow
+# feature cannot be taken away per group. Give the internal team all:all —
+# a bare `all` stops being enough once a tool requires a privileged
+# feature. See docs/config.md (Features).
+# grants:
+#   - name: staff
+#     members: ["cfaccess/team:panda", "oidc/team:ethpandaops"]
+#     services: ["all:all"]
+#   - name: internal-tooling
+#     members: ["oidc/groups:panda-access"]
+#     services: [assertoor]
+#   - name: client-devs
+#     members: ["oidc/team:lighthouse", "oidc/team:geth"]
+#     services: ["dora:admin", "spamoor:user*"]
+#   - members: ["oidc/user:alice@example.org"]
+#     services: ["dora:reindex"]
 
 # ─── signing keys ─────────────────────────────────────────────────────────────
 

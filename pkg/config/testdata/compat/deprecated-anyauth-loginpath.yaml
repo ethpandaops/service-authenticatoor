@@ -1,0 +1,10 @@
+# A key that v0.0.2 documented and read: anyAuth.loginPath.
+issuer: "https://auth.example.com"
+authMode: any
+anyAuth:
+  loginPath: "/auth/anyauth/login"
+  cookieName: "authenticatoor_anyauth_user"
+  cookieTTL: "12h"
+signing:
+  rs256:
+    privateKeyFile: "/etc/authenticatoor/keys/private.pem"

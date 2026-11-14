@@ -14,7 +14,8 @@ Behind the active protection provider (`/auth/*`):
 - `GET /auth/login?return_to=<url>` — issue a JWT and 302 to `return_to`
   with the token in the URL fragment. `return_to` host must match
   `allowedReturnHosts`.
-- `GET /auth/userinfo` — small introspection endpoint.
+- `GET /auth/userinfo` — small introspection endpoint (email, subject,
+  teams, audience, scope).
 - `GET /auth/embed?target_origin=…` — issues a JWT and posts it to the
   parent window via `postMessage`, restricted to the validated origin.
   This is the silent token-acquisition path (loaded via an invisible
@@ -148,6 +149,7 @@ in-flight promise simply becomes irrelevant once the page navigates.
   "email": "alice@example.com",
   "aud":   ["example.com"],
   "scope": "*.example.com",
+  "teams": ["lighthouse", "panda"],
   "iat":   1714492800,
   "nbf":   1714492800,
   "exp":   1714494600,
@@ -157,6 +159,151 @@ in-flight promise simply becomes irrelevant once the page navigates.
 
 Signed RS256, `kid` in the header. Verifiers must check `iss`, `aud`,
 `exp`, and the signature.
+
+### Teams
+
+**Teams say who you are; grants say what you may use.**
+
+`teams` lists the teams the user belongs to. It is an identity
+attribute: a resource server uses it to tell whose things are whose (a
+client team acting on its own nodes). authenticatoor does not manage
+memberships: the claim carries what the provider that authenticated the
+user knows. Each provider takes a static list (`teams: [panda]`) and
+`teamRules` that derive teams from the attributes it verified — the
+`team:<slug>` groups of the central IdP's id_token, an org list, an
+email address:
+
+```yaml
+oidc:
+  teamRules:
+    - claim: groups
+      prefix: "team:"       # "team:lighthouse" → lighthouse
+```
+
+Access does not hang on a team name. Which tools a user may use is
+decided by the `grants` section, whose members always name the provider
+they come through (`cfaccess/team:panda`, `oidc/team:lighthouse`,
+`oidc/groups:panda-access`, `oidc/user:alice@example.org`), and reaches
+a tool as the `services` claim below. In a resource server, use `teams`
+for ownership and features (`HasFeature`) for what a user may do; do
+not hang privileges on a team name.
+
+See [`docs/config.md`](docs/config.md#teams) for the attributes of each
+provider, the rule forms, and how sessions and config changes interact.
+
+The claim is an array of lowercase names (`[a-z0-9][a-z0-9._-]{0,62}`),
+de-duplicated, sorted, at most 32 entries. It is **omitted** when the
+user has no teams, and absent from tokens issued by older versions —
+treat a missing claim as "no teams", never as "all teams".
+
+A Go resource server reads it from the verified claims of
+[`pkg/auth`](pkg/auth):
+
+```go
+claims, err := verifier.Verify(token) // unchanged
+if err != nil { /* 401 */ }
+
+if claims.HasTeam("panda") {
+	// internal team: everything
+} else if claims.HasAnyTeam(node.OwnerTeams...) {
+	// a client team acting on its own node
+} else {
+	// 403
+}
+```
+
+`HasTeam` / `HasAnyTeam` normalize their argument and compare exactly
+(no prefixes, no wildcards); `claims.Teams` is the raw slice. Other
+languages read the `teams` array from the JWT payload after verifying
+the token. Verification itself does not look at the claim, so tokens
+without it verify exactly as before.
+
+### Services
+
+`services` is an allow/deny directive list (`+name` / `-name`, `all` for
+every service, later entries win) saying which tools the token may be
+used against — `"-all,+dora"` is a token for dora only. A
+resource server enforces it by naming itself to the verifier:
+
+```go
+verifier, err := auth.NewJWKSVerifier(ctx, auth.VerifierConfig{
+	// ...
+	ExpectedService: "dora",
+})
+```
+
+`Verify` then rejects tokens whose directive does not allow that
+service. Two properties matter:
+
+- A missing or empty claim means **no constraint** — such a token passes
+  every service check. That is what tokens look like unless the
+  [`grants`](docs/config.md#service-grants-grants) config section is
+  set.
+- The claim only binds resource servers that set `ExpectedService`
+  (spamoor and assertoor do; buildoor does once its branch
+  `pk910/services-gate` is merged). One that does not accepts any valid
+  token.
+
+With `grants` configured, authenticatoor computes the claim per user
+from the groups they are a member of — by team, by user id or by any
+attribute their provider verified, always together with that provider:
+`+all` for someone granted every service, `-all,+<service>…` for
+specific grants, and `-all` for a user in no group.
+
+### Checking features in a resource server
+
+A service directive grants basic access; features are extras on top.
+`+dora` is basic access to dora, `+dora:admin` adds its
+feature `admin`, `+dora:all` every feature, `+dora:user*` every
+feature whose name starts with `user`, and `-dora:admin` or
+`+dora:all:-admin` exclude one. (`basic` is the reserved name of
+basic access itself; `all` is reserved too.)
+
+Keep the service gate (`ExpectedService`) and add feature checks to it —
+never replace it. Each feature is checked in one of two modes:
+
+```go
+// Privileged: must be handed out deliberately. Needs +dora:admin or
+// +dora:all.
+if !claims.HasFeature("dora", "admin", auth.FeatureDefaultDeny) {
+	http.Error(w, "forbidden", http.StatusForbidden)
+	return
+}
+
+// Ordinary: comes with basic access unless it was excluded.
+if claims.HasFeature("dora", "view-logs", auth.FeatureDefaultAllow) {
+	// ...
+}
+
+// As middleware: 401 without claims, 403 when not allowed.
+mux.Handle("POST /api/admin/reindex", auth.RequireFeature(
+	"dora", "admin", auth.FeatureDefaultDeny, handleReindex))
+```
+
+| Basic access to the service | Feature  | `FeatureDefaultDeny` | `FeatureDefaultAllow` |
+| --------------------------- | -------- | -------------------- | --------------------- |
+| denied                      | any      | no                   | no                    |
+| allowed                     | unset    | no                   | yes                   |
+| allowed                     | granted  | yes                  | yes                   |
+| allowed                     | excluded | no                   | no                    |
+| *token without a `services` claim* | —  | **yes**              | **yes**               |
+
+A feature is never allowed without basic access. The last row is the
+one case where default-deny says yes without a grant: a token without
+the claim has no constraint, which is what an authenticatoor without
+`grants` mints. One with `grants` never does.
+
+Features name capabilities (`admin`), not endpoints. Because a grant can
+be a prefix (`user*`), feature names are namespaces: group them
+deliberately (`user-view`, `user-edit`). Introducing a
+default-deny feature takes it away from every group that only has the
+bare service — the internal team should be granted `all:all`. In
+`grants`, a grant names features as `svc:f1:f2`, `svc:all`,
+`all:f1` or `all:all`; the emitted claim always carries the bare
+directive too (`-all,+dora,+dora:admin`), so tools built
+against older versions of `pkg/auth` keep reading basic access
+correctly. Details:
+[`docs/config.md`](docs/config.md#features).
 
 ## Build
 
@@ -208,6 +355,43 @@ authMode: any
 
 See [`docs/config.md`](docs/config.md#protection-modes) for the full
 reference and the alternatives (`basic`, `github`).
+
+## Upgrading
+
+Configs written for earlier versions load unchanged — the single-string
+`authMode`, the top-level `userHeader` and the top-level provider blocks
+(`cloudflareAccess:`, `basicAuth:`, `anyAuth:`, `githubOAuth:`, `oidc:`)
+stay valid, and without the new settings (`teams`, `teamRules`,
+`grants`) the tokens carry the same claims as before. Three things to
+know:
+
+- **Everyone logs in again, once.** Session cookies of earlier versions
+  are not accepted. Invisible behind Cloudflare Access; a redirect
+  through the IdP for `oidc` and `github`.
+- **`oidc`: an email counts only when the id_token says
+  `email_verified: true`.** Otherwise the user's token has the IdP's
+  `sub` as its `sub` and no `email` — where earlier versions used the
+  email regardless. With an IdP that sends `false` or nothing, every
+  user's subject changes with the upgrade; with one that flips the flag
+  between logins, a user's subject alternates. Set
+  `oidc.trustUnverifiedEmail: true` to get the earlier behaviour (only
+  for an IdP that verifies addresses without saying so) or `false` to
+  keep the rule; until the key is set, the service warns at startup.
+- **Unknown keys are checked.** A misspelled key inside a provider
+  block, a top-level key within two edits of `grants`, and a map
+  written where a list belongs are startup errors that name the key.
+  Keys earlier versions knew and that are gone (`anyAuth.loginPath`,
+  `githubOAuth.sessionSecret`, `githubOAuth.sessionSecretFile`) are
+  ignored with a deprecation warning; other unknown top-level keys only
+  get a warning.
+
+Cloudflare Access needs no `audTag`: a provider without it keeps
+accepting the assertions of every Access application of the Cloudflare
+team, also when it gives teams or is named in `grants` — the service
+then says so in a startup warning. Set `audTag` to limit it to one
+application.
+
+Details: [`docs/config.md`](docs/config.md#upgrading).
 
 ## Dev quickstart
 

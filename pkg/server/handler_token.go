@@ -37,7 +37,7 @@ func (s *Server) handleToken(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	tok, claims, err := s.issuer.Issue(id.Subject, id.Email, requested)
+	tok, claims, err := s.issuer.IssueFor(tokenIdentity(id), requested)
 	if err != nil {
 		s.tokenIssueErrors.WithLabelValues("issue").Inc()
 		s.log.WithError(err).Error("issue token")

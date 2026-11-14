@@ -71,15 +71,30 @@ type Config struct {
 	// SessionTTL is the session cookie lifetime. Defaults to 12h.
 	SessionTTL time.Duration
 
+	// Teams are the static teams given to every identity this provider
+	// authenticates (normalized at New; invalid names fail Start).
+	Teams []string
+	// TeamRules derive further teams from the attributes this provider
+	// verified about the user (see the package documentation of each
+	// provider for its attributes).
+	TeamRules []protection.TeamRule
+	// GrantMembers are the attribute members the grants section names
+	// for this provider ("<provider>/<attribute>:<value>"). The provider
+	// reports which of them an identity satisfies.
+	GrantMembers []protection.AttributeMember
+
 	// Now overrides time.Now for deterministic tests.
 	Now func() time.Time
 }
 
 // Provider implements protection.Provider for HTTP Basic auth.
 type Provider struct {
-	cfg  Config
-	log  logrus.FieldLogger
-	file *htpasswd.File
+	cfg     Config
+	log     logrus.FieldLogger
+	file    *htpasswd.File
+	teams   protection.Teams
+	members protection.Members
+	door    session.Door
 }
 
 var (
@@ -106,8 +121,11 @@ func New(log logrus.FieldLogger, cfg Config) *Provider {
 		cfg.Now = time.Now
 	}
 	return &Provider{
-		cfg: cfg,
-		log: log.WithField("package", "protection/basic"),
+		cfg:     cfg,
+		log:     log.WithField("package", "protection/basic"),
+		teams:   protection.NewTeams(cfg.Teams, cfg.TeamRules),
+		members: protection.NewMembers(cfg.GrantMembers),
+		door:    session.NewDoor("basic"),
 	}
 }
 
@@ -123,6 +141,9 @@ func (p *Provider) Start(_ context.Context) error {
 	if len(p.cfg.SessionKey) < 16 {
 		return errors.New("basic: SessionKey must be at least 16 bytes")
 	}
+	if err := p.teams.Err(); err != nil {
+		return fmt.Errorf("basic: %w", err)
+	}
 	f, err := htpasswd.New(p.cfg.HtpasswdFile, htpasswd.DefaultSystems, func(err error) {
 		p.log.WithError(err).Warn("htpasswd: malformed line ignored")
 	})
@@ -130,7 +151,8 @@ func (p *Provider) Start(_ context.Context) error {
 		return fmt.Errorf("basic: load %s: %w", p.cfg.HtpasswdFile, err)
 	}
 	p.file = f
-	p.log.WithField("file", p.cfg.HtpasswdFile).Info("htpasswd loaded")
+	p.log.WithField("file", p.cfg.HtpasswdFile).WithField("teams", p.teams.Static()).
+		WithField("teamRules", p.teams.Rules()).Info("htpasswd loaded")
 	return nil
 }
 
@@ -173,27 +195,50 @@ func (p *Provider) Logout(w http.ResponseWriter, _ *http.Request) {
 // so silent (iframe) auth works as long as the user has logged in once.
 func (p *Provider) Authenticate(_ context.Context, r *http.Request) (protection.Outcome, error) {
 	if c, err := r.Cookie(p.cfg.SessionCookieName); err == nil {
-		sub, email, perr := session.Parse(p.cfg.SessionKey, c.Value, p.cfg.Now())
+		sess, perr := session.Parse(p.cfg.SessionKey, p.door, c.Value, p.cfg.Now())
 		if perr == nil {
-			return protection.Outcome{Identity: &protection.Identity{
-				Subject: sub,
-				Email:   email,
-			}}, nil
+			// The session never holds teams for this provider: the
+			// username is all there is to know, so the rules run on
+			// every request against the current config, and whatever a
+			// cookie carries in its teams field is not read.
+			return protection.Outcome{Identity: p.identity(sess.Subject)}, nil
 		}
 		p.log.WithError(perr).Debug("session cookie invalid; falling back to basic credentials")
 	}
 
 	if user, pass, ok := r.BasicAuth(); ok && user != "" && p.file.Match(user, pass) {
-		return protection.Outcome{Identity: &protection.Identity{
-			Subject: user,
-			Email:   user,
-		}}, nil
+		return protection.Outcome{Identity: p.identity(user)}, nil
 	}
 
 	return protection.Outcome{
 		Status:    http.StatusUnauthorized,
 		Challenge: basicChallenge(p.cfg.Realm),
 	}, nil
+}
+
+// attributes are what this provider knows about an authenticated user:
+//
+//	username   the htpasswd user name
+func attributes(username string) protection.Attributes {
+	return protection.Attributes{"username": username}
+}
+
+// identity builds the identity of an authenticated user. Teams and
+// grant-member matches are resolved from the username and the current
+// config on every request; nothing of the kind is read from a cookie.
+//
+// The username is both subject and email claim, as it always was. It
+// is a name from the operator's own password file: whatever it looks
+// like, the operator vouches for it, and a "user:" member of a grants
+// group names it as written.
+func (p *Provider) identity(user string) *protection.Identity {
+	attrs := attributes(user)
+	return &protection.Identity{
+		Subject: user,
+		Email:   user,
+		Teams:   p.teams.ForRequest(attrs),
+		Matches: p.members.ForRequest(attrs),
+	}
 }
 
 // handleLogin challenges for Basic credentials, converts a valid pair
@@ -213,7 +258,15 @@ func (p *Provider) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	signed, err := session.Sign(p.cfg.SessionKey, user, user, p.cfg.SessionTTL, p.cfg.Now())
+	// The session stores no teams: they are resolved from the username
+	// and the current config on every request.
+	signed, err := session.SignCookie(p.cfg.SessionCookieName, p.cfg.SessionKey, p.door,
+		session.Payload{Subject: user, Email: user}, p.cfg.SessionTTL, p.cfg.Now())
+	if errors.Is(err, session.ErrTooLarge) {
+		p.log.WithError(err).Warn("login refused: the session does not fit a cookie")
+		http.Error(w, protection.SessionTooLargeMessage, http.StatusForbidden)
+		return
+	}
 	if err != nil {
 		p.log.WithError(err).Error("session cookie signing failed")
 		http.Error(w, "session error", http.StatusInternalServerError)
