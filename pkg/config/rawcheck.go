@@ -330,6 +330,11 @@ func checkStructKeys(node *yaml.Node, t reflect.Type, where string, deprecations
 		child := where + "." + field.Tag.Get("mapstructure")
 		switch {
 		case field.Type.Kind() == reflect.Struct && field.Type != reflect.TypeOf(time.Time{}):
+			if field.Type == reflect.TypeOf(OIDCBearerConfig{}) {
+				if err := checkBearerBlock(value, child); err != nil {
+					return err
+				}
+			}
 			if err := checkStructKeys(value, field.Type, child, deprecations); err != nil {
 				return err
 			}
@@ -348,6 +353,32 @@ func checkStructKeys(node *yaml.Node, t reflect.Type, where string, deprecations
 					return err
 				}
 			}
+		}
+	}
+	return nil
+}
+
+// checkBearerBlock checks the shape of an oidc.bearer block. Written
+// down, the block is meant to switch bearer tokens on, so it has to
+// say whose: a block that is empty, or whose audiences are missing,
+// empty or not a list of non-empty strings, is refused instead of
+// being read as "off" — or, for a single string where the list
+// belongs, as a list of one.
+func checkBearerBlock(block *yaml.Node, where string) error {
+	if block == nil || isNull(block) {
+		return fmt.Errorf("%s: is empty; leave the key out or list the accepted audiences", where)
+	}
+	if block.Kind != yaml.MappingNode {
+		return nil // checkStructKeys says what it has to be
+	}
+	audiences := resolveNode(rawChild(block, "audiences"))
+	if audiences == nil || audiences.Kind != yaml.SequenceNode || len(audiences.Content) == 0 {
+		return fmt.Errorf("%s.audiences: must be a non-empty list of the client ids whose tokens are "+
+			"accepted, not %s", where, nodeKind(audiences))
+	}
+	for i, item := range audiences.Content {
+		if item = resolveNode(item); item == nil || item.Kind != yaml.ScalarNode || item.Value == "" {
+			return fmt.Errorf("%s.audiences[%d]: must be a non-empty string", where, i)
 		}
 	}
 	return nil

@@ -263,6 +263,8 @@ allow-list, CORS origins) or covered by sensible defaults.
 | `oidc.trustUnverifiedEmail`           | bool        | `false`                              | Use the id_token's `email` although the token does not say `email_verified: true`. Off by default: an unverified email is whatever its user typed. While the key is not set at all, the service logs a startup warning explaining the rule; `false` keeps the rule and silences it. See **Attributes** under Teams and **Upgrading**. |
 | `oidc.teams`                           | string list | `[]`                                 | Static teams put into the token's `teams` claim for every identity this provider authenticates. See **Teams** below. |
 | `oidc.teamRules`                      | list        | `[]`                                 | Rules that turn the attributes this provider verified about the user into teams. See **Teams** below. |
+| `oidc.bearer.audiences`                | string list | (block absent: off)                  | Switches bearer tokens for non-browser clients on: `GET /<name>/token` accepts `Authorization: Bearer <JWT>` for a JWT of the IdP whose `aud` names at least one of these client ids. Required and non-empty once the `bearer` block is there; never defaulted to `oidc.clientId`. See **Non-browser clients (bearer tokens)**. |
+| `oidc.bearer.issuerURL`                | string      | `oidc.issuerURL`                     | Issuer of the accepted tokens when it is not `oidc.issuerURL` (an IdP with one issuer per client, e.g. Authentik). Its discovery document and JWKS are fetched at startup, separately. |
 | `signing.mode`                         | string      | `rs256`                              | Only `rs256` is supported.                                            |
 | `signing.rs256.privateKeyFile`         | string      | (required)                           | PEM-encoded RSA-2048+ private key (PKCS#1 or PKCS#8).                 |
 | `signing.rs256.keyId`                  | string      | hash of public key                   | `kid` put in JWT header.                                              |
@@ -312,6 +314,7 @@ from the entry's (required) `name`:
 | `/<name>/login`    | all                | Login entry: authenticates, mints a signed session cookie, redirects back via `return_to`. |
 | `/<name>/callback` | `github`, `oidc`   | OAuth/OIDC callback.                                 |
 | `/<name>/token`    | `cloudflare`       | Machine token alias: `/auth/token` contract, authenticated purely from ambient CF headers (service tokens; never redirects). |
+| `/<name>/token`    | `oidc` with `oidc.bearer` | The same alias, authenticated from `Authorization: Bearer <JWT of the IdP>`; never redirects, sets no cookie. Not mounted without the `bearer` block. |
 | `/login`           | server             | Provider selector listing the `authMode` entries. Redirects straight to the login entry when only one provider is advertised. |
 
 When no provider authenticates a request, an instance advertising a
@@ -1297,6 +1300,101 @@ For Kubernetes, mount the client secret from a Kubernetes Secret. The
 inline `oidc.clientSecret` variant works for ad-hoc deployments via
 `AUTHENTICATOOR_OIDC_CLIENTSECRET=…`. The session HMAC key is derived
 from the JWT signing key — no separate session secret to configure.
+
+#### Non-browser clients (bearer tokens)
+
+A command-line tool cannot follow the browser login. With the
+`oidc.bearer` block, a client that already holds a JWT from the same
+IdP — obtained by its own device-code or loopback login — exchanges it
+for this service's token:
+
+```yaml
+providers:
+  - name: oidc
+    type: oidc
+    oidc:
+      issuerURL: "https://idp.example.org"
+      # … the browser client, as above …
+      bearer:
+        audiences: ["devnet-cli"]   # client ids whose tokens are accepted
+        # issuerURL: "https://idp.example.org/application/o/devnet-cli/"
+```
+
+```
+GET /<name>/token
+Authorization: Bearer <JWT of the IdP>
+```
+
+answers with the JSON of `/auth/token`. The block is off unless it is
+written down; written down, `audiences` must be a non-empty list of
+non-empty, distinct strings, and unknown keys are a startup error. The
+service logs one line per provider at startup naming the issuer and the
+audiences it accepts. [`docs/cli-clients.md`](cli-clients.md) is the
+contract for client authors.
+
+A presented token is accepted when all of this holds:
+
+- it is signed (RS256 — no `none`, no HMAC) by a key in the JWKS of the
+  bearer issuer's discovery document;
+- `iss` is exactly that issuer;
+- `aud` — a string or a list — names at least one configured audience.
+  `azp` is not looked at;
+- `exp` is there and in the future; `nbf`, when there, has passed;
+- `sub` is not empty;
+- the `Authorization` header is at most 16 KiB.
+
+There is no nonce to check and no session: nothing is stored, and no
+cookie is set. Without the header, or with a token that fails a check,
+the answer is `401` with a `WWW-Authenticate: Bearer` challenge — never
+a redirect to the login. A valid token of a user outside
+`oidc.allowedGroups` gets `403`.
+
+The identity then comes from the token's claims through the very
+function the login callback runs on the id_token: `allowedGroups`, the
+`email_verified` rule (`trustUnverifiedEmail`), the choice of subject,
+`teamRules` and the members of `grants`. The provider is the same
+instance, so `<name>/team:…`, `<name>/user:…` and attribute members
+apply to both paths alike. Two things follow:
+
+- **The claims have to be in the presented token.** No userinfo call is
+  made. Whatever `allowedGroups`, team rules and grants read — `email`,
+  `email_verified`, `groups`, … — must be in the JWT the client sends,
+  be it an id_token or a JWT access token. A token without `groups`
+  yields a user without groups.
+- **The subject equals the browser login's only if the IdP makes it
+  so**: the client has to use the same subject mode as the browser
+  client and its tokens have to mark the email verified the same way.
+  Otherwise the same person is two subjects, and `user:` grants match
+  one of them.
+
+`/auth/*` accepts the header as well, through the same check — as the
+`cloudflare` provider's ambient headers work there. A request that
+carries `Authorization: Bearer` is then judged by that token alone: a
+bad one is not rescued by a session cookie. Clients should use
+`/<name>/token`, which answers with a status under every configuration;
+on `/auth/*` an instance with several advertised providers redirects
+what it could not authenticate to `/login`.
+
+Security notes — read them before listing an audience:
+
+- **An audience is a trust decision about everyone who ever receives
+  that client's tokens.** Whoever gets hold of a token with an accepted
+  `aud` is that user here. Use a dedicated client whose tokens are sent
+  to authenticatoor instances and nowhere else. Never list the audience
+  of a client whose tokens are forwarded to other services: each of
+  them could then log in as its users. That is also why `oidc.clientId`
+  is not accepted unless you list it.
+- **Instances that accept the same audience can replay tokens against
+  each other.** A token one instance received is valid at every other
+  one until it expires. Keep the IdP's token lifetime short (minutes)
+  and let the client refresh.
+- **Service accounts count.** Anything at the IdP that can obtain a
+  token for that client — a service account, a client-credentials
+  grant — gets in, subject to `allowedGroups` and `grants` like a
+  person.
+- **Same subject, same rules.** See above: subject mode and verified
+  email behaviour of the client decide whether its user is the browser
+  user.
 
 ### Logout (`/auth/logout`)
 

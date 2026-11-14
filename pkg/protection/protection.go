@@ -143,6 +143,17 @@ type AmbientAuthenticator interface {
 	AuthenticateAmbient(ctx context.Context, r *http.Request) (Outcome, error)
 }
 
+// AmbientSwitch is implemented by an AmbientAuthenticator for which
+// authenticating from the request itself is a setting (the oidc
+// provider's bearer tokens). The server mounts the token alias of such
+// a provider only when AmbientEnabled reports true; a provider without
+// this method always gets it.
+type AmbientSwitch interface {
+	// AmbientEnabled reports whether the provider is configured to
+	// authenticate ambient credentials. It is called before Start.
+	AmbientEnabled() bool
+}
+
 // SessionClearer is implemented by providers that track their session in
 // a clearable cookie. The server's multi-provider logout collects and
 // clears every provider's session cookie in one response.

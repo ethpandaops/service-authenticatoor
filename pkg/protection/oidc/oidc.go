@@ -161,6 +161,10 @@ type Config struct {
 	// reports which of them an identity satisfies.
 	GrantMembers []protection.AttributeMember
 
+	// Bearer lets non-browser clients authenticate with a JWT of the
+	// IdP in an Authorization header (see bearer.go). Nil: off.
+	Bearer *BearerConfig
+
 	// HTTPClient is the http.Client used for discovery / token endpoint
 	// calls. Defaults to a 10s-timeout client.
 	HTTPClient *http.Client
@@ -177,6 +181,9 @@ type Provider struct {
 	httpClient    *http.Client
 	disco         *discovery
 	verifier      *idTokenVerifier
+	// bearer verifies the tokens of non-browser clients; nil unless
+	// Config.Bearer is set.
+	bearer        *idTokenVerifier
 	allowedGroups map[string]struct{}
 	teams         protection.Teams
 	members       protection.Members
@@ -186,8 +193,10 @@ type Provider struct {
 }
 
 var (
-	_ protection.Provider       = (*Provider)(nil)
-	_ protection.SessionClearer = (*Provider)(nil)
+	_ protection.Provider             = (*Provider)(nil)
+	_ protection.SessionClearer       = (*Provider)(nil)
+	_ protection.AmbientAuthenticator = (*Provider)(nil)
+	_ protection.AmbientSwitch        = (*Provider)(nil)
 )
 
 // New constructs a Provider. Defaults are filled in here; secret material,
@@ -268,11 +277,15 @@ func (p *Provider) Start(ctx context.Context) error {
 	}
 	p.disco = disco
 
-	verifier, err := newIDTokenVerifier(ctx, disco.JWKSURI, disco.Issuer, p.cfg.ClientID, p.cfg.Now)
+	verifier, err := newIDTokenVerifier(ctx, disco.JWKSURI, disco.Issuer, []string{p.cfg.ClientID}, p.cfg.Now)
 	if err != nil {
 		return err
 	}
 	p.verifier = verifier
+
+	if err := p.startBearer(ctx); err != nil {
+		return err
+	}
 
 	if p.cfg.TrustUnverifiedEmail {
 		p.log.Warn("trustUnverifiedEmail is on: emails are used as identity, in team rules and in grants " +
@@ -311,7 +324,17 @@ func (p *Provider) LoginURL(returnTo string) string {
 
 // Authenticate looks for a valid session cookie. When absent or stale the
 // outcome redirects to the login entry, which starts the OIDC flow.
-func (p *Provider) Authenticate(_ context.Context, r *http.Request) (protection.Outcome, error) {
+//
+// With Config.Bearer set, a request that carries an Authorization:
+// Bearer header is authenticated from that token alone, as on the
+// token alias (AuthenticateAmbient): a client that sends one is not a
+// browser, so a token that fails is answered with its status and never
+// with a redirect or the session cookie.
+func (p *Provider) Authenticate(ctx context.Context, r *http.Request) (protection.Outcome, error) {
+	if _, presented := bearerToken(r); p.bearer != nil && presented {
+		return p.AuthenticateAmbient(ctx, r)
+	}
+
 	if c, err := r.Cookie(p.cfg.SessionCookieName); err == nil {
 		sess, perr := session.Parse(p.sessionSecret, p.door, c.Value, p.cfg.Now())
 		if perr == nil {
@@ -472,6 +495,67 @@ func (p *Provider) handleCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	id, refusal := p.identify(claims, idToken)
+	if refusal != "" {
+		http.Error(w, refusal, http.StatusForbidden)
+		return
+	}
+	subject, email := id.subject, id.email
+	// Teams derived by the team rules from the id_token are captured now
+	// and travel in the session; the static teams are applied per
+	// request.
+	loginLog := p.log.WithField("sub", subject)
+	teams := p.teams.Capture(loginLog, id.attrs)
+	// The grant members the id_token satisfies are captured the same
+	// way: which members matched, not the claims.
+	matches := p.members.Capture(loginLog, id.attrs, teams)
+	p.log.WithFields(logrus.Fields{
+		"sub":   subject,
+		"teams": p.teams.With(teams),
+	}).Debug("oidc login resolved teams")
+
+	cookie, err := p.signSessionCookie(subject, email, teams, matches)
+	if errors.Is(err, session.ErrTooLarge) {
+		loginLog.WithError(err).Warn("login refused: the session does not fit a cookie")
+		http.Error(w, protection.SessionTooLargeMessage, http.StatusForbidden)
+		return
+	}
+	if err != nil {
+		p.log.WithError(err).Error("session cookie signing failed")
+		http.Error(w, "session error", http.StatusInternalServerError)
+		return
+	}
+	http.SetCookie(w, cookie)
+
+	if returnTo == "" || !strings.HasPrefix(returnTo, "/") {
+		returnTo = "/"
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	http.Redirect(w, r, returnTo, http.StatusFound)
+}
+
+// claimIdentity is what a verified token of the IdP says about its
+// user, after the rules of this provider were applied to it.
+type claimIdentity struct {
+	// subject is the verified email, or the IdP's "sub" without one.
+	subject string
+	// email is the verified email; empty without one.
+	email string
+	// attrs are the token's claims as team rules and grant members see
+	// them (without "email" when it is not verified).
+	attrs protection.Attributes
+}
+
+// identify turns the claims of a verified token into the identity of
+// its user. It is the one place that does so: the login callback runs
+// it on the id_token and the bearer path on the token a client
+// presented, so that the same user gets the same subject, teams and
+// grant members through both.
+//
+// It applies allowedGroups — refusal is then the message for the user
+// and the identity is not to be used — and the verified-email rule, and
+// picks the subject. token is the verified JWT the claims came from.
+func (p *Provider) identify(claims *idTokenClaims, token string) (id claimIdentity, refusal string) {
 	if !groupAllowed(claims.Groups, p.allowedGroups) {
 		p.log.WithFields(logrus.Fields{
 			"sub":           claims.Subject,
@@ -479,15 +563,14 @@ func (p *Provider) handleCallback(w http.ResponseWriter, r *http.Request) {
 			"groups":        strings.Join(claims.Groups, ", "),
 			"allowedGroups": strings.Join(p.cfg.AllowedGroups, ", "),
 		}).Warn("user not in any allowed group")
-		http.Error(w, fmt.Sprintf(
+		return claimIdentity{}, fmt.Sprintf(
 			"your account %q is not in any allowed group.\n"+
 				"  allowed: [%s]\n"+
 				"  your groups: [%s]",
 			claims.Email,
 			strings.Join(p.cfg.AllowedGroups, ", "),
 			strings.Join(claims.Groups, ", "),
-		), http.StatusForbidden)
-		return
+		)
 	}
 
 	// The email counts only when the IdP vouches for it. An unverified
@@ -516,47 +599,17 @@ func (p *Provider) handleCallback(w http.ResponseWriter, r *http.Request) {
 					"the token's sub as it is and matches no user: member of a grants group")
 		}
 	}
-	// Teams derived by the team rules from the id_token are captured now
-	// and travel in the session; the static teams are applied per
-	// request. The attributes are the claims of the id_token that was
-	// just verified — every claim, by its name ("groups", "email",
-	// "sub", nested ones by dotted path) — and nothing else: no
-	// userinfo call is made.
-	attrs, err := protection.TokenAttributes(idToken)
+	// The attributes are the claims of the token that was just verified
+	// — every claim, by its name ("groups", "email", "sub", nested ones
+	// by dotted path) — and nothing else: no userinfo call is made.
+	attrs, err := protection.TokenAttributes(token)
 	if err != nil {
 		p.log.WithError(err).Warn("id_token claims unreadable for team rules; none applied")
 	}
 	if email == "" {
 		delete(attrs, "email")
 	}
-	loginLog := p.log.WithField("sub", subject)
-	teams := p.teams.Capture(loginLog, attrs)
-	// The grant members the id_token satisfies are captured the same
-	// way: which members matched, not the claims.
-	matches := p.members.Capture(loginLog, attrs, teams)
-	p.log.WithFields(logrus.Fields{
-		"sub":   subject,
-		"teams": p.teams.With(teams),
-	}).Debug("oidc login resolved teams")
-
-	cookie, err := p.signSessionCookie(subject, email, teams, matches)
-	if errors.Is(err, session.ErrTooLarge) {
-		loginLog.WithError(err).Warn("login refused: the session does not fit a cookie")
-		http.Error(w, protection.SessionTooLargeMessage, http.StatusForbidden)
-		return
-	}
-	if err != nil {
-		p.log.WithError(err).Error("session cookie signing failed")
-		http.Error(w, "session error", http.StatusInternalServerError)
-		return
-	}
-	http.SetCookie(w, cookie)
-
-	if returnTo == "" || !strings.HasPrefix(returnTo, "/") {
-		returnTo = "/"
-	}
-	w.Header().Set("Cache-Control", "no-store")
-	http.Redirect(w, r, returnTo, http.StatusFound)
+	return claimIdentity{subject: subject, email: email, attrs: attrs}, ""
 }
 
 // signSessionCookie builds the HttpOnly session cookie for the

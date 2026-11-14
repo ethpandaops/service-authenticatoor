@@ -242,6 +242,13 @@ func buildProvider(
 			GrantMembers:      members,
 		}), nil
 	case config.AuthModeOIDC:
+		var bearer *oidc.BearerConfig
+		if pc.OIDC.Bearer.Enabled() {
+			bearer = &oidc.BearerConfig{
+				Audiences: pc.OIDC.Bearer.Audiences,
+				IssuerURL: pc.OIDC.Bearer.IssuerURL,
+			}
+		}
 		return oidc.New(log, oidc.Config{
 			IssuerURL:            pc.OIDC.IssuerURL,
 			CallbackURL:          pc.OIDC.CallbackURL,
@@ -261,6 +268,7 @@ func buildProvider(
 			Teams:                pc.OIDC.Teams,
 			TeamRules:            pc.OIDC.TeamRules,
 			GrantMembers:         members,
+			Bearer:               bearer,
 		}), nil
 	default:
 		return nil, fmt.Errorf("type %q not implemented", pc.Type)

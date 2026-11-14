@@ -330,6 +330,47 @@ type OIDCConfig struct {
 	// TeamRules derive further teams from the attributes the provider
 	// verified about the user; see protection.TeamRule and docs/config.md.
 	TeamRules []protection.TeamRule `yaml:"teamRules" mapstructure:"teamRules"`
+	// Bearer lets non-browser clients authenticate with a JWT of the
+	// IdP instead of a browser login. Off unless the block is there.
+	Bearer OIDCBearerConfig `yaml:"bearer" mapstructure:"bearer"`
+}
+
+// OIDCBearerConfig is the oidc.bearer block: GET /<name>/token accepts
+// "Authorization: Bearer <JWT>" for a JWT of the IdP and answers like
+// /auth/token. The feature is on when Audiences is set; a block
+// without audiences is a startup error.
+type OIDCBearerConfig struct {
+	// Audiences are the accepted "aud" values of a presented token —
+	// client ids at the IdP. A token must name at least one. Required,
+	// and never defaulted to oidc.clientId.
+	Audiences []string `yaml:"audiences" mapstructure:"audiences"`
+	// IssuerURL is the issuer of the accepted tokens when it differs
+	// from oidc.issuerURL (an IdP with one issuer per client, such as
+	// Authentik). Default: oidc.issuerURL.
+	IssuerURL string `yaml:"issuerURL" mapstructure:"issuerURL"`
+}
+
+// Enabled reports whether bearer tokens are accepted.
+func (c OIDCBearerConfig) Enabled() bool { return len(c.Audiences) > 0 }
+
+// validate checks the block. An issuer without audiences is a block
+// that was meant to switch the feature on and names nobody to accept.
+func (c OIDCBearerConfig) validate() error {
+	if c.IssuerURL != "" && len(c.Audiences) == 0 {
+		return errors.New("oidc.bearer.audiences is required when oidc.bearer is configured: list the " +
+			"client ids whose tokens are accepted")
+	}
+	seen := make(map[string]struct{}, len(c.Audiences))
+	for i, aud := range c.Audiences {
+		if strings.TrimSpace(aud) != aud || aud == "" {
+			return fmt.Errorf("oidc.bearer.audiences[%d]: %q is empty or has surrounding space", i, aud)
+		}
+		if _, dup := seen[aud]; dup {
+			return fmt.Errorf("oidc.bearer.audiences: %q is listed twice", aud)
+		}
+		seen[aud] = struct{}{}
+	}
+	return nil
 }
 
 // TrustsUnverifiedEmail reports the effective trustUnverifiedEmail
@@ -1006,6 +1047,9 @@ func (p *ProviderConfig) validate() error {
 		// oidc.allowedGroups is optional: empty means "trust the IdP's
 		// own gating" (e.g. dex's connector orgs allow-list). Set it
 		// to narrow further on a per-instance basis.
+		if err := p.OIDC.Bearer.validate(); err != nil {
+			return err
+		}
 	default:
 		return fmt.Errorf("type: unsupported value %q", p.Type)
 	}

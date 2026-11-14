@@ -1,7 +1,8 @@
 // Package oidctest provides a minimal in-process OpenID Connect identity
 // provider for tests: discovery document, JWKS, an authorize endpoint
 // that immediately redirects back with a code, and a token endpoint that
-// answers with a signed id_token for the configured user.
+// answers with a signed id_token for the configured user. Token and Sign
+// issue JWTs outside that flow.
 package oidctest
 
 import (
@@ -47,6 +48,7 @@ type IdP struct {
 
 	mu     sync.Mutex
 	user   User
+	noAlg  bool
 	nonces map[string]string // authorization code → nonce
 	seq    int
 }
@@ -77,6 +79,81 @@ func (i *IdP) SetUser(user User) {
 	i.mu.Lock()
 	defer i.mu.Unlock()
 	i.user = user
+}
+
+// Token returns a JWT for the current user as the IdP would hand it to
+// another client (audience) outside the browser flow — a CLI's device
+// or loopback login. It has no nonce.
+func (i *IdP) Token(t *testing.T, audience string) string {
+	t.Helper()
+	i.mu.Lock()
+	user := i.user
+	i.mu.Unlock()
+	return i.Sign(t, i.userClaims(user, audience))
+}
+
+// Claims returns the claims of Token, for a test to change before it
+// signs them with Sign.
+func (i *IdP) Claims(audience string) map[string]any {
+	i.mu.Lock()
+	user := i.user
+	i.mu.Unlock()
+	return i.userClaims(user, audience)
+}
+
+// Sign signs exactly these claims with the IdP's key (RS256).
+func (i *IdP) Sign(t *testing.T, claims map[string]any) string {
+	t.Helper()
+	signed, err := i.sign(claims)
+	if err != nil {
+		t.Fatalf("oidctest: sign: %v", err)
+	}
+	return signed
+}
+
+// Key returns the IdP's signing key, for tests that forge tokens.
+func (i *IdP) Key() *rsa.PrivateKey { return i.key }
+
+// OmitKeyAlg makes the JWKS leave out the key's "alg", as some IdPs
+// do. Call it before the relying party loads the keys.
+func (i *IdP) OmitKeyAlg() {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	i.noAlg = true
+}
+
+func (i *IdP) sign(claims jwt.MapClaims) (string, error) {
+	tok := jwt.NewWithClaims(jwt.SigningMethodRS256, claims)
+	tok.Header["kid"] = keyID
+	return tok.SignedString(i.key)
+}
+
+// userClaims are the claims the IdP asserts about user in a token for
+// audience.
+func (i *IdP) userClaims(user User, audience string) jwt.MapClaims {
+	now := time.Now()
+	claims := jwt.MapClaims{}
+	for name, value := range user.Claims {
+		claims[name] = value
+	}
+	claims["iss"] = i.URL
+	claims["aud"] = audience
+	claims["sub"] = user.Subject
+	claims["iat"] = now.Unix()
+	claims["exp"] = now.Add(5 * time.Minute).Unix()
+	if user.Email != "" {
+		claims["email"] = user.Email
+		switch value, set := user.Claims["email_verified"]; {
+		case !set:
+			claims["email_verified"] = true
+		case value == nil:
+			delete(claims, "email_verified")
+		}
+	}
+	if user.Groups != nil {
+		claims["groups"] = user.Groups
+	}
+	return claims
 }
 
 // Authorize plays the browser's visit to the authorize URL the relying
@@ -116,14 +193,20 @@ func (i *IdP) handleDiscovery(w http.ResponseWriter, _ *http.Request) {
 
 func (i *IdP) handleKeys(w http.ResponseWriter, _ *http.Request) {
 	pub := &i.key.PublicKey
-	writeJSON(w, map[string]any{"keys": []map[string]string{{
+	key := map[string]string{
 		"kty": "RSA",
 		"use": "sig",
 		"alg": "RS256",
 		"kid": keyID,
 		"n":   base64.RawURLEncoding.EncodeToString(pub.N.Bytes()),
 		"e":   base64.RawURLEncoding.EncodeToString(big.NewInt(int64(pub.E)).Bytes()),
-	}}})
+	}
+	i.mu.Lock()
+	if i.noAlg {
+		delete(key, "alg")
+	}
+	i.mu.Unlock()
+	writeJSON(w, map[string]any{"keys": []map[string]string{key}})
 }
 
 func (i *IdP) handleAuthorize(w http.ResponseWriter, r *http.Request) {
@@ -164,32 +247,9 @@ func (i *IdP) handleToken(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	now := time.Now()
-	claims := jwt.MapClaims{}
-	for name, value := range user.Claims {
-		claims[name] = value
-	}
-	claims["iss"] = i.URL
-	claims["aud"] = r.Form.Get("client_id")
-	claims["sub"] = user.Subject
+	claims := i.userClaims(user, r.Form.Get("client_id"))
 	claims["nonce"] = nonce
-	claims["iat"] = now.Unix()
-	claims["exp"] = now.Add(5 * time.Minute).Unix()
-	if user.Email != "" {
-		claims["email"] = user.Email
-		switch value, set := user.Claims["email_verified"]; {
-		case !set:
-			claims["email_verified"] = true
-		case value == nil:
-			delete(claims, "email_verified")
-		}
-	}
-	if user.Groups != nil {
-		claims["groups"] = user.Groups
-	}
-	tok := jwt.NewWithClaims(jwt.SigningMethodRS256, claims)
-	tok.Header["kid"] = keyID
-	signed, err := tok.SignedString(i.key)
+	signed, err := i.sign(claims)
 	if err != nil {
 		http.Error(w, "sign", http.StatusInternalServerError)
 		return

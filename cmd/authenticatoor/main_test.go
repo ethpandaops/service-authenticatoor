@@ -10,6 +10,7 @@ import (
 
 	"github.com/ethpandaops/service-authenticatoor/pkg/config"
 	"github.com/ethpandaops/service-authenticatoor/pkg/issuer"
+	"github.com/ethpandaops/service-authenticatoor/pkg/protection"
 )
 
 // TestLogServiceGrants covers the startup messages about the services
@@ -88,5 +89,33 @@ func TestLogServiceGrants(t *testing.T) {
 				t.Errorf("table:\n got %q\nwant %q", table, tc.wantTable)
 			}
 		})
+	}
+}
+
+// TestBuildProvider_OIDCBearer: the oidc.bearer block of the config
+// reaches the provider, and a config without it builds a provider that
+// asks for no token alias.
+func TestBuildProvider_OIDCBearer(t *testing.T) {
+	log, _ := test.NewNullLogger()
+	build := func(bearer config.OIDCBearerConfig) protection.AmbientSwitch {
+		t.Helper()
+		pc := &config.ProviderConfig{Name: "corp", Type: config.AuthModeOIDC, OIDC: config.OIDCConfig{
+			IssuerURL: "https://idp.example.org", ClientID: "authenticatoor", Bearer: bearer,
+		}}
+		prov, err := buildProvider(log, &config.Config{}, pc, make([]byte, 32), nil)
+		if err != nil {
+			t.Fatalf("build: %v", err)
+		}
+		sw, ok := prov.(protection.AmbientSwitch)
+		if !ok {
+			t.Fatal("the oidc provider does not say whether it takes ambient credentials")
+		}
+		return sw
+	}
+	if build(config.OIDCBearerConfig{}).AmbientEnabled() {
+		t.Error("bearer is on without the block")
+	}
+	if !build(config.OIDCBearerConfig{Audiences: []string{"devnet-cli"}}).AmbientEnabled() {
+		t.Error("bearer is off although audiences are configured")
 	}
 }

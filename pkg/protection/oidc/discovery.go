@@ -131,28 +131,34 @@ func (v *verified) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
-// idTokenVerifier validates dex-issued id_tokens against the published
-// JWKS, checks iss/aud/exp, and matches the embedded nonce against the
-// value the originating flow generated.
+// idTokenVerifier validates JWTs of one issuer against its published
+// JWKS and checks iss/aud/exp/sub. The callback uses one for the
+// id_token of the login flow (audience: the client id, plus the nonce
+// of the flow); the bearer path uses one for tokens a non-browser
+// client presents (audiences: Config.Bearer.Audiences, no nonce).
 type idTokenVerifier struct {
-	kf       keyfunc.Keyfunc
-	issuer   string
-	clientID string
-	now      func() time.Time
+	kf     keyfunc.Keyfunc
+	issuer string
+	// audiences are the accepted "aud" values: a token must name at
+	// least one of them. Never empty.
+	audiences []string
+	now       func() time.Time
 }
 
 // newIDTokenVerifier wires up a background-refreshing JWKS keyfunc against
 // the IdP's JWKS URI.
-func newIDTokenVerifier(ctx context.Context, jwksURI, issuer, clientID string, now func() time.Time) (*idTokenVerifier, error) {
+func newIDTokenVerifier(
+	ctx context.Context, jwksURI, issuer string, audiences []string, now func() time.Time,
+) (*idTokenVerifier, error) {
 	kf, err := keyfunc.NewDefaultCtx(ctx, []string{jwksURI})
 	if err != nil {
 		return nil, fmt.Errorf("oidc: jwks load %s: %w", jwksURI, err)
 	}
 	return &idTokenVerifier{
-		kf:       kf,
-		issuer:   issuer,
-		clientID: clientID,
-		now:      now,
+		kf:        kf,
+		issuer:    issuer,
+		audiences: audiences,
+		now:       now,
 	}, nil
 }
 
@@ -160,12 +166,34 @@ func newIDTokenVerifier(ctx context.Context, jwksURI, issuer, clientID string, n
 // nonce we sent in the authorize request; an empty value disables the
 // nonce check (callers should always pass the originating nonce).
 func (v *idTokenVerifier) verify(token, expectedNonce string) (*idTokenClaims, error) {
+	claims, err := v.parse(token)
+	if err != nil {
+		return nil, err
+	}
+	if expectedNonce != "" && claims.Nonce != expectedNonce {
+		return nil, errors.New("id_token nonce mismatch")
+	}
+	return claims, nil
+}
+
+// parse validates everything about a token that does not depend on a
+// login flow: the signature against the issuer's JWKS (RS256 only — no
+// "none", no HMAC), "iss" equal to the issuer, "aud" naming at least
+// one accepted audience (as a string or in a list; "azp" is not looked
+// at), "exp" present and in the future, "nbf" when present, and a
+// non-empty "sub".
+func (v *idTokenVerifier) parse(token string) (*idTokenClaims, error) {
+	if len(v.audiences) == 0 {
+		// Without an expected audience the parser would not check the
+		// claim at all.
+		return nil, errors.New("id_token verifier has no audience")
+	}
 	parser := jwt.NewParser(
 		jwt.WithValidMethods([]string{"RS256"}),
 		jwt.WithExpirationRequired(),
 		jwt.WithTimeFunc(v.now),
 		jwt.WithIssuer(v.issuer),
-		jwt.WithAudience(v.clientID),
+		jwt.WithAudience(v.audiences...),
 	)
 	claims := &idTokenClaims{}
 	tok, err := parser.ParseWithClaims(token, claims, v.kf.Keyfunc)
@@ -177,9 +205,6 @@ func (v *idTokenVerifier) verify(token, expectedNonce string) (*idTokenClaims, e
 	}
 	if claims.Subject == "" {
 		return nil, errors.New("id_token missing sub")
-	}
-	if expectedNonce != "" && claims.Nonce != expectedNonce {
-		return nil, errors.New("id_token nonce mismatch")
 	}
 	return claims, nil
 }

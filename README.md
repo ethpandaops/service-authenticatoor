@@ -459,6 +459,15 @@ so `/auth/*` itself needs no edge protection.
 See [`docs/config.md`](docs/config.md#protection-providers) for the
 per-provider config blocks and trade-offs.
 
+Command-line tools and other non-browser clients can get a token
+without a browser: an `oidc` provider with the `oidc.bearer` block
+(off by default) accepts a JWT the client already holds from the same
+IdP at `GET /<name>/token` and answers like `/auth/token`, with the
+identity, teams and grants of that user's browser login.
+[`docs/cli-clients.md`](docs/cli-clients.md) is the contract for client
+authors; the operator's side and its security notes are in
+[`docs/config.md`](docs/config.md#non-browser-clients-bearer-tokens).
+
 ## Repo layout
 
 ```

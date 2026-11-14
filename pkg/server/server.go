@@ -226,7 +226,12 @@ func (s *Server) routes() http.Handler {
 	// it can stay behind the edge protection when /auth/* is opened up,
 	// giving non-interactive clients (CF service tokens) an endpoint
 	// that never redirects.
+	// A provider for which that is a setting (oidc bearer tokens) gets
+	// the alias only when the setting is on.
 	for _, np := range s.providers {
+		if sw, ok := np.Provider.(protection.AmbientSwitch); ok && !sw.AmbientEnabled() {
+			continue
+		}
 		if amb, ok := np.Provider.(protection.AmbientAuthenticator); ok {
 			r.HandleFunc("/"+np.Name+"/token", s.ambientTokenHandler(np.Name, amb)).Methods(http.MethodGet)
 		}
@@ -363,8 +368,9 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 }
 
 // ambientTokenHandler adapts the /auth/token contract onto a provider's
-// ambient edge credentials. No cookies, no redirects: either the edge
-// injected a verifiable identity or the response is the outcome's status.
+// ambient credentials. No cookies, no redirects: either the request
+// carries a verifiable identity or the response is the outcome's status
+// (with the outcome's challenge headers, if it has any).
 func (s *Server) ambientTokenHandler(name string, amb protection.AmbientAuthenticator) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		out, err := amb.AuthenticateAmbient(r.Context(), r)
@@ -374,6 +380,11 @@ func (s *Server) ambientTokenHandler(name string, amb protection.AmbientAuthenti
 			return
 		}
 		if out.Identity == nil {
+			for k, vs := range out.Challenge {
+				for _, v := range vs {
+					w.Header().Add(k, v)
+				}
+			}
 			status := out.Status
 			if status == 0 {
 				status = http.StatusUnauthorized
