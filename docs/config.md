@@ -810,9 +810,11 @@ every authenticated identity receives tokens valid for every service.
 
 Two things to keep in mind:
 
-- **An empty or missing `services` claim means "no constraint".** That
-  is how verifiers have always read it, and it is what tokens look like
-  without `grants`. Once the section exists, the claim is never
+- **An empty or missing `services` claim means basic access to every
+  service, and nothing more.** Every service gate lets such a token
+  through — that is how verifiers have always read it — and it holds no
+  granted feature (see [Features](#features)). It is what tokens look
+  like without `grants`. Once the section exists, the claim is never
   empty: an identity with no grant gets an explicit `-all`.
 - **The gate binds only tools that check it.** A resource server
   enforces the claim when it sets its own name as
@@ -1020,20 +1022,24 @@ What the claim says about one feature is one of three things: nothing
 | allowed                     | unset    | no                   | yes                   |
 | allowed                     | granted  | yes                  | yes                   |
 | allowed                     | excluded | no                   | no                    |
-| *token without a `services` claim* | —  | **yes**              | **yes**               |
+| *token without a `services` claim* | *(unset)* | no              | yes                   |
 
 A feature is never allowed without basic access to its service, in
 either mode. `HasFeature(svc, "basic", …)` is the service gate itself:
 it always answers what `ServiceAllowed` / `ExpectedService` answer.
 
-**The last row is the one case where default-deny says yes without a
-grant.** A token without a `services` claim has no constraint; that has
-always been the meaning of an empty claim, and it is what an
-authenticatoor without `grants` mints. Such an instance gates
-nothing per user and has only its own operators behind it. An
-authenticatoor with `grants` never mints an empty claim (an
-identity with no grant gets `-all`), so configure `grants` on
-every instance that lets anyone but staff in.
+**Without a claim a token has basic access everywhere and no
+default-deny feature.** The last row is no special case: a token
+without a `services` claim is evaluated exactly as if the claim were
+`+all` — it passes every service gate, has the default-allow features
+and holds no grant, so a default-deny check refuses it. An empty claim
+is what an authenticatoor without `grants` mints. For operators that
+means: **an instance without `grants` hands out no default-deny
+feature to anyone**, its own staff included — configure `grants` to
+give them out (`all:all` for the internal team). An authenticatoor
+with `grants` never mints an empty claim (an identity with no grant
+gets `-all`), and `grants` is also what keeps anyone but staff out of
+a service.
 
 **Teams or features?** Use the `teams` claim for *ownership*-type
 decisions — whose nodes these are, which team's dashboard to show — and

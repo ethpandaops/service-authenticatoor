@@ -107,8 +107,9 @@ type Config struct {
 	Scope string
 	// Services is the default "services" claim — a comma-separated
 	// allow/deny directive list (see auth.ServiceAllowed). Empty means
-	// no constraint is encoded into the token, and downstream verifiers
-	// will accept it for any service. A blank value is treated as
+	// no constraint is encoded into the token: downstream verifiers
+	// will accept it for any service, with basic access and no granted
+	// feature. A blank value is treated as
 	// empty. When Grants is set, this is the upper bound on base access
 	// and must not name features (no ":").
 	Services string
@@ -148,7 +149,7 @@ func NewRS256Issuer(cfg Config) (*RS256Issuer, error) {
 
 	// A blank directive is no directive. Left as it is it would be
 	// minted as a non-empty claim (" ") that verifiers do not read as
-	// "no constraint".
+	// the absent claim.
 	cfg.Services = strings.TrimSpace(cfg.Services)
 	// With grants, Services is the upper bound on base access, and only
 	// that. A bound naming features has no consistent meaning: it would

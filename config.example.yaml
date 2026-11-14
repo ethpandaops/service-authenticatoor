@@ -285,7 +285,8 @@ providers:
 # Read from the config at every mint, so a change applies to existing
 # sessions after a restart (attribute members: at the user's next login
 # for oidc/github). Absent (the default): no per-identity constraint
-# — every authenticated identity gets tokens valid for every service,
+# — every authenticated identity gets tokens valid for every service
+# (basic access only: no default-deny feature of any tool),
 # and the service warns about that at startup when several providers or
 # any teams are configured. `grants: []` grants nothing to anyone.
 #

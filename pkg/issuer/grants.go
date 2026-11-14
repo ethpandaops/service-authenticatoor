@@ -502,7 +502,7 @@ func (s grantSet) addEntry(raw string) error {
 // says it, and old verifiers would not understand it. A service the
 // instance-wide directive denies gets no directive at all, hence no
 // features either. The result is never empty, because an
-// empty claim means "no constraint" to a verifier.
+// empty claim means basic access to every service to a verifier.
 func (g *ServiceGrants) Directive(id Identity, instanceWide string) string {
 	granted := make(grantSet, 4)
 	if id.Provider != "" {

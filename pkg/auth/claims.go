@@ -20,7 +20,7 @@ import (
 //     set of logical applications this token may be used against
 //     (e.g. "+all,-spamoor", "-all,+buildoor"), optionally naming
 //     features per service ("-all,+spamoor,+spamoor:plugins"). Empty ⇒
-//     no constraint. Evaluated by ServiceAllowed and FeatureAllowed /
+//     basic access to every service and no granted feature. Evaluated by ServiceAllowed and FeatureAllowed /
 //     HasFeature.
 //   - Teams lists the teams the user belongs to, as resolved by the
 //     provider that authenticated them (e.g. "panda", "lighthouse").

@@ -50,8 +50,9 @@ const FeatureBasic = "basic"
 //
 // Evaluation:
 //
-//   - An empty directive string allows every query, basic or feature:
-//     there is no constraint.
+//   - An empty directive string — a token without the claim — means
+//     basic access to every service and nothing more. For a feature it
+//     reads like "+all": nothing is said about any feature.
 //   - Directives apply left to right and a later verdict overrides an
 //     earlier one. Inside one directive the grant segments also apply
 //     left to right (":all:-x" is not ":-x:all").
@@ -166,16 +167,18 @@ const (
 // FeatureAllowed reports whether a feature of a service may be used
 // under the directive list. See ServiceAllowed for the grammar.
 //
-// NOTE — an EMPTY directive string allows every feature, in BOTH modes.
-// It is the one case in which FeatureDefaultDeny says yes without a
-// grant. An empty "services" claim has always meant "no constraint" in
-// this package: it is what an authenticatoor without service grants
-// (the grants config section) mints, an instance that gates nothing per
-// user and has only its own operators behind it. An authenticatoor with
-// grants never mints an empty claim.
+// NOTE — an EMPTY directive string is basic access to every service and
+// nothing more. A token without the claim passes every service gate,
+// and for a feature it is evaluated exactly like "+all": base access,
+// feature state unset — allowed under FeatureDefaultAllow, DENIED under
+// FeatureDefaultDeny. An empty "services" claim is what an
+// authenticatoor without service grants (the grants config section)
+// mints, so such an instance hands out no default-deny feature; grants
+// are how those are given. An authenticatoor with grants never mints an
+// empty claim.
 //
-// For any other directive list the walk is left to right, tracking for
-// the queried feature one of three states — unset, granted, excluded:
+// The walk over a directive list is left to right, tracking for the
+// queried feature one of three states — unset, granted, excluded:
 //
 //   - "+svc:feat" and "+svc:all" (and "+all:…" for every service) set
 //     granted;
@@ -200,7 +203,8 @@ const (
 //	allowed       unset      no                   yes
 //	allowed       granted    yes                  yes
 //	allowed       excluded   no                   no
-//	(empty directive string) yes                  yes
+//
+// A token without the claim is the row "allowed, unset".
 //
 // Read the modes this way: with FeatureDefaultAllow a feature follows
 // basic access unless it was excluded; with FeatureDefaultDeny it needs
@@ -209,23 +213,29 @@ const (
 //
 // Arguments: the feature "basic" (FeatureBasic), like an empty feature,
 // asks for the service itself and is equivalent to ServiceAllowed in
-// both modes. An empty service is allowed only under
-// the empty directive string — unlike ServiceAllowed, which lets an
-// empty service through, a feature check that cannot name its service
-// is refused. A feature that cannot be a feature name (the reserved
-// word "all", or one containing ":", ",", "*" or a leading sign) is
-// refused as well: wildcards exist in directives only, never in
+// both modes. An empty service is refused — unlike ServiceAllowed,
+// which lets an empty service through, a feature check that cannot name
+// its service is not answered with yes. The one exception is the service
+// gate under the empty directive string, which is open whatever is
+// asked ("basic" or an empty feature, any service). A feature that
+// cannot be a feature name (the reserved word "all", or one containing
+// ":", ",", "*" or a leading sign) is refused as well, under the empty
+// directive string too: wildcards exist in directives only, never in
 // queries.
 func FeatureAllowed(directives, service, feature string, def FeatureDefault) bool {
-	if directives == "" {
+	feature = strings.ToLower(strings.TrimSpace(feature))
+	basic := feature == "" || feature == FeatureBasic
+	if directives == "" && basic {
+		// The service gate of a token without the claim: always open.
+		// Any other feature takes the ordinary walk below, which over
+		// no directives ends at base access with the feature unset.
 		return true
 	}
 	service = strings.ToLower(strings.TrimSpace(service))
 	if service == "" {
 		return false
 	}
-	feature = strings.ToLower(strings.TrimSpace(feature))
-	if feature == "" || feature == FeatureBasic {
+	if basic {
 		return ServiceAllowed(directives, service)
 	}
 	if !queryName(service) || !queryName(feature) || feature == grantAll {
@@ -270,8 +280,9 @@ func FeatureAllowed(directives, service, feature string, def FeatureDefault) boo
 
 // HasFeature reports whether the token's "services" claim allows the
 // named feature of a service; see FeatureAllowed, in particular for the
-// meaning of a token without the claim (no constraint: allowed in both
-// modes).
+// meaning of a token without the claim (basic access to every service
+// and nothing more: a feature is allowed under FeatureDefaultAllow and
+// denied under FeatureDefaultDeny).
 func (c *Claims) HasFeature(service, feature string, def FeatureDefault) bool {
 	if c == nil {
 		return false

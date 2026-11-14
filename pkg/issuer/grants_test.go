@@ -201,7 +201,7 @@ func TestServiceGrants_Directive(t *testing.T) {
 				t.Errorf("directive: got %q, want %q", got, tc.want)
 			}
 			if got == "" {
-				t.Error("an empty directive means no constraint; it must never be emitted")
+				t.Error("an empty directive means basic access to every service; it must never be emitted")
 			}
 			allowed := strings.Fields(tc.allowed)
 			for _, service := range strings.Fields(probeServices) {

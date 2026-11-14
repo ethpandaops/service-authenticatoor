@@ -235,8 +235,9 @@ verifier, err := auth.NewJWKSVerifier(ctx, auth.VerifierConfig{
 `Verify` then rejects tokens whose directive does not allow that
 service. Two properties matter:
 
-- A missing or empty claim means **no constraint** — such a token passes
-  every service check. That is what tokens look like unless the
+- A missing or empty claim means **basic access to every service and
+  nothing more** — such a token passes every service check and holds no
+  granted feature (see below). That is what tokens look like unless the
   [`grants`](docs/config.md#service-grants-grants) config section is
   set.
 - The claim only binds resource servers that set `ExpectedService`
@@ -286,12 +287,13 @@ mux.Handle("POST /api/admin/reindex", auth.RequireFeature(
 | allowed                     | unset    | no                   | yes                   |
 | allowed                     | granted  | yes                  | yes                   |
 | allowed                     | excluded | no                   | no                    |
-| *token without a `services` claim* | —  | **yes**              | **yes**               |
+| *token without a `services` claim* | *(unset)* | no              | yes                   |
 
-A feature is never allowed without basic access. The last row is the
-one case where default-deny says yes without a grant: a token without
-the claim has no constraint, which is what an authenticatoor without
-`grants` mints. One with `grants` never does.
+A feature is never allowed without basic access. A token without the
+claim has basic access to every service and nothing more: it is the row
+"allowed / unset", exactly as if the claim were `+all`. That is what an
+authenticatoor without `grants` mints, so such an instance hands out no
+default-deny feature — configure `grants` to give them out.
 
 Features name capabilities (`admin`), not endpoints. Because a grant can
 be a prefix (`user*`), feature names are namespaces: group them

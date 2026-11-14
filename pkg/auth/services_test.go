@@ -310,7 +310,7 @@ func checkFeature(t *testing.T, directives, service, feature string, wantDeny, w
 
 // TestFeatureAllowed_TruthTable is the documented table, literally: base
 // access denied / allowed × feature unset / granted / excluded × both
-// modes, plus the empty-claim row.
+// modes. A token without the claim is the row "allowed, unset".
 func TestFeatureAllowed_TruthTable(t *testing.T) {
 	cases := []struct {
 		name       string
@@ -330,7 +330,7 @@ func TestFeatureAllowed_TruthTable(t *testing.T) {
 		{"base allowed, granted by all", "-all,+dora,+dora:all", true, true, true},
 		{"base allowed, excluded", "-all,+dora,-dora:roll", true, false, false},
 		{"base allowed, excluded inside a grant of all", "+dora:all:-roll", true, false, false},
-		{"empty claim: no constraint", "", true, true, true},
+		{"empty claim: base allowed, unset", "", true, false, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -356,13 +356,32 @@ func TestFeatureAllowed_Arguments(t *testing.T) {
 		wantDeny   bool
 		wantAllow  bool
 	}{
-		// The empty claim allows everything, whatever is asked.
-		{"empty claim", "", "spamoor", "plugins", true, true},
+		// The empty claim is basic access to every service and nothing
+		// more: the service gate is open, a feature reads as under "+all".
+		{"empty claim", "", "spamoor", "plugins", false, true},
 		{"empty claim, empty feature", "", "spamoor", "", true, true},
-		{"empty claim, empty service", "", "", "plugins", true, true},
-		{"empty claim, reserved feature name", "", "spamoor", "all", true, true},
+		{"empty claim, blank feature", "", "spamoor", "  ", true, true},
+		{"empty claim, empty service", "", "", "plugins", false, false},
+		{"empty claim, blank service", "", "   ", "plugins", false, false},
+		{"empty claim, empty service, basic", "", "", "basic", true, true},
+		{"empty claim, empty service and feature", "", "", "", true, true},
+		{"empty claim, reserved feature name", "", "spamoor", "all", false, false},
+		{"empty claim, wildcard feature", "", "spamoor", "user*", false, false},
+		{"empty claim, lone * as the feature", "", "spamoor", "*", false, false},
+		{"empty claim, signed feature", "", "spamoor", "-plugins", false, false},
+		{"empty claim, feature with a colon", "", "spamoor", "a:b", false, false},
+		{"empty claim, feature with a comma", "", "spamoor", "a,+all", false, false},
+		{"empty claim, service with a colon", "", "spamoor:plugins", "x", false, false},
+		{"empty claim, wildcard service", "", "spam*", "f1", false, false},
+		{"empty claim, service all", "", "all", "f1", false, true},
+		{"empty claim, case and whitespace", "", " SPAMOOR ", " Plugins ", false, true},
 
-		// Only the empty string is the empty claim.
+		// The same queries under "+all", which the empty claim reads like.
+		{"+all", "+all", "spamoor", "plugins", false, true},
+		{"+all, reserved feature name", "+all", "spamoor", "all", false, false},
+		{"+all, empty service", "+all", "", "plugins", false, false},
+
+		// A whitespace or garbage claim reads the same for a feature.
 		{"whitespace claim: base by default, nothing granted", " ", "spamoor", "plugins", false, true},
 		{"garbage claim: base by default, nothing granted", "nonsense", "spamoor", "plugins", false, true},
 
@@ -376,6 +395,7 @@ func TestFeatureAllowed_Arguments(t *testing.T) {
 		{"basic, service denied", "-all,+spamoor", "buildoor", "basic", false, false},
 		{"basic, service nothing mentions: allowed by default", "+spamoor,+buildoor", "other", "basic", true, true},
 		{"basic under the empty claim", "", "spamoor", "basic", true, true},
+		{"basic under the empty claim, spelled otherwise", "", "spamoor", " Basic ", true, true},
 
 		// An empty service is refused, although ServiceAllowed lets it through.
 		{"empty service, basic", "+all:all", "", "basic", false, false},
@@ -410,8 +430,83 @@ func TestFeatureAllowed_Arguments(t *testing.T) {
 	if none.HasFeature("spamoor", "plugins", auth.FeatureDefaultAllow) {
 		t.Error("nil claims must not allow anything")
 	}
-	if !(&auth.Claims{}).HasFeature("spamoor", "plugins", auth.FeatureDefaultDeny) {
-		t.Error("claims without a services claim have no constraint")
+	bare := &auth.Claims{}
+	if !bare.HasFeature("spamoor", auth.FeatureBasic, auth.FeatureDefaultDeny) {
+		t.Error("claims without a services claim have basic access to every service")
+	}
+	if !bare.HasFeature("spamoor", "plugins", auth.FeatureDefaultAllow) {
+		t.Error("claims without a services claim have the default-allow features")
+	}
+	if bare.HasFeature("spamoor", "plugins", auth.FeatureDefaultDeny) {
+		t.Error("claims without a services claim must not hold a default-deny feature")
+	}
+}
+
+// emptyClaimWant states the rule for a token without a services claim,
+// independently of the implementation: basic access to every service
+// and nothing more. The service gate ("basic" or an empty feature) is
+// open whatever is asked. Any other feature is allowed under
+// default-allow and denied under default-deny, and refused in both
+// modes when the service or the feature cannot be a query name.
+func emptyClaimWant(service, feature string) (wantDeny, wantAllow bool) {
+	name := func(s string) (string, bool) {
+		s = strings.ToLower(strings.TrimSpace(s))
+		for _, c := range []string{":", ",", "*"} {
+			if strings.Contains(s, c) {
+				return s, false
+			}
+		}
+		return s, s != "" && !strings.HasPrefix(s, "-") && !strings.HasPrefix(s, "+")
+	}
+	f, featureOK := name(feature)
+	if f == "" || f == "basic" {
+		return true, true
+	}
+	if _, serviceOK := name(service); !serviceOK || !featureOK || f == "all" {
+		return false, false
+	}
+	return false, true
+}
+
+// TestFeatureAllowed_EmptyClaimIsBasicAccessOnly runs every combination
+// of a set of services and features — ordinary, reserved, malformed,
+// in odd case and whitespace — against the empty directive string and
+// compares with the rule (emptyClaimWant). For every feature but the
+// service gate the answer must also be the one "+all" gives.
+func TestFeatureAllowed_EmptyClaimIsBasicAccessOnly(t *testing.T) {
+	services := []string{
+		"spamoor", "SPAMOOR", " spamoor ", "my-service", "other", "all", "basic", "x",
+		"", "   ", "*", "spam*", "spamoor:plugins", "a,b", "-spamoor", "+spamoor",
+	}
+	features := []string{
+		"plugins", "PLUGINS", " plugins ", "f1", "user-admin", "roll", "basics", "allx", "b",
+		"", "  ", "basic", " Basic ", "BASIC", "all", "ALL", " all ",
+		"*", "user*", "us*er", "a:b", "a,b", "a,+all", "-plugins", "+plugins", "-", "+", ":", ",",
+	}
+	plain, refused, gate := 0, 0, 0
+	for _, service := range services {
+		if !auth.ServiceAllowed("", service) {
+			t.Errorf("ServiceAllowed(\"\", %q) = false: the empty claim allows every service", service)
+		}
+		for _, feature := range features {
+			wantDeny, wantAllow := emptyClaimWant(service, feature)
+			checkFeature(t, "", service, feature, wantDeny, wantAllow)
+
+			switch {
+			case wantDeny:
+				gate++
+				continue // the service gate; "+all" refuses it for an empty service
+			case wantAllow:
+				plain++
+			default:
+				refused++
+			}
+			// The rule, said the other way: exactly as under "+all".
+			checkFeature(t, "+all", service, feature, wantDeny, wantAllow)
+		}
+	}
+	if plain == 0 || refused == 0 || gate == 0 {
+		t.Fatalf("the cases are one-sided: plain=%d refused=%d gate=%d", plain, refused, gate)
 	}
 }
 
@@ -464,11 +559,11 @@ func TestServiceAllowed_SameAsV003WithoutColons(t *testing.T) {
 
 	fragments := []string{
 		"+all", "-all", "+ALL", "-All", "+spamoor", "-spamoor", "+Spamoor", "-SPAMOOR",
-		"+buildoor", "-buildoor", "+dora", "-dora", "+up-gradoor", "-x",
+		"+buildoor", "-buildoor", "+dora", "-dora", "+my-service", "-x",
 		" +spamoor ", " - spamoor", "+ all", "-\tall", "", " ", "+", "-", "all", "spamoor",
 		"*", "+*", "-*", "++spamoor", "--all", "+-spamoor", "+spamoor+buildoor", "+spamoor buildoor",
 	}
-	services := []string{"spamoor", "SPAMOOR", " spamoor ", "buildoor", "dora", "up-gradoor", "other", "all", "x", "*", ""}
+	services := []string{"spamoor", "SPAMOOR", " spamoor ", "buildoor", "dora", "my-service", "other", "all", "x", "*", ""}
 
 	rng := rand.New(rand.NewSource(20261114))
 	for range 20000 {
@@ -495,7 +590,9 @@ func TestServiceAllowed_SameAsV003WithoutColons(t *testing.T) {
 // directive lists in the full grammar, the formula behind
 // FeatureAllowed: a feature is never allowed without base access to its
 // service in either mode, default-deny never allows what default-allow
-// refuses, and an empty feature is the base question.
+// refuses, and an empty feature is the base question. The empty claim
+// is one of the lists: it obeys the same formula, and default-deny
+// allows nothing under it.
 func TestFeatureAllowed_NeverWithoutBaseAccess(t *testing.T) {
 	fragments := []string{
 		"+all", "-all", "+spamoor", "-spamoor", "+buildoor", "-buildoor",
@@ -516,9 +613,6 @@ func TestFeatureAllowed_NeverWithoutBaseAccess(t *testing.T) {
 			parts = append(parts, fragments[rng.Intn(len(fragments))])
 		}
 		directives := strings.Join(parts, ",")
-		if directives == "" {
-			continue
-		}
 		for _, service := range []string{"spamoor", "buildoor", "other"} {
 			base := auth.ServiceAllowed(directives, service)
 			if got := auth.FeatureAllowed(directives, service, "", auth.FeatureDefaultDeny); got != base {
@@ -539,6 +633,12 @@ func TestFeatureAllowed_NeverWithoutBaseAccess(t *testing.T) {
 				if deny && !allow {
 					t.Errorf("%q: %s:%s allowed under default-deny but not under default-allow",
 						directives, service, feature)
+				}
+				if strings.Trim(directives, ",") == "" && (deny || !allow) {
+					// No directive at all — the empty claim, or only
+					// separators: basic access, the feature unset.
+					t.Errorf("%q: %s:%s deny=%t allow=%t, want basic access and nothing more",
+						directives, service, feature, deny, allow)
 				}
 				if deny {
 					allowedDeny++

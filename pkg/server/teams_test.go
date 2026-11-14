@@ -993,8 +993,9 @@ func TestGrants_Features_EndToEnd(t *testing.T) {
 }
 
 // TestGrants_Features_AbsentSection: without a grants section the
-// token has no services claim, which means no constraint — every
-// feature is allowed, in both modes.
+// token has no services claim, which means basic access to every
+// service and nothing more — the service gate passes, a default-allow
+// feature is allowed, a default-deny feature is not.
 func TestGrants_Features_AbsentSection(t *testing.T) {
 	h := newGrantsHarness(t, nil, "", newCloudflareProvider("cfaccess", "panda"))
 	req := tokenRequest()
@@ -1007,9 +1008,14 @@ func TestGrants_Features_AbsentSection(t *testing.T) {
 	if claims.Services != "" {
 		t.Fatalf("services claim: %q", claims.Services)
 	}
-	if !claims.HasFeature("dora", "roll", auth.FeatureDefaultDeny) ||
-		!claims.HasFeature("dora", "view-logs", auth.FeatureDefaultAllow) {
-		t.Error("a token without a services claim has no constraint")
+	if !claims.HasFeature("dora", auth.FeatureBasic, auth.FeatureDefaultDeny) {
+		t.Error("a token without a services claim has basic access to every service")
+	}
+	if !claims.HasFeature("dora", "view-logs", auth.FeatureDefaultAllow) {
+		t.Error("a token without a services claim has the default-allow features")
+	}
+	if claims.HasFeature("dora", "roll", auth.FeatureDefaultDeny) {
+		t.Error("a token without a services claim must not hold a default-deny feature")
 	}
 }
 

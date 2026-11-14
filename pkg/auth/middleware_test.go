@@ -147,7 +147,7 @@ func TestRequireFeature(t *testing.T) {
 		{"no claims", nil, http.StatusUnauthorized, http.StatusUnauthorized},
 		{"feature granted", &Claims{Services: "-all,+dora,+dora:roll"}, http.StatusOK, http.StatusOK},
 		{"every feature granted", &Claims{Services: "+all,+all:all"}, http.StatusOK, http.StatusOK},
-		{"no services claim: no constraint", &Claims{}, http.StatusOK, http.StatusOK},
+		{"no services claim: basic access only", &Claims{}, http.StatusForbidden, http.StatusOK},
 		{"base access only", &Claims{Services: "-all,+dora"}, http.StatusForbidden, http.StatusOK},
 		{"base access to everything only", &Claims{Services: "+all"}, http.StatusForbidden, http.StatusOK},
 		{"another feature granted", &Claims{Services: "-all,+dora,+dora:hold"}, http.StatusForbidden, http.StatusOK},
