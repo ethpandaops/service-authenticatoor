@@ -338,16 +338,18 @@ type OIDCConfig struct {
 
 // OIDCBearerConfig is the oidc.bearer block: GET /<name>/token accepts
 // "Authorization: Bearer <JWT>" for a JWT of the IdP and answers like
-// /auth/token. The feature is on when Audiences is set; a block
-// without audiences is a startup error.
+// /auth/token (the header is read there only, never on /auth/*). The
+// feature is on when Audiences is set; a block without audiences is a
+// startup error.
 type OIDCBearerConfig struct {
 	// Audiences are the accepted "aud" values of a presented token —
 	// client ids at the IdP. A token must name at least one. Required,
-	// and never defaulted to oidc.clientId.
+	// and never defaulted to oidc.clientId. In the config file each
+	// item has to be a YAML string.
 	Audiences []string `yaml:"audiences" mapstructure:"audiences"`
 	// IssuerURL is the issuer of the accepted tokens when it differs
-	// from oidc.issuerURL (an IdP with one issuer per client, such as
-	// Authentik). Default: oidc.issuerURL.
+	// from oidc.issuerURL (an IdP that gives each client its own
+	// issuer). An http or https URL. Default: oidc.issuerURL.
 	IssuerURL string `yaml:"issuerURL" mapstructure:"issuerURL"`
 }
 
@@ -356,10 +358,23 @@ func (c OIDCBearerConfig) Enabled() bool { return len(c.Audiences) > 0 }
 
 // validate checks the block. An issuer without audiences is a block
 // that was meant to switch the feature on and names nobody to accept.
+// The issuer has to be an absolute http(s) URL; which of the two is
+// the operator's choice, as for oidc.issuerURL.
 func (c OIDCBearerConfig) validate() error {
 	if c.IssuerURL != "" && len(c.Audiences) == 0 {
 		return errors.New("oidc.bearer.audiences is required when oidc.bearer is configured: list the " +
 			"client ids whose tokens are accepted")
+	}
+	if c.IssuerURL != "" {
+		u, err := url.Parse(c.IssuerURL)
+		switch {
+		case err != nil:
+			return fmt.Errorf("oidc.bearer.issuerURL: %q is not a URL: %w", c.IssuerURL, err)
+		case u.Scheme != "http" && u.Scheme != "https":
+			return fmt.Errorf("oidc.bearer.issuerURL: %q must be an http or https URL", c.IssuerURL)
+		case u.Host == "":
+			return fmt.Errorf("oidc.bearer.issuerURL: %q has no host", c.IssuerURL)
+		}
 	}
 	seen := make(map[string]struct{}, len(c.Audiences))
 	for i, aud := range c.Audiences {
@@ -550,9 +565,10 @@ func unusedBlockEnv(prefix string, environ []string) []string {
 }
 
 // checkedFeature names a part of the config that must not be loaded
-// from a file the strict checks cannot inspect: teams, team rules and
-// grants, wherever they are configured — in the file or through the
-// environment. It returns "" when the config has none of them.
+// from a file the strict checks cannot inspect: teams, team rules,
+// grants and the oidc bearer block, wherever they are configured — in
+// the file or through the environment. It returns "" when the config
+// has none of them.
 func (c *Config) checkedFeature(v *viper.Viper) string {
 	if v.IsSet(grantsKey) || v.IsSet(removedTeamServicesKey) {
 		return grantsKey
@@ -567,6 +583,11 @@ func (c *Config) checkedFeature(v *viper.Viper) string {
 	})
 	blocks = append(blocks, c.Providers...)
 	for i := range blocks {
+		// The bearer block decides whose tokens are a login: a
+		// misspelled or misplaced key in it must not go unnoticed.
+		if bearer := blocks[i].OIDC.Bearer; bearer.Enabled() || bearer.IssuerURL != "" {
+			return "oidc.bearer"
+		}
 		for _, block := range providerBlockKeys {
 			if len(blocks[i].teamsOf(block)) > 0 {
 				return block + ".teams"

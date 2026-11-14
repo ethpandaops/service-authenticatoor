@@ -361,7 +361,7 @@ func checkStructKeys(node *yaml.Node, t reflect.Type, where string, deprecations
 // checkBearerBlock checks the shape of an oidc.bearer block. Written
 // down, the block is meant to switch bearer tokens on, so it has to
 // say whose: a block that is empty, or whose audiences are missing,
-// empty or not a list of non-empty strings, is refused instead of
+// empty or not a list of non-empty YAML strings, is refused instead of
 // being read as "off" — or, for a single string where the list
 // belongs, as a list of one.
 func checkBearerBlock(block *yaml.Node, where string) error {
@@ -379,6 +379,13 @@ func checkBearerBlock(block *yaml.Node, where string) error {
 	for i, item := range audiences.Content {
 		if item = resolveNode(item); item == nil || item.Kind != yaml.ScalarNode || item.Value == "" {
 			return fmt.Errorf("%s.audiences[%d]: must be a non-empty string", where, i)
+		}
+		// 123 or true would be read as the texts "123" and "true". An
+		// audience is a name: one that looks like a number has to be
+		// written as a string.
+		if tag := item.ShortTag(); tag != "!!str" {
+			return fmt.Errorf("%s.audiences[%d]: must be a non-empty string, not %s (%s); quote it if "+
+				"that is the client id", where, i, strings.TrimPrefix(tag, "!!"), item.Value)
 		}
 	}
 	return nil

@@ -104,9 +104,9 @@ comes in through a merge is checked exactly like one written in place.
 **Other file formats.** The checks above read the file as YAML. A config
 file in another format that the loader understands (`.toml`, …) cannot
 be checked at all. Such a file is accepted with a startup warning as
-long as it configures no `teams`, no `teamRules` and no `grants` —
-neither in the file nor through the environment; as soon as it does,
-startup fails and asks for a YAML (or JSON) file.
+long as it configures no `teams`, no `teamRules`, no `grants` and no
+`oidc.bearer` block — neither in the file nor through the environment;
+as soon as it does, startup fails and asks for a YAML (or JSON) file.
 
 Names that are data keep their spelling: the members of a `grants`
 group and the keys of a team rule's `map` are taken exactly as written,
@@ -263,8 +263,8 @@ allow-list, CORS origins) or covered by sensible defaults.
 | `oidc.trustUnverifiedEmail`           | bool        | `false`                              | Use the id_token's `email` although the token does not say `email_verified: true`. Off by default: an unverified email is whatever its user typed. While the key is not set at all, the service logs a startup warning explaining the rule; `false` keeps the rule and silences it. See **Attributes** under Teams and **Upgrading**. |
 | `oidc.teams`                           | string list | `[]`                                 | Static teams put into the token's `teams` claim for every identity this provider authenticates. See **Teams** below. |
 | `oidc.teamRules`                      | list        | `[]`                                 | Rules that turn the attributes this provider verified about the user into teams. See **Teams** below. |
-| `oidc.bearer.audiences`                | string list | (block absent: off)                  | Switches bearer tokens for non-browser clients on: `GET /<name>/token` accepts `Authorization: Bearer <JWT>` for a JWT of the IdP whose `aud` names at least one of these client ids. Required and non-empty once the `bearer` block is there; never defaulted to `oidc.clientId`. See **Non-browser clients (bearer tokens)**. |
-| `oidc.bearer.issuerURL`                | string      | `oidc.issuerURL`                     | Issuer of the accepted tokens when it is not `oidc.issuerURL` (an IdP with one issuer per client, e.g. Authentik). Its discovery document and JWKS are fetched at startup, separately. |
+| `oidc.bearer.audiences`                | string list | (block absent: off)                  | Switches bearer tokens for non-browser clients on: `GET /<name>/token` accepts `Authorization: Bearer <JWT>` for a JWT of the IdP whose `aud` names at least one of these client ids. Required and non-empty once the `bearer` block is there; each item a YAML string (quote a client id that looks like a number); never defaulted to `oidc.clientId`. See **Non-browser clients (bearer tokens)**. |
+| `oidc.bearer.issuerURL`                | string      | `oidc.issuerURL`                     | Issuer of the accepted tokens when it is not `oidc.issuerURL` (an IdP that gives each client its own issuer). An `http` or `https` URL; anything else is a startup error. Its discovery document is fetched at startup, separately, and a failure there fails the start; its JWKS is loaded in the background (see **Startup** in that section). |
 | `signing.mode`                         | string      | `rs256`                              | Only `rs256` is supported.                                            |
 | `signing.rs256.privateKeyFile`         | string      | (required)                           | PEM-encoded RSA-2048+ private key (PKCS#1 or PKCS#8).                 |
 | `signing.rs256.keyId`                  | string      | hash of public key                   | `kid` put in JWT header.                                              |
@@ -314,7 +314,7 @@ from the entry's (required) `name`:
 | `/<name>/login`    | all                | Login entry: authenticates, mints a signed session cookie, redirects back via `return_to`. |
 | `/<name>/callback` | `github`, `oidc`   | OAuth/OIDC callback.                                 |
 | `/<name>/token`    | `cloudflare`       | Machine token alias: `/auth/token` contract, authenticated purely from ambient CF headers (service tokens; never redirects). |
-| `/<name>/token`    | `oidc` with `oidc.bearer` | The same alias, authenticated from `Authorization: Bearer <JWT of the IdP>`; never redirects, sets no cookie. Not mounted without the `bearer` block. |
+| `/<name>/token`    | `oidc` with `oidc.bearer` | The same alias, authenticated from `Authorization: Bearer <JWT of the IdP>`; never redirects, sets no cookie. `GET` only, no CORS headers. Not mounted without the `bearer` block. It is the only path where a bearer token is read. |
 | `/login`           | server             | Provider selector listing the `authMode` entries. Redirects straight to the login entry when only one provider is advertised. |
 
 When no provider authenticates a request, an instance advertising a
@@ -1373,7 +1373,7 @@ providers:
       # … the browser client, as above …
       bearer:
         audiences: ["devnet-cli"]   # client ids whose tokens are accepted
-        # issuerURL: "https://idp.example.org/application/o/devnet-cli/"
+        # issuerURL: "https://idp.example.org/cli"   # only if that client has its own issuer
 ```
 
 ```
@@ -1381,29 +1381,79 @@ GET /<name>/token
 Authorization: Bearer <JWT of the IdP>
 ```
 
-answers with the JSON of `/auth/token`. The block is off unless it is
-written down; written down, `audiences` must be a non-empty list of
-non-empty, distinct strings, and unknown keys are a startup error. The
-service logs one line per provider at startup naming the issuer and the
-audiences it accepts. [`docs/cli-clients.md`](cli-clients.md) is the
-contract for client authors.
+answers with the JSON of `/auth/token`. [`docs/cli-clients.md`](cli-clients.md)
+is the contract for client authors.
+
+**The block.** It is off unless it is written down. Written down,
+`audiences` must be a non-empty list of non-empty, distinct YAML
+strings — `[123, true]` is a startup error; quote a client id that
+looks like a number — and unknown keys are a startup error.
+`issuerURL`, when set, must be an `http` or `https` URL with a host
+(which of the two is your choice, as for `oidc.issuerURL`). The block
+is one of the settings that need a config file the strict checks can
+read: with a `.toml` file startup fails (see **Other file formats**).
+With the legacy top-level `oidc:` block the settings can also come from
+the environment — `AUTHENTICATOOR_OIDC_BEARER_AUDIENCES=devnet-cli`
+(comma-separated) **switches the feature on** without a line in the
+file, and `AUTHENTICATOOR_OIDC_BEARER_ISSUERURL` sets the issuer. With
+a `providers` list these variables have no effect (and are warned
+about).
+
+**Startup.** The service logs one line per provider naming the issuer
+and the audiences it accepts. If `issuerURL` is set and differs from
+`oidc.issuerURL`, its discovery document is fetched at startup, and a
+failure — unreachable, not the issuer it claims to be — fails the
+start, as for `oidc.issuerURL`. The signing keys (JWKS) are different:
+they are loaded in the background, and a JWKS that cannot be fetched at
+startup does **not** fail the start. Until the keys have loaded every
+token is refused with `401`; they are fetched again when a token names
+a key that is not known (at most once in five minutes) and every hour.
+The same holds for the keys of the browser login.
+
+If `audiences` contains the provider's own `oidc.clientId` (and the
+issuer is the same), the service logs a **warning** at startup: the
+id_tokens the IdP issues in the browser login of that client are then
+bearer credentials as well.
+
+**Where the token counts.** Only on `/<name>/token`, and only with
+`GET`: other methods get `405`. The endpoint sends no CORS headers and
+answers no preflight — it is not for JavaScript in a browser, which has
+`/auth/token`. On `/auth/*` an `Authorization: Bearer` header is not
+looked at, with or without this block: a request there is authenticated
+by its session cookie or sent to the login, exactly as on an instance
+without `bearer`.
 
 A presented token is accepted when all of this holds:
 
-- it is signed (RS256 — no `none`, no HMAC) by a key in the JWKS of the
-  bearer issuer's discovery document;
+- the `Authorization` header is at most 16 KiB — checked first, before
+  the token is parsed;
+- it is signed with RS256 by a key in the JWKS of the bearer issuer's
+  discovery document. Nothing else is accepted: no `none`, no HMAC
+  (HS256), no other RSA or EC algorithm;
 - `iss` is exactly that issuer;
-- `aud` — a string or a list — names at least one configured audience.
-  `azp` is not looked at;
-- `exp` is there and in the future; `nbf`, when there, has passed;
-- `sub` is not empty;
-- the `Authorization` header is at most 16 KiB.
+- `aud` — a string or a list — names at least one configured audience
+  (any one of them; a token need not name all). **`azp` is not looked
+  at**: a token that carries an accepted audience is accepted whoever
+  it was issued to;
+- `exp` is there and in the future; `nbf`, when there, has passed.
+  There is **no clock leeway**: a token is refused from the second it
+  expires by this server's clock, so clients should not present a token
+  in its last seconds;
+- `sub` is not empty.
 
 There is no nonce to check and no session: nothing is stored, and no
 cookie is set. Without the header, or with a token that fails a check,
 the answer is `401` with a `WWW-Authenticate: Bearer` challenge — never
 a redirect to the login. A valid token of a user outside
-`oidc.allowedGroups` gets `403`.
+`oidc.allowedGroups` gets `403`, and so does — on an instance with
+`grants` — a user no group names (see
+[An identity no group names](#an-identity-no-group-names)).
+
+Failed authentications are logged at debug level (the access log has
+the request and its status at info level); so is, on this path, what a
+browser login reports once per login about a user — an email that is
+not verified, a subject that looks like an address, a user outside
+`allowedGroups` — because a client would repeat it with every request.
 
 The identity then comes from the token's claims through the very
 function the login callback runs on the id_token: `allowedGroups`, the
@@ -1423,27 +1473,32 @@ apply to both paths alike. Two things follow:
   Otherwise the same person is two subjects, and `user:` grants match
   one of them.
 
-`/auth/*` accepts the header as well, through the same check — as the
-`cloudflare` provider's ambient headers work there. A request that
-carries `Authorization: Bearer` is then judged by that token alone: a
-bad one is not rescued by a session cookie. Clients should use
-`/<name>/token`, which answers with a status under every configuration;
-on `/auth/*` an instance with several advertised providers redirects
-what it could not authenticate to `/login`.
-
 Security notes — read them before listing an audience:
 
 - **An audience is a trust decision about everyone who ever receives
   that client's tokens.** Whoever gets hold of a token with an accepted
-  `aud` is that user here. Use a dedicated client whose tokens are sent
-  to authenticatoor instances and nowhere else. Never list the audience
+  `aud` is that user here — `azp` is ignored, so it does not matter
+  which client the token was issued to, only which audiences it
+  carries. Use a dedicated client whose tokens are sent to
+  authenticatoor instances and nowhere else. Never list the audience
   of a client whose tokens are forwarded to other services: each of
   them could then log in as its users. That is also why `oidc.clientId`
-  is not accepted unless you list it.
+  is not accepted unless you list it — and why listing it gets a
+  startup warning.
+- **There is no revocation.** The service keeps no list of tokens and
+  asks the IdP nothing per request. A captured IdP token can be turned
+  into devnet tokens until its own `exp`, whatever happens to the
+  user's account or session at the IdP in the meantime; each devnet
+  token it buys then lives for this instance's `tokenTTL`. The IdP
+  token's lifetime is the only bound: keep it at minutes.
+- **The client's refresh token is a long-lived credential.** A CLI that
+  keeps short-lived tokens fresh holds a refresh token that is good for
+  as long as the IdP allows. This service never sees it, and cannot
+  limit it: its lifetime, rotation and revocation are settings of the
+  IdP, and its storage is the client's job.
 - **Instances that accept the same audience can replay tokens against
   each other.** A token one instance received is valid at every other
-  one until it expires. Keep the IdP's token lifetime short (minutes)
-  and let the client refresh.
+  one until it expires.
 - **Service accounts count.** Anything at the IdP that can obtain a
   token for that client — a service account, a client-credentials
   grant — gets in, subject to `allowedGroups` and `grants` like a

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"slices"
 	"strings"
 
 	"github.com/sirupsen/logrus"
@@ -30,13 +31,16 @@ type BearerConfig struct {
 	Audiences []string
 	// IssuerURL is the issuer of the accepted tokens when it is not
 	// Config.IssuerURL (an IdP with one issuer per client). Its
-	// discovery document and JWKS are then loaded separately.
+	// discovery document is then fetched separately at Start (a
+	// failure fails Start) and its JWKS loaded separately (a failure
+	// does not; see newIDTokenVerifier).
 	IssuerURL string
 }
 
 // startBearer prepares the verifier of the bearer path. It reuses the
 // provider's JWKS when the tokens come from the same issuer and runs a
-// second discovery otherwise.
+// second discovery otherwise. It warns when the provider's own client
+// id is an accepted audience of its own issuer.
 func (p *Provider) startBearer(ctx context.Context) error {
 	cfg := p.cfg.Bearer
 	if cfg == nil {
@@ -59,6 +63,14 @@ func (p *Provider) startBearer(ctx context.Context) error {
 		}
 	}
 	p.bearer = verifier
+
+	if verifier.issuer == p.disco.Issuer && slices.Contains(cfg.Audiences, p.cfg.ClientID) {
+		p.log.WithField("clientID", p.cfg.ClientID).
+			Warn("oidc bearer audiences include this provider's own clientId: the id_tokens the IdP issues " +
+				"in the browser login of that client are then accepted as bearer credentials too, so " +
+				"whoever obtains one — anything the browser flow hands it to — can fetch tokens as its " +
+				"user until it expires. List a dedicated client instead")
+	}
 
 	p.log.WithFields(logrus.Fields{
 		"issuer":    verifier.issuer,
@@ -95,7 +107,12 @@ func bearerChallenge(challenge string) protection.Outcome {
 // AuthenticateAmbient authenticates a request from the JWT in its
 // Authorization: Bearer header and nothing else — no session cookie is
 // read or set, and the outcome never redirects. The server mounts the
-// token alias (/<name>/token) on top of it.
+// token alias (/<name>/token) on top of it; that alias is the only
+// place a bearer token is accepted (Authenticate, which serves /auth/*,
+// does not read the header).
+//
+// A header longer than maxBearerHeader is refused before its token is
+// looked at.
 //
 // The token must be signed by the bearer issuer (RS256), name that
 // issuer and one of the configured audiences, be unexpired and carry a
@@ -112,7 +129,9 @@ func (p *Provider) AuthenticateAmbient(_ context.Context, r *http.Request) (prot
 		return bearerChallenge("Bearer"), nil
 	}
 	fail := func(reason error) (protection.Outcome, error) {
-		p.log.WithError(reason).Warn("oidc bearer authentication failed")
+		// Debug: anyone can send a bad token, as often as they like.
+		// The access log has the request and its 401.
+		p.log.WithError(reason).Debug("oidc bearer authentication failed")
 		return bearerChallenge(`Bearer error="invalid_token"`), nil
 	}
 	if len(r.Header.Get("Authorization")) > maxBearerHeader {
@@ -123,9 +142,10 @@ func (p *Provider) AuthenticateAmbient(_ context.Context, r *http.Request) (prot
 		return fail(err)
 	}
 
-	id, refusal := p.identify(claims, token)
+	id, refusal := p.identify(claims, token, true)
 	if refusal != "" {
-		// Authenticated, but not let in: identify logged why.
+		// Authenticated, but not let in: identify logged why (at debug
+		// level, as everything it says on this path).
 		return protection.Outcome{Status: http.StatusForbidden}, nil
 	}
 	identity := &protection.Identity{

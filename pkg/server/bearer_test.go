@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/ethpandaops/service-authenticatoor/pkg/auth"
@@ -198,11 +199,32 @@ func TestBearer_Responses(t *testing.T) {
 	if rr := h.do(bearerGet("/oidc/token", idp.Token(t, cliAudience))); rr.Code != http.StatusOK {
 		t.Errorf("allowed user: status %d", rr.Code)
 	}
-	// Only GET, as for every token alias.
+	// Only GET, as for every token alias — and no CORS: the alias is
+	// not for scripts in a browser, so a preflight is a 405 like any
+	// other method, and no answer carries an Access-Control header.
+	for _, method := range []string{http.MethodPost, http.MethodPut, http.MethodDelete, http.MethodHead, http.MethodOptions} {
+		req := bearerGet("/oidc/token", idp.Token(t, cliAudience))
+		req.Method = method
+		req.Header.Set("Origin", "https://app.test.example")
+		req.Header.Set("Access-Control-Request-Method", http.MethodGet)
+		rr := h.do(req)
+		if rr.Code != http.StatusMethodNotAllowed {
+			t.Errorf("%s: status %d", method, rr.Code)
+		}
+		if strings.Contains(rr.Body.String(), "eyJ") {
+			t.Errorf("%s: the answer carries a token", method)
+		}
+	}
 	req := bearerGet("/oidc/token", idp.Token(t, cliAudience))
-	req.Method = http.MethodPost
-	if rr := h.do(req); rr.Code != http.StatusMethodNotAllowed {
-		t.Errorf("POST: status %d", rr.Code)
+	req.Header.Set("Origin", "https://app.test.example")
+	rr := h.do(req)
+	if rr.Code != http.StatusOK {
+		t.Errorf("GET with an Origin: status %d", rr.Code)
+	}
+	for name := range rr.Header() {
+		if strings.HasPrefix(name, "Access-Control-") {
+			t.Errorf("the alias sent %s: %s", name, rr.Header().Get(name))
+		}
 	}
 }
 
@@ -230,35 +252,80 @@ func TestBearer_Off(t *testing.T) {
 	}
 }
 
-// TestBearer_AuthToken: with the bearer block, /auth/token takes the
-// header too — the way the cloudflare provider's ambient headers work
-// on /auth/* — through the same check.
+// TestBearer_AuthToken: the bearer block changes nothing on /auth/*.
+// A request there that carries Authorization: Bearer is answered as if
+// the header were not there — by the session cookie, or with the
+// redirect to the login — whether the token is one the alias accepts
+// or not, and wherever the provider stands among several.
 func TestBearer_AuthToken(t *testing.T) {
 	idp := oidctest.New(t, oidctest.User{Subject: "u1", Email: "alice@example.org", Groups: []string{"team:panda"}})
-	h := newGrantsHarness(t, map[string][]string{"panda": {"dora"}}, "",
-		newOIDCProvider(idp, "oidc", oidc.Config{TeamRules: teamRules(prefixRule), Bearer: bearerOn()}))
+	oidcDoor := func(bearer *oidc.BearerConfig) NamedProvider {
+		return newOIDCProvider(idp, "oidc", oidc.Config{TeamRules: teamRules(prefixRule), Bearer: bearer})
+	}
+	grants := map[string][]string{"panda": {"dora"}}
 
-	rr := h.do(bearerGet("/auth/token", idp.Token(t, cliAudience)))
-	if rr.Code != http.StatusOK || len(rr.Result().Cookies()) != 0 {
-		t.Fatalf("/auth/token: status %d, cookies %v", rr.Code, rr.Result().Cookies())
+	orders := map[string]func(*testing.T, *oidc.BearerConfig) []NamedProvider{
+		"alone": func(_ *testing.T, b *oidc.BearerConfig) []NamedProvider { return []NamedProvider{oidcDoor(b)} },
+		"first of two": func(t *testing.T, b *oidc.BearerConfig) []NamedProvider {
+			return []NamedProvider{oidcDoor(b), newBasicProvider(t, "htpasswd")}
+		},
+		"second of two": func(t *testing.T, b *oidc.BearerConfig) []NamedProvider {
+			return []NamedProvider{newBasicProvider(t, "htpasswd"), oidcDoor(b)}
+		},
 	}
-	var resp tokenResponse
-	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
-		t.Fatalf("decode: %v", err)
+	tokens := map[string]string{
+		"a token the alias accepts": idp.Token(t, cliAudience),
+		"a token it refuses":        idp.Token(t, "authenticatoor"),
+		"garbage":                   "garbage",
 	}
-	if c := h.verify(resp.Token); c.Subject != "alice@example.org" || c.Services != "-all,+dora" {
-		t.Errorf("token: sub %q services %q", c.Subject, c.Services)
-	}
+	paths := []string{"/auth/token", "/auth/userinfo", "/auth/login?return_to=https%3A%2F%2Fapp.test.example%2F"}
 
-	rr = h.do(bearerGet("/auth/token", idp.Token(t, "authenticatoor")))
-	if rr.Code != http.StatusUnauthorized || rr.Header().Get("Location") != "" ||
-		rr.Header().Get("WWW-Authenticate") != `Bearer error="invalid_token"` {
-		t.Errorf("bad token: %d, location %q, challenge %q",
-			rr.Code, rr.Header().Get("Location"), rr.Header().Get("WWW-Authenticate"))
-	}
-	// A browser without the header still goes to the login.
-	if rr := h.do(tokenRequest()); rr.Code != http.StatusFound {
-		t.Errorf("no credentials: status %d", rr.Code)
+	for order, providers := range orders {
+		t.Run(order, func(t *testing.T) {
+			on := newGrantsHarness(t, grants, "", providers(t, bearerOn())...)
+			off := newGrantsHarness(t, grants, "", providers(t, nil)...)
+			session := on.oidcLogin(idp, "oidc")
+
+			for name, token := range tokens {
+				for _, path := range paths {
+					// Without a session: exactly what an instance without
+					// the bearer block answers, and what the same request
+					// gets without the header.
+					got, before := on.do(bearerGet(path, token)), off.do(bearerGet(path, token))
+					plain := on.do(httptest.NewRequest(http.MethodGet, path, nil))
+					for what, want := range map[string]*httptest.ResponseRecorder{"bearer off": before, "no header": plain} {
+						if got.Code != want.Code || got.Header().Get("Location") != want.Header().Get("Location") ||
+							got.Body.String() != want.Body.String() {
+							t.Errorf("%s, %s: %d → %q, but with %s: %d → %q", name, path,
+								got.Code, got.Header().Get("Location"), what, want.Code, want.Header().Get("Location"))
+						}
+					}
+					if got.Code != http.StatusFound || got.Header().Get("WWW-Authenticate") != "" {
+						t.Errorf("%s, %s: status %d, challenge %q; want the redirect to the login",
+							name, path, got.Code, got.Header().Get("WWW-Authenticate"))
+					}
+				}
+
+				// With a session the cookie decides, also next to a bad
+				// token.
+				rr := on.do(bearerGet("/auth/token", token), session)
+				if rr.Code != http.StatusOK {
+					t.Fatalf("%s next to a session: status %d", name, rr.Code)
+				}
+				var resp tokenResponse
+				if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+					t.Fatalf("decode: %v", err)
+				}
+				if c := on.verify(resp.Token); c.Subject != "alice@example.org" || c.Services != "-all,+dora" {
+					t.Errorf("%s next to a session: sub %q services %q", name, c.Subject, c.Services)
+				}
+			}
+
+			// The alias is where the token counts.
+			if rr := on.do(bearerGet("/oidc/token", tokens["a token the alias accepts"])); rr.Code != http.StatusOK {
+				t.Errorf("/oidc/token: status %d", rr.Code)
+			}
+		})
 	}
 }
 

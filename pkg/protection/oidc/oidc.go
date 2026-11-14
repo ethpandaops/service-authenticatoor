@@ -199,8 +199,9 @@ var (
 	_ protection.AmbientSwitch        = (*Provider)(nil)
 )
 
-// New constructs a Provider. Defaults are filled in here; secret material,
-// discovery fetch, and JWKS load happen in Start.
+// New constructs a Provider. Defaults are filled in here; secret material
+// and the discovery fetch happen in Start, which also starts the JWKS
+// load.
 func New(log logrus.FieldLogger, cfg Config) *Provider {
 	if cfg.LoginPath == "" {
 		cfg.LoginPath = DefaultLoginPath
@@ -242,7 +243,10 @@ func New(log logrus.FieldLogger, cfg Config) *Provider {
 func (p *Provider) Name() string { return "oidc" }
 
 // Start validates required fields, loads secret material, fetches the
-// IdP's discovery document, and primes the JWKS verifier.
+// IdP's discovery document, and sets up the JWKS verifier. A discovery
+// document that cannot be fetched fails Start; a JWKS that cannot does
+// not — the keys are loaded in the background, and until they are
+// there no token verifies (see newIDTokenVerifier).
 func (p *Provider) Start(ctx context.Context) error {
 	if p.cfg.IssuerURL == "" {
 		return errors.New("oidc: IssuerURL is required")
@@ -325,16 +329,12 @@ func (p *Provider) LoginURL(returnTo string) string {
 // Authenticate looks for a valid session cookie. When absent or stale the
 // outcome redirects to the login entry, which starts the OIDC flow.
 //
-// With Config.Bearer set, a request that carries an Authorization:
-// Bearer header is authenticated from that token alone, as on the
-// token alias (AuthenticateAmbient): a client that sends one is not a
-// browser, so a token that fails is answered with its status and never
-// with a redirect or the session cookie.
-func (p *Provider) Authenticate(ctx context.Context, r *http.Request) (protection.Outcome, error) {
-	if _, presented := bearerToken(r); p.bearer != nil && presented {
-		return p.AuthenticateAmbient(ctx, r)
-	}
-
+// An Authorization header is not looked at, with or without
+// Config.Bearer: bearer tokens are accepted on the token alias only
+// (AuthenticateAmbient). On /auth/* every provider gets a look at the
+// request and the first identity wins, so a header read here would be
+// judged or passed over depending on the order of the providers.
+func (p *Provider) Authenticate(_ context.Context, r *http.Request) (protection.Outcome, error) {
 	if c, err := r.Cookie(p.cfg.SessionCookieName); err == nil {
 		sess, perr := session.Parse(p.sessionSecret, p.door, c.Value, p.cfg.Now())
 		if perr == nil {
@@ -495,7 +495,7 @@ func (p *Provider) handleCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	id, refusal := p.identify(claims, idToken)
+	id, refusal := p.identify(claims, idToken, false)
 	if refusal != "" {
 		http.Error(w, refusal, http.StatusForbidden)
 		return
@@ -555,14 +555,30 @@ type claimIdentity struct {
 // It applies allowedGroups — refusal is then the message for the user
 // and the identity is not to be used — and the verified-email rule, and
 // picks the subject. token is the verified JWT the claims came from.
-func (p *Provider) identify(claims *idTokenClaims, token string) (id claimIdentity, refusal string) {
+//
+// perRequest says that the caller runs it on every request (the bearer
+// path) rather than once per login: what it has to say about the user —
+// not in an allowed group, email not verified, a subject that looks
+// like an email — is then logged at debug level instead of repeating
+// at its own level with every token a client fetches.
+func (p *Provider) identify(
+	claims *idTokenClaims, token string, perRequest bool,
+) (id claimIdentity, refusal string) {
+	// What a login reports once, a bearer client would repeat with
+	// every request.
+	at := func(level logrus.Level) logrus.Level {
+		if perRequest {
+			return logrus.DebugLevel
+		}
+		return level
+	}
 	if !groupAllowed(claims.Groups, p.allowedGroups) {
-		p.log.WithFields(logrus.Fields{
+		logAt(p.log.WithFields(logrus.Fields{
 			"sub":           claims.Subject,
 			"email":         claims.Email,
 			"groups":        strings.Join(claims.Groups, ", "),
 			"allowedGroups": strings.Join(p.cfg.AllowedGroups, ", "),
-		}).Warn("user not in any allowed group")
+		}), at(logrus.WarnLevel), "user not in any allowed group")
 		return claimIdentity{}, fmt.Sprintf(
 			"your account %q is not in any allowed group.\n"+
 				"  allowed: [%s]\n"+
@@ -579,8 +595,8 @@ func (p *Provider) identify(claims *idTokenClaims, token string) (id claimIdenti
 	// own "sub".
 	email := claims.Email
 	if email != "" && !bool(claims.EmailVerified) && !p.cfg.TrustUnverifiedEmail {
-		p.log.WithField("sub", claims.Subject).
-			Info("id_token email is not marked email_verified: the email is dropped and the user is " +
+		logAt(p.log.WithField("sub", claims.Subject), at(logrus.InfoLevel),
+			"id_token email is not marked email_verified: the email is dropped and the user is "+
 				"identified by the IdP subject (oidc.trustUnverifiedEmail is off)")
 		email = ""
 	}
@@ -594,8 +610,8 @@ func (p *Provider) identify(claims *idTokenClaims, token string) (id claimIdenti
 		// reads "sub" as an email would take this one for verified.
 		subject = claims.Subject
 		if strings.Contains(subject, "@") {
-			p.log.WithField("sub", subject).
-				Warn("the IdP subject looks like an email address but is not a verified email; it becomes " +
+			logAt(p.log.WithField("sub", subject), at(logrus.WarnLevel),
+				"the IdP subject looks like an email address but is not a verified email; it becomes "+
 					"the token's sub as it is and matches no user: member of a grants group")
 		}
 	}
@@ -610,6 +626,19 @@ func (p *Provider) identify(claims *idTokenClaims, token string) (id claimIdenti
 		delete(attrs, "email")
 	}
 	return claimIdentity{subject: subject, email: email, attrs: attrs}, ""
+}
+
+// logAt logs msg at the given level. logrus.FieldLogger has a method
+// per level and none that takes one.
+func logAt(log logrus.FieldLogger, level logrus.Level, msg string) {
+	switch level {
+	case logrus.DebugLevel:
+		log.Debug(msg)
+	case logrus.InfoLevel:
+		log.Info(msg)
+	default:
+		log.Warn(msg)
+	}
 }
 
 // signSessionCookie builds the HttpOnly session cookie for the

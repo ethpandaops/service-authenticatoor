@@ -237,12 +237,14 @@ providers:
   #     # /auth/token. Off unless the block is there. audiences lists
   #     # the IdP client ids whose tokens are accepted — a dedicated
   #     # client whose tokens go to authenticatoor instances only (never
-  #     # defaulted to clientId). issuerURL only when that client has
-  #     # another issuer than the one above. See docs/config.md,
-  #     # "Non-browser clients", and docs/cli-clients.md.
+  #     # defaulted to clientId; items are strings — quote one that
+  #     # looks like a number). issuerURL (http or https) only when
+  #     # that client has another issuer than the one above. The token
+  #     # is read on /<name>/token only, never on /auth/*. See
+  #     # docs/config.md, "Non-browser clients", and docs/cli-clients.md.
   #     # bearer:
   #     #   audiences: ["devnet-cli"]
-  #     #   # issuerURL: "https://idp.example.org/application/o/devnet-cli/"
+  #     #   # issuerURL: "https://idp.example.org/cli"
   #     # Static teams for every user of this provider.
   #     # teams: [devnet]
   #     # Teams from the id_token (any claim; nested ones by dotted path).

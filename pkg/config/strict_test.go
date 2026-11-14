@@ -279,8 +279,8 @@ privateKeyFile = "/etc/keys/private.pem"
 // file as YAML. A file in another format is loaded by viper all the
 // same; then none of the checks can run. Such a file is accepted — with
 // a warning — as long as it configures nothing those checks protect,
-// and refused as soon as teams, team rules or grants come into play,
-// from the file or from the environment.
+// and refused as soon as teams, team rules, grants or an oidc bearer
+// block come into play, from the file or from the environment.
 func TestLoad_FileThatCannotBeChecked(t *testing.T) {
 	t.Run("a plain TOML config loads with a warning", func(t *testing.T) {
 		cfg, err := Load(writeConfigFile(t, "config.toml", minimalTOML))
@@ -326,6 +326,25 @@ func TestLoad_FileThatCannotBeChecked(t *testing.T) {
 		{
 			"teams from the environment",
 			minimalTOML, [2]string{"AUTHENTICATOOR_ANYAUTH_TEAMS", "panda"}, "anyAuth.teams is configured",
+		},
+		{
+			"a bearer block in the file",
+			minimalTOML + "\n[oidc.bearer]\naudiences = [\"devnet-cli\"]\n", [2]string{}, "oidc.bearer is configured",
+		},
+		{
+			"a bearer block with an issuer only",
+			minimalTOML + "\n[oidc.bearer]\nissuerURL = \"https://idp.example.org/cli\"\n", [2]string{}, "oidc.bearer is configured",
+		},
+		{
+			"a bearer block in a providers entry",
+			"issuer = \"https://auth.demo.example.com\"\n[signing.rs256]\nprivateKeyFile = \"/k.pem\"\n" +
+				"[[providers]]\nname = \"corp\"\ntype = \"oidc\"\n[providers.oidc]\nissuerURL = \"https://idp.example.org\"\n" +
+				"[providers.oidc.bearer]\naudiences = [\"devnet-cli\"]\n",
+			[2]string{}, "oidc.bearer is configured",
+		},
+		{
+			"bearer audiences from the environment",
+			minimalTOML, [2]string{"AUTHENTICATOOR_OIDC_BEARER_AUDIENCES", "devnet-cli"}, "oidc.bearer is configured",
 		},
 	}
 	for _, tc := range refused {

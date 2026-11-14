@@ -147,6 +147,11 @@ type idTokenVerifier struct {
 
 // newIDTokenVerifier wires up a background-refreshing JWKS keyfunc against
 // the IdP's JWKS URI.
+//
+// A JWKS that cannot be fetched now is not an error: the keyfunc starts
+// without keys, refuses every token, and fetches again every hour and
+// when a token names a key it does not know (at most once in five
+// minutes).
 func newIDTokenVerifier(
 	ctx context.Context, jwksURI, issuer string, audiences []string, now func() time.Time,
 ) (*idTokenVerifier, error) {
