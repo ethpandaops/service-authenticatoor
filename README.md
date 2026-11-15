@@ -39,7 +39,10 @@ Public (no upstream auth — reachable by JWKS verifiers and browser JS):
   `window.ethpandaops.authenticatoor`. `client-v1.js` is the
   polling-style API (`{checkLogin, login, logout, getToken, isLoggedIn}`);
   `client-v2.js` is the shared-session, event-emitting API described
-  below. Auth service URL is templated in at serve time. Served minified
+  below. Both also tell a page what the logged-in user's token holds
+  (`getClaims`, `hasService`, `hasFeature`, `getTeams`; see
+  [Token details in the browser](#token-details-in-the-browser)).
+  Auth service URL is templated in at serve time. Served minified
   with an external source map at `/client-v{n}.js.map`; set
   `devMode: true` to serve the readable source instead. The legacy
   `/client.js` path keeps serving v1 for existing consumers.
@@ -62,7 +65,7 @@ Public (no upstream auth — reachable by JWKS verifiers and browser JS):
   // | "refreshing". Fired once with the current state right after
   // subscribing (asynchronously), so it can drive the whole auth UI.
   auth.addEventListener('status', (info) => {
-    // info = { status, authenticated, user, exp }
+    // info = { status, authenticated, user, exp, teams, services }
     if (info.authenticated) renderAuthedUI(info);
     else renderLoginButton();
   });
@@ -107,8 +110,8 @@ Local-dev pitfall: `localhost` is itself the effective TLD, so
 Either run everything on plain `localhost:<port>`s, or give every host a
 shared parent zone (`auth.dev.localhost` + `app.dev.localhost`).
 
-v1 remains available (and the default) for existing consumers; it is
-unchanged.
+v1 remains available (and the default) for existing consumers; its API
+is unchanged.
 
 ## Browser integration (v1)
 
@@ -147,6 +150,69 @@ unchanged.
 Render the unauthenticated UI immediately — never block on the promise.
 The user can click "Login" any time during the 30-second window; the
 in-flight promise simply becomes irrelevant once the page navigates.
+
+## Token details in the browser
+
+A tool's UI often needs to know what the logged-in user may do — to hide
+or disable a control, not to enforce anything. Both clients answer that
+from the token they hold, with the same evaluation of the `services`
+claim that `pkg/auth` does in Go (`ServiceAllowed`, `FeatureAllowed`), so
+no tool has to port the directive grammar:
+
+```js
+const auth = window.ethpandaops.authenticatoor;
+
+auth.addEventListener('status', (info) => {
+  // info.teams: string[], info.services: the raw "services" claim ('' when
+  // the token has none). Both empty while unauthenticated.
+  if (auth.hasFeature('spamoor', 'plugins')) showPluginUI();
+  else hidePluginUI();
+});
+```
+
+| Function | Returns |
+| -------- | ------- |
+| `getClaims()` | The decoded payload of the current token as an object, or `null` when unauthenticated (or when the token cannot be decoded). Treat it as read-only. |
+| `hasService(service)` | Whether the token allows the service at all — the service gate, `auth.ServiceAllowed` in Go. `false` when unauthenticated. |
+| `hasFeature(service, feature, opts?)` | Whether the token grants the feature — `auth.FeatureAllowed` in Go. Default-deny: the feature needs its own grant (`+svc:feat`, `+svc:fe*`, `+svc:all`). `opts = { defaultAllow: true }` switches to default-allow: the feature follows basic access unless it was excluded. `false` when unauthenticated. |
+| `getTeams()` | The token's `teams` as a fresh array of strings; empty when it has none or when unauthenticated. |
+| `serviceAllowed(directives, service)` | The service gate for a directive list given as a string (a `services` claim). Needs no session. |
+| `featureAllowed(directives, service, feature, defaultAllow)` | The feature check for a directive list given as a string. `defaultAllow` counts only when it is exactly `true`. Needs no session. |
+
+All of them are synchronous. In v2 they are about the token of the last
+`status` event, and the `TokenInfo` object passed to `status` listeners
+and resolved by `getStatus()` carries `teams` and `services` next to
+`status`, `authenticated`, `user` and `exp`. In v1 they are about the
+token `getToken()` returns at that moment, so call them after
+`checkLogin()` resolved with `authenticated: true`; before that they
+answer as if unauthenticated. The object `checkLogin()` resolves to is
+unchanged.
+
+What to know:
+
+- **This is UI convenience, not access control.** The browser decodes
+  the token's payload and does **not verify** its signature. The API of
+  each tool verifies the token and checks the service and the feature
+  itself (see
+  [Checking features in a resource server](#checking-features-in-a-resource-server));
+  that stays the enforcement.
+- A token without a `services` claim has basic access to every service
+  and no default-deny feature, exactly as in Go. A token whose `services`
+  claim is not a string — one the Go verifier refuses — has no service
+  and no feature; `TokenInfo.services` is `''` for it too, so ask
+  `hasService` / `hasFeature` rather than evaluating the field. A `teams`
+  claim that is not an array of strings counts as no teams.
+- Service and feature names are ASCII. A directive list or a name with
+  any other character is answered with `false`, and so is an argument
+  that is not a string — the browser never allows what the Go evaluator
+  would refuse.
+- **Older authenticatoor instances** serve a client without these
+  functions. Detect that and treat it as "no features":
+
+  ```js
+  const canUsePlugins = typeof auth.hasFeature === 'function' &&
+    auth.hasFeature('spamoor', 'plugins');
+  ```
 
 ## Token format
 
@@ -446,6 +512,14 @@ curl http://127.0.0.1:18080/.well-known/openid-configuration
 go test ./...
 ```
 
+The browser clients' evaluation of the `services` claim is tested against
+the Go one: `pkg/server/client_claims_test.go` runs the served scripts in
+a JavaScript interpreter ([goja](https://github.com/dop251/goja), a
+test-only dependency) and compares their answers with
+`auth.ServiceAllowed` / `auth.FeatureAllowed` over the tables of
+`pkg/auth`'s tests (`internal/directivecases`) and over generated
+directive lists.
+
 ## Protection providers
 
 Providers decide who is allowed to mint tokens. The `providers` list
@@ -490,7 +564,8 @@ pkg/cors/             CORS middleware with strict allow-list
 pkg/cfaccess/         Cf-Access-Jwt-Assertion verification
 pkg/config/           YAML + env config loader, derivation, validation
 pkg/protection/       Provider interface; sub-packages cloudflare/basic/anyauth/github/oidc
-pkg/server/           HTTP server: routes, handlers, lifecycle
+pkg/server/           HTTP server: routes, handlers, lifecycle; static/ holds the browser clients
+internal/directivecases/  test tables for the services claim, shared by the Go and the browser evaluator's tests
 Dockerfile            multi-stage source build
 Dockerfile-stub       packages a pre-built binary into a distroless image (used by CI)
 config.example.yaml   annotated example config

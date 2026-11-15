@@ -18,6 +18,38 @@ import (
 //go:embed static/authenticatoor-*.js
 var authenticatoorFS embed.FS
 
+// The token-claims code (decoding a token, evaluating its "services"
+// claim) is one file, shared by every client library version: a library
+// marks the place where it wants it with claimsIncludeMarker and
+// clientSource puts the file's text there. The file is not served on its
+// own.
+const (
+	claimsIncludeFile   = "static/authenticatoor-claims.js"
+	claimsIncludeMarker = "/*__AUTHENTICATOOR_CLAIMS__*/"
+)
+
+// clientSource returns an embedded client script with the shared
+// token-claims code included where the script asks for it. A script
+// without the marker (the frame script) is returned as it is.
+func clientSource(name string) (string, error) {
+	raw, err := authenticatoorFS.ReadFile(name)
+	if err != nil {
+		return "", fmt.Errorf("read %s: %w", name, err)
+	}
+
+	src := string(raw)
+	if !strings.Contains(src, claimsIncludeMarker) {
+		return src, nil
+	}
+
+	claims, err := authenticatoorFS.ReadFile(claimsIncludeFile)
+	if err != nil {
+		return "", fmt.Errorf("read %s: %w", claimsIncludeFile, err)
+	}
+
+	return strings.ReplaceAll(src, claimsIncludeMarker, string(claims)), nil
+}
+
 // builtClientAsset is a client script prepared for serving: the
 // __AUTH_SERVICE_URL__ placeholder templated in, and — outside dev
 // mode — minified, with an optional external source map.
@@ -27,6 +59,8 @@ type builtClientAsset struct {
 }
 
 // clientAsset returns the serving form of an embedded client script.
+// The shared token-claims code is included first (see clientSource), so
+// it is templated, minified and source-mapped as part of the script.
 // Templating runs BEFORE minification so generated source maps line up
 // with the served bytes. Outside dev mode the script is minified
 // (comments stripped, whitespace collapsed, local identifiers mangled —
@@ -53,11 +87,11 @@ func (s *Server) clientAsset(name, sourceURL string) (*builtClientAsset, error) 
 		return cached, nil
 	}
 
-	raw, err := authenticatoorFS.ReadFile(name)
+	src, err := clientSource(name)
 	if err != nil {
 		return nil, err
 	}
-	src := strings.ReplaceAll(string(raw), "__AUTH_SERVICE_URL__", strings.TrimRight(s.cfg.ExternalURL, "/"))
+	src = strings.ReplaceAll(src, "__AUTH_SERVICE_URL__", strings.TrimRight(s.cfg.ExternalURL, "/"))
 
 	asset := &builtClientAsset{code: []byte(src)}
 	if !s.cfg.DevMode {
@@ -141,7 +175,9 @@ func (s *Server) serveClientJS(w http.ResponseWriter, r *http.Request, version s
 // {checkLogin, login, logout, getToken, isLoggedIn, authServiceURL}; v2
 // exposes the shared-session, event-emitting API
 // {addEventListener, removeEventListener, getStatus, getToken, login,
-// logout, authServiceURL} backed by the /clientFrame hidden iframe.
+// logout, authServiceURL} backed by the /clientFrame hidden iframe. Both
+// carry the token-claims functions {getClaims, hasService, hasFeature,
+// getTeams, serviceAllowed, featureAllowed}.
 //
 // Hosted under the public path (outside /auth/*) so it can be loaded
 // without authenticating to the upstream proxy.

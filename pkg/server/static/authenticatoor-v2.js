@@ -7,7 +7,13 @@
 //     "status" fires whenever the session state changes. cb receives a
 //     TokenInfo object:
 //       { status: 'unauthenticated'|'authenticated'|'refreshing',
-//         authenticated: boolean, user: string, exp: number }
+//         authenticated: boolean, user: string, exp: number,
+//         teams: string[], services: string }
+//     teams and services are the token's claims of that name: teams is
+//     empty when the token has none, services is the raw directive list
+//     and '' when the token has none (or when the claim is not a string
+//     — then hasService/hasFeature answer false; ask them, not the
+//     field). Both are empty while unauthenticated.
 //     A listener added after the state is already known receives the
 //     current state once, asynchronously, right after subscribing.
 //
@@ -29,6 +35,50 @@
 //     converge to unauthenticated) and pokes the server-side logout.
 //
 //   authServiceURL(): string
+//
+// Token details — synchronous, about the token of the last "status"
+// event. For deciding what a page SHOWS (hide or disable a control the
+// user may not use). The claims are base64url-decoded from the token and
+// NOT VERIFIED here; the API of each tool verifies the token and stays
+// the enforcement.
+//
+//   getClaims(): object|null
+//     The decoded payload of the current token, not verified. null when
+//     unauthenticated or when the token cannot be decoded. Treat the
+//     object as read-only.
+//
+//   hasService(service): boolean
+//     Whether the token's "services" claim allows the service at all
+//     (the service gate; auth.ServiceAllowed in Go). false when
+//     unauthenticated.
+//
+//   hasFeature(service, feature, opts?): boolean
+//     Whether the token grants a feature of a service
+//     (auth.FeatureAllowed in Go). Default-deny: the feature needs its
+//     own grant ("+svc:feat", "+svc:fe*", "+svc:all"). With
+//     opts = { defaultAllow: true } the feature follows basic access
+//     unless it was excluded. false when unauthenticated.
+//
+//       if (auth.hasFeature('spamoor', 'plugins')) showPluginUI();
+//
+//   getTeams(): string[]
+//     The token's teams; a fresh array, empty when there are none or
+//     when unauthenticated.
+//
+//   serviceAllowed(directives, service): boolean
+//   featureAllowed(directives, service, feature, defaultAllow): boolean
+//     The same evaluation for a directive list given as a string (a
+//     "services" claim), usable without a session. defaultAllow counts
+//     only when it is exactly true.
+//
+//   A token without a "services" claim has basic access to every service
+//   and no default-deny feature. A token whose "services" claim is not a
+//   string has no service and no feature. Arguments that are not strings,
+//   and names with characters outside ASCII, are answered with false.
+//
+//   An older authenticatoor serves a client without these functions:
+//   check `typeof auth.hasFeature === 'function'` and treat its absence
+//   as "no features".
 //
 // How it works: this script mounts a hidden iframe on the auth-service
 // origin (/clientFrame). That frame owns the session — it stores the token
@@ -85,7 +135,39 @@
   var pendingAdopt = null;     // token captured from the login redirect fragment
 
   function makeUnauthInfo() {
-    return { status: 'unauthenticated', authenticated: false, user: '', exp: 0 };
+    return {
+      status: 'unauthenticated',
+      authenticated: false,
+      user: '',
+      exp: 0,
+      teams: [],
+      services: '',
+    };
+  }
+
+  // ─── token claims (shared with the v1 client, included at serve time) ───
+
+/*__AUTHENTICATOOR_CLAIMS__*/
+
+  // currentClaims returns the decoded claims of the token behind the
+  // current status, or null when unauthenticated (or not decodable).
+  function currentClaims() {
+    if (!currentTokenInfo || !currentTokenInfo.authenticated) return null;
+    return claimsTokenState(currentToken);
+  }
+
+  // withClaims returns a copy of a TokenInfo with the teams and services
+  // of the current token filled in. They are read from the token itself,
+  // never taken from the info handed in.
+  function withClaims(info) {
+    var out = {};
+    for (var key in info) {
+      if (Object.prototype.hasOwnProperty.call(info, key)) out[key] = info[key];
+    }
+    var state = out.authenticated ? claimsTokenState(currentToken) : null;
+    out.teams = state ? state.teams.slice() : [];
+    out.services = state && state.services !== null ? state.services : '';
+    return out;
   }
 
   // ─── readiness (first known state) ──────────────────────────────────────
@@ -142,16 +224,18 @@
 
   function infoEqual(a, b) {
     if (!a || !b) return a === b;
-    return a.status === b.status && a.user === b.user && a.exp === b.exp;
+    return a.status === b.status && a.user === b.user && a.exp === b.exp &&
+      a.services === b.services && a.teams.join(',') === b.teams.join(',');
   }
 
   // applyState updates the tracked session state and emits "status" when it
   // actually changed. Pass token === undefined to keep the cached token.
   function applyState(status, info, token) {
+    if (token !== undefined) currentToken = token;
+    info = withClaims(info);
     var changed = currentStatus !== status || !infoEqual(currentTokenInfo, info);
     currentStatus = status;
     currentTokenInfo = info;
-    if (token !== undefined) currentToken = token;
     settleReady();
     if (changed) emitStatus();
   }
@@ -339,7 +423,9 @@
         return currentToken || null;
       }
       return request('getToken').then(function (tok) {
-        if (tok) currentToken = tok;
+        // The frame's status push normally delivered this token already.
+        // If not, take it through applyState so the claims follow it.
+        if (tok && tok !== currentToken) applyState(currentStatus, currentTokenInfo, tok);
         return tok || null;
       });
     });
@@ -397,6 +483,8 @@
 
   // ─── publish ────────────────────────────────────────────────────────────
 
+  var claimFns = claimsAPI(currentClaims);
+
   if (!window.ethpandaops) window.ethpandaops = {};
   window.ethpandaops.authenticatoor = {
     version:             2,
@@ -407,5 +495,11 @@
     login:               login,
     logout:              logout,
     authServiceURL:      authServiceURL,
+    getClaims:           claimFns.getClaims,
+    hasService:          claimFns.hasService,
+    hasFeature:          claimFns.hasFeature,
+    getTeams:            claimFns.getTeams,
+    serviceAllowed:      claimFns.serviceAllowed,
+    featureAllowed:      claimFns.featureAllowed,
   };
 })();

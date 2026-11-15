@@ -2,50 +2,24 @@ package auth_test
 
 import (
 	"math/rand"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/ethpandaops/service-authenticatoor/internal/directivecases"
 	"github.com/ethpandaops/service-authenticatoor/pkg/auth"
 )
 
 func TestServiceAllowed(t *testing.T) {
-	cases := []struct {
-		name       string
-		directives string
-		service    string
-		want       bool
-	}{
-		{"empty directives default allow", "", "spamoor", true},
-		{"empty service short-circuits to allow", "-all", "", true},
-		{"plus all allows", "+all", "spamoor", true},
-		{"minus all denies", "-all", "spamoor", false},
-		{"plus all minus self denies self", "+all,-spamoor", "spamoor", false},
-		{"plus all minus other allows self", "+all,-buildoor", "spamoor", true},
-		{"minus all plus self allows self", "-all,+spamoor", "spamoor", true},
-		{"minus all plus other denies self", "-all,+buildoor", "spamoor", false},
-		{"later wins (allow then deny)", "+spamoor,-spamoor", "spamoor", false},
-		{"later wins (deny then allow)", "-spamoor,+spamoor", "spamoor", true},
-		{"all overrides earlier specific", "-spamoor,+all", "spamoor", true},
-		{"specific overrides earlier all", "+all,-spamoor", "spamoor", false},
-		{"unrelated directives default allow", "+buildoor,-monitoring", "spamoor", true},
-		{"case insensitive name", "+ALL,-Spamoor", "spamoor", false},
-		{"case insensitive service", "+all,-spamoor", "SPAMOOR", false},
-		{"whitespace tolerated", " +all , -spamoor ", "spamoor", false},
-		{"missing prefix skipped", "all,-spamoor", "spamoor", false},
-		{"empty name skipped", "+,-spamoor", "spamoor", false},
-		{"single char skipped", "+", "spamoor", true},
-		{"only minus all", "-all", "buildoor", false},
-		{"complex chain", "-all,+spamoor,+buildoor,-buildoor", "buildoor", false},
-		{"complex chain other", "-all,+spamoor,+buildoor,-buildoor", "spamoor", true},
-	}
+	cases := directivecases.Service
 
 	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			got := auth.ServiceAllowed(tc.directives, tc.service)
-			if got != tc.want {
+		t.Run(tc.Name, func(t *testing.T) {
+			got := auth.ServiceAllowed(tc.Directives, tc.Service)
+			if got != tc.Want {
 				t.Errorf("ServiceAllowed(%q, %q) = %v, want %v",
-					tc.directives, tc.service, got, tc.want)
+					tc.Directives, tc.Service, got, tc.Want)
 			}
 		})
 	}
@@ -89,9 +63,8 @@ func legacyServiceAllowed(directives, service string) bool {
 
 // What a directive list says about one feature; see FeatureAllowed.
 const (
-	unset    = "unset"
-	granted  = "granted"
-	excluded = "excluded"
+	granted  = directivecases.Granted
+	excluded = directivecases.Excluded
 )
 
 // TestFeatureAllowed_Grammar covers every documented directive form.
@@ -100,184 +73,25 @@ const (
 // in both modes follows from the truth table pinned literally in
 // TestFeatureAllowed_TruthTable.
 func TestFeatureAllowed_Grammar(t *testing.T) {
-	cases := []struct {
-		name       string
-		directives string
-		service    string
-		feature    string
-		wantBase   bool
-		wantState  string
-	}{
-		// ─── the documented forms ───────────────────────────────────────
-		{"+svc: base, nothing about features", "+spamoor", "spamoor", "plugins", true, unset},
-		{"+svc:all: every feature", "+spamoor:all", "spamoor", "plugins", true, granted},
-		{"+svc:f1:f2: first", "+spamoor:f1:f2", "spamoor", "f1", true, granted},
-		{"+svc:f1:f2: second", "+spamoor:f1:f2", "spamoor", "f2", true, granted},
-		{"+svc:f1:f2: another", "+spamoor:f1:f2", "spamoor", "f3", true, unset},
-		{"+svc:all:-f: the exception", "+spamoor:all:-plugins", "spamoor", "plugins", true, excluded},
-		{"+svc:all:-f: the rest", "+spamoor:all:-plugins", "spamoor", "txpool", true, granted},
-		{"+svc:-f: excluded, base granted", "+spamoor:-plugins", "spamoor", "plugins", true, excluded},
-		{"+svc:-f: the rest stays unset", "+spamoor:-plugins", "spamoor", "txpool", true, unset},
-		{"+all:f: any service", "+all:feata", "buildoor", "feata", true, granted},
-		{"+all:f: another feature", "+all:feata", "buildoor", "featb", true, unset},
-		{"-svc: base gone", "-spamoor", "spamoor", "plugins", false, unset},
-		{"-svc after a grant: base and feature gone", "+spamoor:all,-spamoor", "spamoor", "plugins", false, unset},
-		{"-svc:f: the feature", "-spamoor:f1", "spamoor", "f1", true, excluded},
-		{"-svc:f: the others", "-spamoor:f1", "spamoor", "f2", true, unset},
-		{"-svc:f after +svc:all: the feature", "+spamoor:all,-spamoor:f1", "spamoor", "f1", true, excluded},
-		{"-svc:f after +svc:all: the others", "+spamoor:all,-spamoor:f1", "spamoor", "f2", true, granted},
-
-		// ─── basic: the reserved name of base access ────────────────────
-		{"+svc:basic is +svc", "-all,+spamoor:basic", "spamoor", "plugins", true, unset},
-		{"+svc:basic:f", "-all,+spamoor:basic:plugins", "spamoor", "plugins", true, granted},
-		{"-svc:basic is -svc", "+spamoor:all,-spamoor:basic", "spamoor", "plugins", false, unset},
-		{"-svc:basic forgets features like -svc", "+spamoor:f1,-spamoor:basic,+spamoor", "spamoor", "f1", true, unset},
-		{"-svc:f:basic is still the denial", "+spamoor:all,-spamoor:f1:basic", "spamoor", "f2", false, unset},
-		{"-all:basic is -all", "+spamoor,-all:basic", "spamoor", "plugins", false, unset},
-		{"+svc:-basic: malformed, the directive grants nothing", "-all,+spamoor:-basic", "spamoor", "plugins", false, unset},
-		{"+svc:all:-basic: malformed, the directive grants nothing", "-all,+spamoor:all:-basic", "spamoor", "plugins", false, unset},
-		{"+svc:f:-basic: not even the feature before it", "-all,+spamoor,+spamoor:plugins:-basic", "spamoor", "plugins", true, unset},
-		{"-svc:-basic: malformed, the directive denies nothing", "+spamoor:all,-spamoor:-basic", "spamoor", "plugins", true, granted},
-		{"-svc:f leaves basic alone", "-all,+spamoor,-spamoor:plugins", "spamoor", "txpool", true, unset},
-		{"all does not need to name basic", "-all,+spamoor:all", "spamoor", "txpool", true, granted},
-
-		// ─── defaults ───────────────────────────────────────────────────
-		{"nothing matches the service", "+buildoor:all", "spamoor", "plugins", true, unset},
-		{"only a denial elsewhere", "-buildoor", "spamoor", "plugins", true, unset},
-		{"-all", "-all", "spamoor", "plugins", false, unset},
-		{"+all: base everywhere", "+all", "spamoor", "plugins", true, unset},
-		{"+all:all: everything", "+all:all", "spamoor", "plugins", true, granted},
-
-		// ─── interaction with -all,+svc ─────────────────────────────────
-		{"-all,+svc: the service", "-all,+spamoor", "spamoor", "plugins", true, unset},
-		{"-all,+svc: another service", "-all,+spamoor", "buildoor", "plugins", false, unset},
-		{"-all,+svc,+svc:f: the feature", "-all,+spamoor,+spamoor:plugins", "spamoor", "plugins", true, granted},
-		{"-all,+svc,+svc:f: another feature", "-all,+spamoor,+spamoor:plugins", "spamoor", "txpool", true, unset},
-		{"-all,+svc,+svc:f: another service", "-all,+spamoor,+spamoor:plugins", "buildoor", "plugins", false, unset},
-		{"-all,+svc,-svc:f", "-all,+spamoor,-spamoor:plugins", "spamoor", "plugins", true, excluded},
-		{"feature directive implies base", "-all,+spamoor:plugins", "spamoor", "plugins", true, granted},
-		{"exclusion segment still implies base", "-all,+spamoor:-plugins", "spamoor", "plugins", true, excluded},
-		{"+all:f implies base everywhere", "-all,+all:feata", "buildoor", "feata", true, granted},
-		{"+all,+all:all", "+all,+all:all", "buildoor", "anything", true, granted},
-
-		// ─── order: later wins ──────────────────────────────────────────
-		{"+svc:all,-svc:f", "+spamoor:all,-spamoor:f", "spamoor", "f", true, excluded},
-		{"-svc:f,+svc:all", "-spamoor:f,+spamoor:all", "spamoor", "f", true, granted},
-		{"+svc:all:-f", "+spamoor:all:-f", "spamoor", "f", true, excluded},
-		{"+svc:-f:all", "+spamoor:-f:all", "spamoor", "f", true, granted},
-		{"+svc:-all:f: the feature", "+spamoor:-all:plugins", "spamoor", "plugins", true, granted},
-		{"+svc:-all:f: another", "+spamoor:-all:plugins", "spamoor", "txpool", true, excluded},
-		{"grant then exclusion", "+spamoor:f1,-spamoor:f1", "spamoor", "f1", true, excluded},
-		{"exclusion then grant", "-spamoor:f1,+spamoor:f1", "spamoor", "f1", true, granted},
-		{"denial then grant", "-spamoor,+spamoor:f1", "spamoor", "f1", true, granted},
-		{"grant, denial, bare re-allow: forgotten", "+spamoor:f1,-spamoor,+spamoor", "spamoor", "f1", true, unset},
-		{"exclusion, denial, bare re-allow: forgotten", "-spamoor:f1,-spamoor,+spamoor", "spamoor", "f1", true, unset},
-		{"a bare positive keeps an earlier grant", "+spamoor:f1,+spamoor", "spamoor", "f1", true, granted},
-		{"a bare positive keeps an earlier exclusion", "-spamoor:f1,+spamoor", "spamoor", "f1", true, excluded},
-		{"a later positive adds features", "+spamoor:f1,+spamoor:f2", "spamoor", "f1", true, granted},
-		{"-svc:all excludes every feature, base stays", "+spamoor:f1:f2,-spamoor:all", "spamoor", "f2", true, excluded},
-		{"-all after grants", "+spamoor:all,-all", "spamoor", "plugins", false, unset},
-
-		// ─── +all:f and -all:f across services ──────────────────────────
-		{"+all:f then +svc:g: the service", "+all:feata,+spamoor:featb", "spamoor", "featb", true, granted},
-		{"+all:f then +svc:g: keeps the all feature", "+all:feata,+spamoor:featb", "spamoor", "feata", true, granted},
-		{"+all:f then +svc:g: other services", "+all:feata,+spamoor:featb", "buildoor", "featb", true, unset},
-		{"+svc:f then +all:-f", "+spamoor:f1,+all:-f1", "spamoor", "f1", true, excluded},
-		{"-all:f excludes everywhere", "-all:feata", "spamoor", "feata", true, excluded},
-		{"-all:f excludes everywhere: another service", "-all:feata", "buildoor", "feata", true, excluded},
-		{"-all:f leaves base and other features", "+all:all,-all:feata", "spamoor", "featb", true, granted},
-		{"-all:f after +all:all", "+all:all,-all:feata", "buildoor", "feata", true, excluded},
-		{"-all:f then +svc:f: that service again", "-all:feata,+spamoor:feata", "spamoor", "feata", true, granted},
-		{"-all:f then +svc:f: the others stay excluded", "-all:feata,+spamoor:feata", "buildoor", "feata", true, excluded},
-		{"+all:all:-f then a service: f for it only", "+all:all:-featb,+spamoor:featb", "buildoor", "featb", true, excluded},
-
-		// ─── wildcards: a trailing * is a prefix ────────────────────────
-		{"prefix: the bare name", "+spamoor:user*", "spamoor", "user", true, granted},
-		{"prefix: a longer name", "+spamoor:user*", "spamoor", "userxyz", true, granted},
-		{"prefix: with a dash", "+spamoor:user*", "spamoor", "user-admin", true, granted},
-		{"prefix: not a shorter name", "+spamoor:user*", "spamoor", "use", true, unset},
-		{"prefix: not another name", "+spamoor:user*", "spamoor", "admin-user", true, unset},
-		{"prefix: another service", "-all,+spamoor:user*", "buildoor", "user", false, unset},
-		{"prefix on all services", "+all:user*", "buildoor", "user-view", true, granted},
-		{"prefix exclusion", "+spamoor:all,-spamoor:user*", "spamoor", "user-admin", true, excluded},
-		{"prefix exclusion: the rest", "+spamoor:all,-spamoor:user*", "spamoor", "plugins", true, granted},
-		{"prefix exclusion inside a positive directive", "+spamoor:all:-user*", "spamoor", "user", true, excluded},
-		{"prefix exclusion inside: the rest", "+spamoor:all:-user*", "spamoor", "plugins", true, granted},
-		{"prefix then exact exclusion: the excluded one", "+spamoor:user*,-spamoor:user-admin", "spamoor", "user-admin", true, excluded},
-		{"prefix then exact exclusion: the others", "+spamoor:user*,-spamoor:user-admin", "spamoor", "user-view", true, granted},
-		{"exact exclusion then prefix: both allowed", "-spamoor:user-admin,+spamoor:user*", "spamoor", "user-admin", true, granted},
-		{"exact exclusion then prefix: the other", "-spamoor:user-admin,+spamoor:user*", "spamoor", "user-view", true, granted},
-		{"segments: prefix then exclusion", "+spamoor:user*:-user-admin", "spamoor", "user-admin", true, excluded},
-		{"segments: exclusion then prefix", "+spamoor:-user-admin:user*", "spamoor", "user-admin", true, granted},
-		{"a lone * is all", "+spamoor:*", "spamoor", "anything", true, granted},
-		{"a lone -* is -all", "+spamoor:f1:-*", "spamoor", "f1", true, excluded},
-		{"-svc:* excludes every feature, base stays", "+spamoor:all,-spamoor:*", "spamoor", "f1", true, excluded},
-		{"prefix case and whitespace", "+spamoor: User* ", "spamoor", "USER-view", true, granted},
-		{"prefix never removes basic", "-all,+spamoor,-spamoor:b*", "spamoor", "backup", true, excluded},
-		{"prefix b* grants b-features, basic comes from the directive", "-all,+spamoor:b*", "spamoor", "backup", true, granted},
-		{"prefix basi* is not basic", "+spamoor,-spamoor:basi*", "spamoor", "plugins", true, unset},
-		{"prefix basic* is a prefix, not the reserved name", "+spamoor:all,-spamoor:basic*", "spamoor", "basic-stats", true, excluded},
-		{"prefix al* is not all", "+spamoor:al*", "spamoor", "plugins", true, unset},
-		{"prefix al* covers names starting al", "+spamoor:al*", "spamoor", "alerts", true, granted},
-
-		// ─── malformed wildcards: the whole directive is skipped ────────
-		{"* in the middle: grants nothing", "-all,+spamoor:us*er", "spamoor", "user", false, unset},
-		{"* in the middle: not the other segments either", "-all,+spamoor:us*er:f1", "spamoor", "f1", false, unset},
-		{"* in the middle: nor a segment before it", "-all,+spamoor,+spamoor:f1:us*er", "spamoor", "f1", true, unset},
-		{"* at the start", "-all,+spamoor:*admin:f1", "spamoor", "f1", false, unset},
-		{"two stars", "-all,+spamoor:u**", "spamoor", "user", false, unset},
-		{"malformed wildcard in a negative directive: no denial, no exclusion", "+spamoor:all,-spamoor:us*er:f1", "spamoor", "f1", true, granted},
-		{"malformed exclusion wildcard: the directive grants nothing", "+spamoor:all:-us*er", "spamoor", "user", true, unset},
-		{"malformed exclusion wildcard: not even basic", "-all,+spamoor:all:-us*er", "spamoor", "plugins", false, unset},
-		{"wildcard in the service position", "-all,+spam*:f1", "spamoor", "f1", false, unset},
-		{"wildcard as the whole service", "-all,+*:f1", "spamoor", "f1", false, unset},
-		{"bare wildcard service is a literal name, as before", "-all,+spam*", "spamoor", "f1", false, unset},
-
-		// ─── malformed entries are skipped ──────────────────────────────
-		{"no prefix", "spamoor:all", "spamoor", "plugins", true, unset},
-		{"empty service name", "+:all", "spamoor", "plugins", true, unset},
-		{"trailing colon: positive", "-all,+spamoor:", "spamoor", "plugins", false, unset},
-		{"trailing colon: negative is not a denial", "+spamoor:all,-spamoor:", "spamoor", "plugins", true, granted},
-		{"empty segment in the middle", "-all,+spamoor::plugins", "spamoor", "plugins", false, unset},
-		{"a lone sign as a segment", "-all,+spamoor:-", "spamoor", "plugins", false, unset},
-		{"an empty segment after basic: not a denial", "+spamoor:all,-spamoor:basic:", "spamoor", "plugins", true, granted},
-		{"an empty segment after a feature and basic", "+spamoor:all,-spamoor:f1:basic::", "spamoor", "f1", true, granted},
-		{"an empty segment before basic", "+spamoor:all,-spamoor::basic", "spamoor", "plugins", true, granted},
-		{"a malformed wildcard after basic: not a denial", "+spamoor:all,-spamoor:basic:us*er", "spamoor", "plugins", true, granted},
-		{"signed segment in a negative directive", "+spamoor:all,-spamoor:-x", "spamoor", "x", true, granted},
-		{"signed segment in a negative directive: base", "-spamoor:-x", "spamoor", "x", true, unset},
-		{"a signed segment makes the negative directive malformed: nothing excluded", "+spamoor:all,-spamoor:-x:y", "spamoor", "y", true, granted},
-		{"a signed segment before basic: not a denial", "+spamoor:all,-spamoor:-x:basic", "spamoor", "y", true, granted},
-		{"malformed entries between good ones", "-all,nonsense,+spamoor:f1,+", "spamoor", "f1", true, granted},
-
-		// ─── case and whitespace ────────────────────────────────────────
-		{"case in the claim", "+SpaMoor:PluGins", "spamoor", "plugins", true, granted},
-		{"case in the query", "+spamoor:plugins", "SPAMOOR", "Plugins", true, granted},
-		{"whitespace everywhere", " -all , + spamoor : f1 : - f2 ", " spamoor ", " f1 ", true, granted},
-		{"whitespace: exclusion segment", " -all , + spamoor : all : - f2 ", "spamoor", "f2", true, excluded},
-
-		// ─── exact names only ───────────────────────────────────────────
-		{"no prefix matching of features", "+spamoor:plugins", "spamoor", "plug", true, unset},
-		{"no prefix matching of services", "+spamoor:all", "spam", "plugins", true, unset},
-	}
+	cases := directivecases.Grammar
 	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := auth.ServiceAllowed(tc.directives, tc.service); got != tc.wantBase {
-				t.Errorf("ServiceAllowed(%q, %q) = %t, want %t", tc.directives, tc.service, got, tc.wantBase)
+		t.Run(tc.Name, func(t *testing.T) {
+			if got := auth.ServiceAllowed(tc.Directives, tc.Service); got != tc.WantBase {
+				t.Errorf("ServiceAllowed(%q, %q) = %t, want %t", tc.Directives, tc.Service, got, tc.WantBase)
 			}
-			wantDeny := tc.wantBase && tc.wantState == granted
-			wantAllow := tc.wantBase && tc.wantState != excluded
-			checkFeature(t, tc.directives, tc.service, tc.feature, wantDeny, wantAllow)
+			wantDeny := tc.WantBase && tc.WantState == granted
+			wantAllow := tc.WantBase && tc.WantState != excluded
+			checkFeature(t, tc.Directives, tc.Service, tc.Feature, wantDeny, wantAllow)
 
 			// "basic" is base access, in both modes.
-			checkFeature(t, tc.directives, tc.service, "basic", tc.wantBase, tc.wantBase)
-			checkFeature(t, tc.directives, tc.service, " Basic ", tc.wantBase, tc.wantBase)
+			checkFeature(t, tc.Directives, tc.Service, "basic", tc.WantBase, tc.WantBase)
+			checkFeature(t, tc.Directives, tc.Service, " Basic ", tc.WantBase, tc.WantBase)
 
 			// Never a feature without base access, in either mode.
-			if !tc.wantBase {
+			if !tc.WantBase {
 				for _, def := range []auth.FeatureDefault{auth.FeatureDefaultDeny, auth.FeatureDefaultAllow} {
-					if auth.FeatureAllowed(tc.directives, tc.service, tc.feature, def) {
-						t.Errorf("mode %d allows %s:%s without base access (%q)", def, tc.service, tc.feature, tc.directives)
+					if auth.FeatureAllowed(tc.Directives, tc.Service, tc.Feature, def) {
+						t.Errorf("mode %d allows %s:%s without base access (%q)", def, tc.Service, tc.Feature, tc.Directives)
 					}
 				}
 			}
@@ -312,33 +126,14 @@ func checkFeature(t *testing.T, directives, service, feature string, wantDeny, w
 // access denied / allowed × feature unset / granted / excluded × both
 // modes. A token without the claim is the row "allowed, unset".
 func TestFeatureAllowed_TruthTable(t *testing.T) {
-	cases := []struct {
-		name       string
-		directives string
-		wantBase   bool
-		wantDeny   bool
-		wantAllow  bool
-	}{
-		{"base denied, unset", "-all", false, false, false},
-		{"base denied, granted before the denial", "+dora:roll,-dora", false, false, false},
-		{"base denied, granted for every service before the denial", "+all:roll,-dora", false, false, false},
-		{"base denied, excluded before the denial", "-dora:roll,-dora", false, false, false},
-		{"base denied by -all, granted before", "+dora:all,-all", false, false, false},
-		{"base allowed, unset", "-all,+dora", true, false, true},
-		{"base allowed by default, unset", "+spamoor", true, false, true},
-		{"base allowed, granted", "-all,+dora,+dora:roll", true, true, true},
-		{"base allowed, granted by all", "-all,+dora,+dora:all", true, true, true},
-		{"base allowed, excluded", "-all,+dora,-dora:roll", true, false, false},
-		{"base allowed, excluded inside a grant of all", "+dora:all:-roll", true, false, false},
-		{"empty claim: base allowed, unset", "", true, false, true},
-	}
+	cases := directivecases.TruthTable
 	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := auth.ServiceAllowed(tc.directives, "dora"); got != tc.wantBase {
-				t.Fatalf("ServiceAllowed(%q) = %t, want %t", tc.directives, got, tc.wantBase)
+		t.Run(tc.Name, func(t *testing.T) {
+			if got := auth.ServiceAllowed(tc.Directives, directivecases.TruthTableService); got != tc.WantBase {
+				t.Fatalf("ServiceAllowed(%q) = %t, want %t", tc.Directives, got, tc.WantBase)
 			}
-			checkFeature(t, tc.directives, "dora", "roll", tc.wantDeny, tc.wantAllow)
-			if !tc.wantBase && (tc.wantDeny || tc.wantAllow) {
+			checkFeature(t, tc.Directives, directivecases.TruthTableService, directivecases.TruthTableFeature, tc.WantDeny, tc.WantAllow)
+			if !tc.WantBase && (tc.WantDeny || tc.WantAllow) {
 				t.Fatal("test bug: a row allows a feature without base access")
 			}
 		})
@@ -348,81 +143,10 @@ func TestFeatureAllowed_TruthTable(t *testing.T) {
 // TestFeatureAllowed_Arguments covers queries that do not name a
 // service and a feature in the ordinary way.
 func TestFeatureAllowed_Arguments(t *testing.T) {
-	cases := []struct {
-		name       string
-		directives string
-		service    string
-		feature    string
-		wantDeny   bool
-		wantAllow  bool
-	}{
-		// The empty claim is basic access to every service and nothing
-		// more: the service gate is open, a feature reads as under "+all".
-		{"empty claim", "", "spamoor", "plugins", false, true},
-		{"empty claim, empty feature", "", "spamoor", "", true, true},
-		{"empty claim, blank feature", "", "spamoor", "  ", true, true},
-		{"empty claim, empty service", "", "", "plugins", false, false},
-		{"empty claim, blank service", "", "   ", "plugins", false, false},
-		{"empty claim, empty service, basic", "", "", "basic", true, true},
-		{"empty claim, empty service and feature", "", "", "", true, true},
-		{"empty claim, reserved feature name", "", "spamoor", "all", false, false},
-		{"empty claim, wildcard feature", "", "spamoor", "user*", false, false},
-		{"empty claim, lone * as the feature", "", "spamoor", "*", false, false},
-		{"empty claim, signed feature", "", "spamoor", "-plugins", false, false},
-		{"empty claim, feature with a colon", "", "spamoor", "a:b", false, false},
-		{"empty claim, feature with a comma", "", "spamoor", "a,+all", false, false},
-		{"empty claim, service with a colon", "", "spamoor:plugins", "x", false, false},
-		{"empty claim, wildcard service", "", "spam*", "f1", false, false},
-		{"empty claim, service all", "", "all", "f1", false, true},
-		{"empty claim, case and whitespace", "", " SPAMOOR ", " Plugins ", false, true},
-
-		// The same queries under "+all", which the empty claim reads like.
-		{"+all", "+all", "spamoor", "plugins", false, true},
-		{"+all, reserved feature name", "+all", "spamoor", "all", false, false},
-		{"+all, empty service", "+all", "", "plugins", false, false},
-
-		// A whitespace or garbage claim reads the same for a feature.
-		{"whitespace claim: base by default, nothing granted", " ", "spamoor", "plugins", false, true},
-		{"garbage claim: base by default, nothing granted", "nonsense", "spamoor", "plugins", false, true},
-
-		// An empty feature asks for the service itself.
-		{"empty feature, service allowed", "-all,+spamoor", "spamoor", "", true, true},
-		{"empty feature, service denied", "-all,+spamoor", "buildoor", "", false, false},
-		{"blank feature, service allowed", "-all,+spamoor", "spamoor", "  ", true, true},
-
-		// "basic" asks for the service itself too.
-		{"basic, service allowed", "-all,+spamoor", "spamoor", "basic", true, true},
-		{"basic, service denied", "-all,+spamoor", "buildoor", "basic", false, false},
-		{"basic, service nothing mentions: allowed by default", "+spamoor,+buildoor", "other", "basic", true, true},
-		{"basic under the empty claim", "", "spamoor", "basic", true, true},
-		{"basic under the empty claim, spelled otherwise", "", "spamoor", " Basic ", true, true},
-
-		// An empty service is refused, although ServiceAllowed lets it through.
-		{"empty service, basic", "+all:all", "", "basic", false, false},
-		{"empty service", "+all:all", "", "plugins", false, false},
-		{"blank service", "+all:all", "   ", "plugins", false, false},
-		{"empty service and feature", "+all:all", "", "", false, false},
-
-		// Names that cannot be a feature or a service.
-		{"reserved feature name all", "+spamoor:all", "spamoor", "all", false, false},
-		{"signed feature", "+spamoor:-plugins", "spamoor", "-plugins", false, false},
-		{"feature with a colon", "+spamoor:a:b", "spamoor", "a:b", false, false},
-		{"feature with a comma", "+spamoor:a", "spamoor", "a,+all", false, false},
-		{"service with a colon", "+all:all", "spamoor:plugins", "x", false, false},
-
-		// Wildcards exist in directives only.
-		{"wildcard feature query", "+spamoor:user*", "spamoor", "user*", false, false},
-		{"wildcard feature query against all", "+all:all", "spamoor", "user*", false, false},
-		{"lone * as the feature", "+spamoor:all", "spamoor", "*", false, false},
-		{"wildcard service query", "+all:all", "spam*", "f1", false, false},
-
-		// The pseudo-service all matches only all-directives.
-		{"service all, all directive", "+all:f1", "all", "f1", true, true},
-		{"service all, specific directive", "+spamoor:f1", "all", "f1", false, true},
-	}
+	cases := directivecases.Arguments
 	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			checkFeature(t, tc.directives, tc.service, tc.feature, tc.wantDeny, tc.wantAllow)
+		t.Run(tc.Name, func(t *testing.T) {
+			checkFeature(t, tc.Directives, tc.Service, tc.Feature, tc.WantDeny, tc.WantAllow)
 		})
 	}
 
@@ -474,15 +198,8 @@ func emptyClaimWant(service, feature string) (wantDeny, wantAllow bool) {
 // compares with the rule (emptyClaimWant). For every feature but the
 // service gate the answer must also be the one "+all" gives.
 func TestFeatureAllowed_EmptyClaimIsBasicAccessOnly(t *testing.T) {
-	services := []string{
-		"spamoor", "SPAMOOR", " spamoor ", "my-service", "other", "all", "basic", "x",
-		"", "   ", "*", "spam*", "spamoor:plugins", "a,b", "-spamoor", "+spamoor",
-	}
-	features := []string{
-		"plugins", "PLUGINS", " plugins ", "f1", "user-admin", "roll", "basics", "allx", "b",
-		"", "  ", "basic", " Basic ", "BASIC", "all", "ALL", " all ",
-		"*", "user*", "us*er", "a:b", "a,b", "a,+all", "-plugins", "+plugins", "-", "+", ":", ",",
-	}
+	services := directivecases.EmptyClaimServices
+	features := directivecases.EmptyClaimFeatures
 	plain, refused, gate := 0, 0, 0
 	for _, service := range services {
 		if !auth.ServiceAllowed("", service) {
@@ -525,45 +242,9 @@ func TestFeatureAllowed_EmptyClaimIsBasicAccessOnly(t *testing.T) {
 // TestServiceGrants_OldVerifiersAgreeOnBaseAccess for the guarantee
 // that holds there: everything the issuer emits reads the same.
 func TestServiceAllowed_SameAsV003WithoutColons(t *testing.T) {
-	type query struct{ directives, service string }
-	queries := []query{
-		{"", "spamoor"},
-		{"-all", ""},
-		{"+all", "spamoor"},
-		{"-all", "spamoor"},
-		{"+all,-spamoor", "spamoor"},
-		{"+all,-buildoor", "spamoor"},
-		{"-all,+spamoor", "spamoor"},
-		{"-all,+buildoor", "spamoor"},
-		{"+spamoor,-spamoor", "spamoor"},
-		{"-spamoor,+spamoor", "spamoor"},
-		{"-spamoor,+all", "spamoor"},
-		{"+buildoor,-monitoring", "spamoor"},
-		{"+ALL,-Spamoor", "spamoor"},
-		{"+all,-spamoor", "SPAMOOR"},
-		{" +all , -spamoor ", "spamoor"},
-		{"all,-spamoor", "spamoor"},
-		{"+,-spamoor", "spamoor"},
-		{"+", "spamoor"},
-		{"-all", "buildoor"},
-		{"-all,+spamoor,+buildoor,-buildoor", "buildoor"},
-		{"-all,+spamoor,+buildoor,-buildoor", "spamoor"},
-		{"-all,+spamoor", "   "},
-		{"-all,+spamoor", " spamoor "},
-		{"-all", "all"},
-		{"+all,-all", "all"},
-		{"-spamoor", "all"},
-		{" ", "spamoor"},
-		{",,,", "spamoor"},
-	}
-
-	fragments := []string{
-		"+all", "-all", "+ALL", "-All", "+spamoor", "-spamoor", "+Spamoor", "-SPAMOOR",
-		"+buildoor", "-buildoor", "+dora", "-dora", "+my-service", "-x",
-		" +spamoor ", " - spamoor", "+ all", "-\tall", "", " ", "+", "-", "all", "spamoor",
-		"*", "+*", "-*", "++spamoor", "--all", "+-spamoor", "+spamoor+buildoor", "+spamoor buildoor",
-	}
-	services := []string{"spamoor", "SPAMOOR", " spamoor ", "buildoor", "dora", "my-service", "other", "all", "x", "*", ""}
+	queries := slices.Clone(directivecases.LegacyQueries)
+	fragments := directivecases.LegacyFragments
+	services := directivecases.LegacyServices
 
 	rng := rand.New(rand.NewSource(20261114))
 	for range 20000 {
@@ -572,16 +253,19 @@ func TestServiceAllowed_SameAsV003WithoutColons(t *testing.T) {
 		for range n {
 			parts = append(parts, fragments[rng.Intn(len(fragments))])
 		}
-		queries = append(queries, query{strings.Join(parts, ","), services[rng.Intn(len(services))]})
+		queries = append(queries, directivecases.Query{
+			Directives: strings.Join(parts, ","),
+			Service:    services[rng.Intn(len(services))],
+		})
 	}
 
 	for _, q := range queries {
-		if strings.Contains(q.directives, ":") {
-			t.Fatalf("test bug: %q is not a legacy directive list", q.directives)
+		if strings.Contains(q.Directives, ":") {
+			t.Fatalf("test bug: %q is not a legacy directive list", q.Directives)
 		}
-		want := legacyServiceAllowed(q.directives, q.service)
-		if got := auth.ServiceAllowed(q.directives, q.service); got != want {
-			t.Errorf("ServiceAllowed(%q, %q) = %t, v0.0.3 says %t", q.directives, q.service, got, want)
+		want := legacyServiceAllowed(q.Directives, q.Service)
+		if got := auth.ServiceAllowed(q.Directives, q.Service); got != want {
+			t.Errorf("ServiceAllowed(%q, %q) = %t, v0.0.3 says %t", q.Directives, q.Service, got, want)
 		}
 	}
 }
@@ -594,16 +278,7 @@ func TestServiceAllowed_SameAsV003WithoutColons(t *testing.T) {
 // is one of the lists: it obeys the same formula, and default-deny
 // allows nothing under it.
 func TestFeatureAllowed_NeverWithoutBaseAccess(t *testing.T) {
-	fragments := []string{
-		"+all", "-all", "+spamoor", "-spamoor", "+buildoor", "-buildoor",
-		"+all:all", "+all:f1", "+all:-f1", "+all:all:-f2", "-all:f1", "-all:all",
-		"+spamoor:all", "+spamoor:f1", "+spamoor:f1:f2", "+spamoor:-f1", "+spamoor:all:-f1",
-		"-spamoor:f1", "-spamoor:all", "-spamoor:-f1", "+spamoor:", "-spamoor:", "+buildoor:f2",
-		"+spamoor:basic", "-spamoor:basic", "+spamoor:-basic", "+spamoor:all:-basic", "-all:basic",
-		"+all:basic:f1", "-spamoor:f1:basic", "-buildoor:-basic",
-		"+spamoor:f*", "-spamoor:f*", "+all:all:-f*", "+spamoor:*", "-all:*", "+spamoor:f*1", "-spamoor:b*",
-		"nonsense", "",
-	}
+	fragments := directivecases.FeatureFragments
 	rng := rand.New(rand.NewSource(7))
 	allowedDeny, allowedAllow, refusedForBase := 0, 0, 0
 	for range 20000 {
@@ -613,7 +288,7 @@ func TestFeatureAllowed_NeverWithoutBaseAccess(t *testing.T) {
 			parts = append(parts, fragments[rng.Intn(len(fragments))])
 		}
 		directives := strings.Join(parts, ",")
-		for _, service := range []string{"spamoor", "buildoor", "other"} {
+		for _, service := range directivecases.FeatureServices {
 			base := auth.ServiceAllowed(directives, service)
 			if got := auth.FeatureAllowed(directives, service, "", auth.FeatureDefaultDeny); got != base {
 				t.Errorf("%q: empty feature on %s = %t, base access = %t", directives, service, got, base)
@@ -623,7 +298,7 @@ func TestFeatureAllowed_NeverWithoutBaseAccess(t *testing.T) {
 					t.Errorf("%q: basic on %s (mode %d) = %t, ServiceAllowed = %t", directives, service, def, got, base)
 				}
 			}
-			for _, feature := range []string{"f1", "f2", "f3"} {
+			for _, feature := range directivecases.FeatureFeatures {
 				deny := auth.FeatureAllowed(directives, service, feature, auth.FeatureDefaultDeny)
 				allow := auth.FeatureAllowed(directives, service, feature, auth.FeatureDefaultAllow)
 				if (deny || allow) && !base {
@@ -667,17 +342,13 @@ func TestFeatureAllowed_NeverWithoutBaseAccess(t *testing.T) {
 // modes, for services the list names and for ones it does not. The
 // empty claim is included.
 func TestFeatureAllowed_BasicIsServiceAllowed(t *testing.T) {
-	signs := []string{"+", "-", "+", "-", "", " + ", "++"}
-	names := []string{"spamoor", "buildoor", "dora", "all", "ALL", " Spamoor ", "", "basic"}
-	segments := []string{
-		"", "", "", ":basic", ":-basic", ":all", ":-all", ":f1", ":-f1", ":f1:f2", ":all:-f1", ":-f1:all",
-		":basic:f1", ":f1:basic", ":all:-basic", ":-basic:f1", ":", "::f1", ":-", ": Basic ", ":BASIC",
-		":b*", ":-b*", ":basic*", ":-basi*", ":*", ":-*", ":f*", ":us*er", ":*x", ":all:-b*",
-	}
-	services := []string{"spamoor", "buildoor", "dora", "unmentioned", "all", "basic", " SPAMOOR "}
+	signs := directivecases.BasicSigns
+	names := directivecases.BasicNames
+	segments := directivecases.BasicSegments
+	services := directivecases.BasicServices
 
 	rng := rand.New(rand.NewSource(11))
-	directiveLists := []string{"", "+spamoor,+buildoor", "-all", "+all"}
+	directiveLists := slices.Clone(directivecases.BasicLists)
 	for range 30000 {
 		n := rng.Intn(6)
 		parts := make([]string, 0, n)
@@ -719,30 +390,14 @@ func TestFeatureAllowed_BasicIsServiceAllowed(t *testing.T) {
 // denial with segments — but a claim written by hand is, unless it
 // repeats the bare directive.
 func TestServiceAllowed_DiffersFromV003WithColons(t *testing.T) {
-	cases := []struct {
-		name       string
-		directives string
-		service    string
-		v003       bool
-		current    bool
-	}{
-		{"a feature directive alone grants basic access now", "-all,+spamoor:x", "spamoor", false, true},
-		{"+all with a feature grants basic access everywhere now", "-all,+all:x", "spamoor", false, true},
-		{"-a:b was a denial of a service named a:b", "-a:b", "a:b", false, true},
-		{"-spamoor:basic denies the service now", "-spamoor:basic", "spamoor", true, false},
-
-		// The same intent written the compatible way reads the same.
-		{"compatible: the bare directive repeated", "-all,+spamoor,+spamoor:x", "spamoor", true, true},
-		{"compatible: +all repeated", "-all,+all,+all:x", "spamoor", true, true},
-		{"compatible: a plain denial", "-spamoor", "spamoor", false, false},
-	}
+	cases := directivecases.V003Diff
 	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := legacyServiceAllowed(tc.directives, tc.service); got != tc.v003 {
-				t.Errorf("v0.0.3: ServiceAllowed(%q, %q) = %t, want %t", tc.directives, tc.service, got, tc.v003)
+		t.Run(tc.Name, func(t *testing.T) {
+			if got := legacyServiceAllowed(tc.Directives, tc.Service); got != tc.V003 {
+				t.Errorf("v0.0.3: ServiceAllowed(%q, %q) = %t, want %t", tc.Directives, tc.Service, got, tc.V003)
 			}
-			if got := auth.ServiceAllowed(tc.directives, tc.service); got != tc.current {
-				t.Errorf("current: ServiceAllowed(%q, %q) = %t, want %t", tc.directives, tc.service, got, tc.current)
+			if got := auth.ServiceAllowed(tc.Directives, tc.Service); got != tc.Current {
+				t.Errorf("current: ServiceAllowed(%q, %q) = %t, want %t", tc.Directives, tc.Service, got, tc.Current)
 			}
 		})
 	}
@@ -752,25 +407,12 @@ func TestServiceAllowed_DiffersFromV003WithColons(t *testing.T) {
 // at both evaluators: very long lists, runs of separators, signs and
 // wildcards, non-UTF-8 bytes. Nothing may panic or take long.
 func TestDirectives_OddInputTerminates(t *testing.T) {
-	inputs := []string{
-		strings.Repeat(",", 100000),
-		strings.Repeat(":", 100000),
-		strings.Repeat("+", 100000),
-		strings.Repeat("-all,", 50000),
-		"+spamoor" + strings.Repeat(":x", 50000),
-		"+spamoor:" + strings.Repeat("*", 50000),
-		"+spamoor:" + strings.Repeat("a*", 20000),
-		"+" + strings.Repeat("a", 100000) + ":" + strings.Repeat("b", 100000),
-		strings.Repeat("+all:all:-all,", 20000),
-		"+spamoor:\xff\xfe,-\x00:\x00,+\u212a:\u212a*",
-		"+spamoor:-:-:-,-spamoor:basic:basic:,+:,-:,+*:*,-*",
-		" \t\n,\t :\n ",
-	}
+	inputs := directivecases.OddInputs
 	start := time.Now()
 	for _, in := range inputs {
-		for _, service := range []string{"spamoor", "x", "all", "*", ""} {
+		for _, service := range directivecases.OddServices {
 			auth.ServiceAllowed(in, service)
-			for _, feature := range []string{"x", "basic", "all", "a", ""} {
+			for _, feature := range directivecases.OddFeatures {
 				auth.FeatureAllowed(in, service, feature, auth.FeatureDefaultDeny)
 				auth.FeatureAllowed(in, service, feature, auth.FeatureDefaultAllow)
 			}
