@@ -906,7 +906,7 @@ grants:
     services: ["dora:reindex"]                 # one more feature for one user
 ```
 
-Feature names are lowercase `[a-z0-9][a-z0-9-]*`. `basic` is the
+Service and feature names are lowercase `[a-z0-9][a-z0-9_-]*` (letters, digits, `-` and `_`, not starting with `-` or `_`). `basic` is the
 reserved name of basic access itself: `svc:basic` is the same grant as
 `svc`, may be written out, and is never a tool's own feature. The grants
 of all the groups an identity is in add up: `dora` from one group,

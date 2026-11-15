@@ -131,7 +131,8 @@ func TestNewServiceGrants(t *testing.T) {
 		{"empty team name", map[string][]string{"": {"all"}}, nil, `the value after "team:" is empty`},
 		{"no wildcard team", map[string][]string{"pan*": {"all"}}, nil, "there are no wildcards"},
 		{"a case variant next to a team is an error, not a second entry", map[string][]string{"panda": {"all"}, "PANDA": {}}, nil, `"PANDA" is not a team name`},
-		{"service with underscore", map[string][]string{"panda": {"up_gradoor"}}, nil, `invalid service name "up_gradoor"`},
+		{"service with underscore", map[string][]string{"panda": {"my_tool"}}, map[string][]string{"panda": {"my_tool"}}, ""},
+		{"service starting with an underscore", map[string][]string{"panda": {"_tool"}}, nil, `invalid service name "_tool"`},
 		{"service with a directive prefix", map[string][]string{"panda": {"+dora"}}, nil, `invalid service name "+dora"`},
 		{"service with a comma", map[string][]string{"panda": {"a,+all"}}, nil, `invalid service name "a,+all"`},
 		{"wildcard as a service", map[string][]string{"panda": {"*"}}, nil, `invalid service name "*"`},
@@ -411,7 +412,11 @@ func TestNewServiceGrants_Features(t *testing.T) {
 		{"plus sign", map[string][]string{"lh": {"+dora:roll"}}, nil, []string{`invalid service name "+dora"`}},
 		{"empty feature", map[string][]string{"lh": {"dora:"}}, nil, []string{`invalid feature name "" in grant "dora:"`}},
 		{"empty feature in the middle", map[string][]string{"lh": {"dora::roll"}}, nil, []string{`invalid feature name ""`}},
-		{"feature with underscore", map[string][]string{"lh": {"dora:roll_out"}}, nil, []string{`invalid feature name "roll_out"`}},
+		{
+			"underscores in names", map[string][]string{"lh": {"faucet:drop_100eth", "my_tool:drop_*"}},
+			map[string][]string{"lh": {"faucet:drop_100eth", "my_tool:drop_*"}}, nil,
+		},
+		{"feature starting with an underscore", map[string][]string{"lh": {"dora:_roll"}}, nil, []string{`invalid feature name "_roll"`}},
 		{"feature with a dot", map[string][]string{"lh": {"dora:v1.roll"}}, nil, []string{`invalid feature name "v1.roll"`}},
 		{"feature with a comma", map[string][]string{"lh": {"dora:roll,+all"}}, nil, []string{`invalid feature name "roll,+all"`}},
 		{"empty service before features", map[string][]string{"lh": {":roll"}}, nil, []string{`invalid service name ""`}},
@@ -1425,7 +1430,7 @@ func TestNewServiceGrants_AttributeMemberForms(t *testing.T) {
 // wellFormedDirective is what the issuer may emit when there is no
 // instance-wide bound: "-all", or a positive directive whose segments
 // are feature names, prefixes or "all".
-var wellFormedDirective = regexp.MustCompile(`^(-all|\+(all|[a-z0-9][a-z0-9-]*)(:(all|[a-z0-9][a-z0-9-]*\*?))*)$`)
+var wellFormedDirective = regexp.MustCompile(`^(-all|\+(all|[a-z0-9][a-z0-9_-]*)(:(all|[a-z0-9][a-z0-9_-]*\*?))*)$`)
 
 // TestServiceGrants_NeverEmitsMalformedSegments: a verifier skips a
 // directive with any malformed segment as a whole. The issuer must

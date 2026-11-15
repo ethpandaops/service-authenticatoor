@@ -77,11 +77,11 @@ type GrantGroup struct {
 
 // grantNamePattern is the form of a service name and of a feature name
 // in a grant.
-var grantNamePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9-]*$`)
+var grantNamePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]*$`)
 
 // featurePrefixPattern is the form of a prefix grant: a feature name
 // with one trailing "*".
-var featurePrefixPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9-]*\*$`)
+var featurePrefixPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]*\*$`)
 
 // ServiceGrants is the validated grants section. It turns an identity —
 // the provider that authenticated it, the teams that provider gave it,
@@ -440,7 +440,7 @@ func (s grantSet) addEntry(raw string) error {
 
 	service := fields[0]
 	if !grantNamePattern.MatchString(service) {
-		return fmt.Errorf("invalid service name %q in grant %q (want [a-z0-9][a-z0-9-]* or %q)",
+		return fmt.Errorf("invalid service name %q in grant %q (want [a-z0-9][a-z0-9_-]* or %q)",
 			service, raw, GrantAll)
 	}
 	features := s.service(service)
@@ -453,7 +453,7 @@ func (s grantSet) addEntry(raw string) error {
 			return fmt.Errorf("invalid feature %q in grant %q: \"*\" is a prefix wildcard and may only "+
 				"be the last character (\"user*\"); a lone \"*\" means %q", feature, raw, GrantAll)
 		default:
-			return fmt.Errorf("invalid feature name %q in grant %q (want [a-z0-9][a-z0-9-]*, "+
+			return fmt.Errorf("invalid feature name %q in grant %q (want [a-z0-9][a-z0-9_-]*, "+
 				"optionally ending in \"*\", or %q)", feature, raw, GrantAll)
 		}
 		switch feature {
