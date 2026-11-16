@@ -513,7 +513,7 @@ go test ./...
 ```
 
 The browser clients' evaluation of the `services` claim is tested against
-the Go one: `pkg/server/client_claims_test.go` runs the served scripts in
+the Go one: `pkg/server/handler_client_test.go` runs the served scripts in
 a JavaScript interpreter ([goja](https://github.com/dop251/goja), a
 test-only dependency) and compares their answers with
 `auth.ServiceAllowed` / `auth.FeatureAllowed` over the tables of
