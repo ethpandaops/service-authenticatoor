@@ -28,7 +28,8 @@ func TestHandleClientJS(t *testing.T) {
 
 	body := rr.Body.String()
 
-	// Must contain all four documented entry points + the namespace.
+	// Must contain all four documented entry points, the token-claims
+	// functions and the namespace.
 	// Scripts are served minified (local identifiers mangled), so only
 	// object property keys and global accesses are stable markers.
 	for _, marker := range []string{
@@ -37,10 +38,19 @@ func TestHandleClientJS(t *testing.T) {
 		"login:",
 		"logout:",
 		"getToken:",
+		"getClaims:",
+		"hasService:",
+		"hasFeature:",
+		"getTeams:",
+		"serviceAllowed:",
+		"featureAllowed:",
 	} {
 		if !strings.Contains(body, marker) {
 			t.Errorf("body missing %q", marker)
 		}
+	}
+	if strings.Contains(body, "__AUTHENTICATOOR_CLAIMS__") {
+		t.Errorf("include marker for the claims code not replaced")
 	}
 
 	// Must have substituted the auth service URL — placeholder gone.
@@ -109,11 +119,21 @@ func TestHandleClientJS_V2Surface(t *testing.T) {
 		"getToken:",
 		"login:",
 		"logout:",
+		"getClaims:",
+		"hasService:",
+		"hasFeature:",
+		"getTeams:",
+		"serviceAllowed:",
+		"featureAllowed:",
+		"version:2",
 		"/clientFrame?v=2&origin=",
 	} {
 		if !strings.Contains(body, marker) {
 			t.Errorf("body missing %q", marker)
 		}
+	}
+	if strings.Contains(body, "__AUTHENTICATOOR_CLAIMS__") {
+		t.Errorf("include marker for the claims code not replaced")
 	}
 
 	if strings.Contains(body, "__AUTH_SERVICE_URL__") {
@@ -150,13 +170,13 @@ func TestClientAssetMinified(t *testing.T) {
 
 	// Serving is expected to strip the (large) header comments and mangle
 	// whitespace — a served script should be substantially smaller than
-	// its source.
+	// its source (with the shared claims code included, as it is served).
 	for _, name := range []string{
 		"static/authenticatoor-v1.js",
 		"static/authenticatoor-v2.js",
 		"static/authenticatoor-frame-v2.js",
 	} {
-		raw, err := authenticatoorFS.ReadFile(name)
+		raw, err := clientSource(name)
 		if err != nil {
 			t.Fatalf("read %s: %v", name, err)
 		}
@@ -205,7 +225,11 @@ func TestHandleClientJS_SourceMap(t *testing.T) {
 	// The mapped source must carry the script's own public URL so
 	// devtools overlays the original onto the served file instead of
 	// listing a second file.
-	for _, marker := range []string{`"mappings"`, `"sourcesContent"`, `"client-v2.js"`} {
+	// The embedded source is the script as served, the shared claims
+	// code included.
+	for _, marker := range []string{
+		`"mappings"`, `"sourcesContent"`, `"client-v2.js"`, "function claimsFeatureAllowed(",
+	} {
 		if !strings.Contains(body, marker) {
 			t.Errorf("source map missing %q", marker)
 		}

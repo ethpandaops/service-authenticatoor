@@ -46,7 +46,7 @@ type NamedProvider struct {
 // Server is the lifecycle-managed HTTP entrypoint for authenticatoor.
 type Server struct {
 	cfg       *config.Config
-	issuer    issuer.Issuer
+	issuer    issuer.IdentityIssuer
 	providers []NamedProvider
 	// advertised is the subset of providers offered to unauthenticated
 	// users (the config's authMode entries, in order): the direct
@@ -89,6 +89,13 @@ func New(opts Options) (*Server, error) {
 	if opts.Issuer == nil {
 		return nil, errors.New("server: Issuer is required")
 	}
+	// Options.Issuer keeps the plain Issuer type it has always had; the
+	// server needs the full form, which carries the identity's teams.
+	// Falling back to Issue would silently mint tokens without them.
+	iss, ok := opts.Issuer.(issuer.IdentityIssuer)
+	if !ok {
+		return nil, errors.New("server: Issuer must implement issuer.IdentityIssuer")
+	}
 	if len(opts.Providers) == 0 {
 		return nil, errors.New("server: at least one Provider is required")
 	}
@@ -101,7 +108,7 @@ func New(opts Options) (*Server, error) {
 
 	s := &Server{
 		cfg:              opts.Config,
-		issuer:           opts.Issuer,
+		issuer:           iss,
 		providers:        opts.Providers,
 		advertised:       advertisedProviders(opts.Config.AuthMode, opts.Providers),
 		log:              opts.Log.WithField("package", "server"),
@@ -219,9 +226,14 @@ func (s *Server) routes() http.Handler {
 	// it can stay behind the edge protection when /auth/* is opened up,
 	// giving non-interactive clients (CF service tokens) an endpoint
 	// that never redirects.
+	// A provider for which that is a setting (oidc bearer tokens) gets
+	// the alias only when the setting is on.
 	for _, np := range s.providers {
+		if sw, ok := np.Provider.(protection.AmbientSwitch); ok && !sw.AmbientEnabled() {
+			continue
+		}
 		if amb, ok := np.Provider.(protection.AmbientAuthenticator); ok {
-			r.HandleFunc("/"+np.Name+"/token", s.ambientTokenHandler(amb)).Methods(http.MethodGet)
+			r.HandleFunc("/"+np.Name+"/token", s.ambientTokenHandler(np.Name, amb)).Methods(http.MethodGet)
 		}
 	}
 
@@ -309,6 +321,8 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 				for _, c := range out.SetCookies {
 					http.SetCookie(w, c)
 				}
+				// The provider that won is the identity's provider.
+				out.Identity.Provider = np.Name
 				next.ServeHTTP(w, r.WithContext(withIdentity(r.Context(), out.Identity)))
 				return
 			}
@@ -354,9 +368,10 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 }
 
 // ambientTokenHandler adapts the /auth/token contract onto a provider's
-// ambient edge credentials. No cookies, no redirects: either the edge
-// injected a verifiable identity or the response is the outcome's status.
-func (s *Server) ambientTokenHandler(amb protection.AmbientAuthenticator) http.HandlerFunc {
+// ambient credentials. No cookies, no redirects: either the request
+// carries a verifiable identity or the response is the outcome's status
+// (with the outcome's challenge headers, if it has any).
+func (s *Server) ambientTokenHandler(name string, amb protection.AmbientAuthenticator) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		out, err := amb.AuthenticateAmbient(r.Context(), r)
 		if err != nil {
@@ -365,6 +380,11 @@ func (s *Server) ambientTokenHandler(amb protection.AmbientAuthenticator) http.H
 			return
 		}
 		if out.Identity == nil {
+			for k, vs := range out.Challenge {
+				for _, v := range vs {
+					w.Header().Add(k, v)
+				}
+			}
 			status := out.Status
 			if status == 0 {
 				status = http.StatusUnauthorized
@@ -372,6 +392,7 @@ func (s *Server) ambientTokenHandler(amb protection.AmbientAuthenticator) http.H
 			http.Error(w, "unauthorized", status)
 			return
 		}
+		out.Identity.Provider = name
 		s.handleToken(w, r.WithContext(withIdentity(r.Context(), out.Identity)))
 	}
 }
@@ -458,6 +479,19 @@ func withIdentity(ctx context.Context, id *protection.Identity) context.Context 
 func identityFromContext(ctx context.Context) *protection.Identity {
 	v, _ := ctx.Value(identityKey{}).(*protection.Identity)
 	return v
+}
+
+// tokenIdentity is what the issuer is told about an authenticated
+// identity.
+func tokenIdentity(id *protection.Identity) issuer.Identity {
+	return issuer.Identity{
+		Subject:        id.Subject,
+		Email:          id.Email,
+		SubjectIsEmail: id.SubjectIsEmail,
+		Teams:          id.Teams,
+		Matches:        id.Matches,
+		Provider:       id.Provider,
+	}
 }
 
 // advertisedProviders resolves the authMode names against the provider

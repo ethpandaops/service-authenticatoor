@@ -1,0 +1,38 @@
+listen: "0.0.0.0:8080"
+issuer: "https://auth.devnet.example.org"
+externalURL: "https://auth-ext.devnet.example.org"
+audience:
+  - "devnet.example.org"
+  - "other.example.org"
+scopePattern: "*.devnet.example.org"
+tokenTTL: "30m"
+userHeader: "Cf-Access-Authenticated-User-Email"
+allowedReturnHosts:
+  - "*.devnet.example.org"
+cors:
+  allowedOrigins:
+    - "*.devnet.example.org"
+
+cloudflareAccess:
+  verifyJWT: true
+  teamDomain: "ethpandaops.cloudflareaccess.com"
+  audTag: "0123456789abcdef"
+  jwtHeader: "Cf-Access-Jwt-Assertion"
+
+signing:
+  mode: rs256
+  rs256:
+    privateKeyFile: "/etc/authenticatoor/keys/active.pem"
+    keyId: "k1"
+    generateIfMissing: false
+    previousKeys:
+      - keyId: "k0"
+        publicKeyFile: "/etc/authenticatoor/keys-prev/prev-k0.pub.pem"
+
+logging:
+  level: "info"
+  format: "json"
+
+metrics:
+  enabled: true
+  listen: "0.0.0.0:9090"

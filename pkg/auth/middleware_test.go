@@ -136,3 +136,56 @@ func TestRequireAuth_PassesWithClaims(t *testing.T) {
 		t.Errorf("status: got %d, want 200", rr.Code)
 	}
 }
+
+func TestRequireFeature(t *testing.T) {
+	tests := []struct {
+		name      string
+		claims    *Claims // nil: no claims on the context
+		wantDeny  int     // status under FeatureDefaultDeny
+		wantAllow int     // status under FeatureDefaultAllow
+	}{
+		{"no claims", nil, http.StatusUnauthorized, http.StatusUnauthorized},
+		{"feature granted", &Claims{Services: "-all,+dora,+dora:roll"}, http.StatusOK, http.StatusOK},
+		{"every feature granted", &Claims{Services: "+all,+all:all"}, http.StatusOK, http.StatusOK},
+		{"no services claim: basic access only", &Claims{}, http.StatusForbidden, http.StatusOK},
+		{"base access only", &Claims{Services: "-all,+dora"}, http.StatusForbidden, http.StatusOK},
+		{"base access to everything only", &Claims{Services: "+all"}, http.StatusForbidden, http.StatusOK},
+		{"another feature granted", &Claims{Services: "-all,+dora,+dora:hold"}, http.StatusForbidden, http.StatusOK},
+		{"feature excluded", &Claims{Services: "-all,+dora,-dora:roll"}, http.StatusForbidden, http.StatusForbidden},
+		{"feature excluded from all", &Claims{Services: "+dora:all:-roll"}, http.StatusForbidden, http.StatusForbidden},
+		{"feature granted on another service", &Claims{Services: "-all,+spamoor,+spamoor:roll"}, http.StatusForbidden, http.StatusForbidden},
+		{"no access at all", &Claims{Services: "-all"}, http.StatusForbidden, http.StatusForbidden},
+	}
+	for _, tc := range tests {
+		for _, mode := range []struct {
+			name string
+			def  FeatureDefault
+			want int
+		}{
+			{"default deny", FeatureDefaultDeny, tc.wantDeny},
+			{"default allow", FeatureDefaultAllow, tc.wantAllow},
+		} {
+			t.Run(tc.name+"/"+mode.name, func(t *testing.T) {
+				called := false
+				h := RequireFeature("dora", "roll", mode.def, func(w http.ResponseWriter, _ *http.Request) {
+					called = true
+					w.WriteHeader(http.StatusOK)
+				})
+
+				req := httptest.NewRequest(http.MethodPost, "/api/roll", nil)
+				if tc.claims != nil {
+					req = req.WithContext(WithClaims(req.Context(), tc.claims))
+				}
+				rr := httptest.NewRecorder()
+				h(rr, req)
+
+				if rr.Code != mode.want {
+					t.Errorf("status: got %d, want %d", rr.Code, mode.want)
+				}
+				if called != (mode.want == http.StatusOK) {
+					t.Errorf("handler called: %t with status %d", called, rr.Code)
+				}
+			})
+		}
+	}
+}

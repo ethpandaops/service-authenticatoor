@@ -33,6 +33,26 @@
 //     Returns the cached bearer token for use in API calls. Null if no
 //     fresh token is stored. Does not trigger any network activity.
 //
+// Token details, for deciding what a page SHOWS. They are the same
+// functions the v2 client has (see authenticatoor-v2.js for the full
+// description). The claims are base64url-decoded from the token and NOT
+// VERIFIED here; the API of each tool stays the enforcement.
+//
+//   getClaims(): object|null
+//   hasService(service): boolean
+//   hasFeature(service, feature, opts?): boolean   opts = { defaultAllow }
+//   getTeams(): string[]
+//   serviceAllowed(directives, service): boolean
+//   featureAllowed(directives, service, feature, defaultAllow): boolean
+//
+//     The first four are synchronous and about the token getToken()
+//     returns at that moment: the fresh token in sessionStorage. Before
+//     checkLogin() has resolved there is usually none, and they answer
+//     null / false / false / [] — as they do when unauthenticated, and
+//     once the stored token is about to expire. Call them after
+//     checkLogin() resolved with authenticated=true. The object
+//     checkLogin() resolves to is unchanged.
+//
 // The auth service URL is templated into the file at serve time. This file
 // is meant to be loaded as `<script src="https://auth.<devnet>/client.js">`.
 
@@ -139,6 +159,10 @@
       return '';
     }
   }
+
+  // ─── token claims (shared with the v2 client, included at serve time) ───
+
+/*__AUTHENTICATOOR_CLAIMS__*/
 
   // ─── fragment capture (after /auth/login redirect) ──────────────────────
 
@@ -307,6 +331,8 @@
 
   // ─── publish ────────────────────────────────────────────────────────────
 
+  var claimFns = claimsAPI(function () { return claimsTokenState(getToken()); });
+
   if (!window.ethpandaops) window.ethpandaops = {};
   window.ethpandaops.authenticatoor = {
     checkLogin:       checkLogin,
@@ -315,5 +341,11 @@
     getToken:         getToken,
     isLoggedIn:       isLoggedIn,
     authServiceURL:   authServiceURL,
+    getClaims:        claimFns.getClaims,
+    hasService:       claimFns.hasService,
+    hasFeature:       claimFns.hasFeature,
+    getTeams:         claimFns.getTeams,
+    serviceAllowed:   claimFns.serviceAllowed,
+    featureAllowed:   claimFns.featureAllowed,
   };
 })();

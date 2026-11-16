@@ -1,0 +1,5 @@
+authMode: cloudflare
+cloudflareAccess:
+  verifyJWT: true
+  teamDomain: "<team>.cloudflareaccess.com"
+  audTag: "<from CF Access app config>"

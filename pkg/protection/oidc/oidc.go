@@ -141,6 +141,29 @@ type Config struct {
 	// Scopes overrides the OIDC scopes requested. Defaults to
 	// ["openid", "email", "groups"]. `openid` is required.
 	Scopes []string
+	// TrustUnverifiedEmail makes the provider use the id_token's email
+	// although the token does not say email_verified: true. Off by
+	// default: an unverified email is whatever its user typed, so
+	// using it as the identity, in team rules or in grants lets a user
+	// of an IdP that does not confirm addresses become someone else.
+	// Only for an IdP that verifies emails without saying so.
+	TrustUnverifiedEmail bool
+
+	// Teams are the static teams given to every identity this provider
+	// authenticates (normalized at New; invalid names fail Start).
+	Teams []string
+	// TeamRules derive further teams from the attributes this provider
+	// verified about the user (see the package documentation of each
+	// provider for its attributes).
+	TeamRules []protection.TeamRule
+	// GrantMembers are the attribute members the grants section names
+	// for this provider ("<provider>/<attribute>:<value>"). The provider
+	// reports which of them an identity satisfies.
+	GrantMembers []protection.AttributeMember
+
+	// Bearer lets non-browser clients authenticate with a JWT of the
+	// IdP in an Authorization header (see bearer.go). Nil: off.
+	Bearer *BearerConfig
 
 	// HTTPClient is the http.Client used for discovery / token endpoint
 	// calls. Defaults to a 10s-timeout client.
@@ -158,18 +181,27 @@ type Provider struct {
 	httpClient    *http.Client
 	disco         *discovery
 	verifier      *idTokenVerifier
+	// bearer verifies the tokens of non-browser clients; nil unless
+	// Config.Bearer is set.
+	bearer        *idTokenVerifier
 	allowedGroups map[string]struct{}
+	teams         protection.Teams
+	members       protection.Members
+	door          session.Door
 	scopeList     string
 	cookieSecure  bool
 }
 
 var (
-	_ protection.Provider       = (*Provider)(nil)
-	_ protection.SessionClearer = (*Provider)(nil)
+	_ protection.Provider             = (*Provider)(nil)
+	_ protection.SessionClearer       = (*Provider)(nil)
+	_ protection.AmbientAuthenticator = (*Provider)(nil)
+	_ protection.AmbientSwitch        = (*Provider)(nil)
 )
 
-// New constructs a Provider. Defaults are filled in here; secret material,
-// discovery fetch, and JWKS load happen in Start.
+// New constructs a Provider. Defaults are filled in here; secret material
+// and the discovery fetch happen in Start, which also starts the JWKS
+// load.
 func New(log logrus.FieldLogger, cfg Config) *Provider {
 	if cfg.LoginPath == "" {
 		cfg.LoginPath = DefaultLoginPath
@@ -198,8 +230,12 @@ func New(log logrus.FieldLogger, cfg Config) *Provider {
 		log:           log.WithField("package", "protection/oidc"),
 		httpClient:    cfg.HTTPClient,
 		allowedGroups: allowedGroupsSet(cfg.AllowedGroups),
-		scopeList:     strings.Join(scopes(cfg.Scopes), " "),
-		cookieSecure:  strings.HasPrefix(cfg.PublicURL, "https://"),
+		teams:         protection.NewTeams(cfg.Teams, cfg.TeamRules),
+		members:       protection.NewMembers(cfg.GrantMembers),
+		// Another IdP, or another client at it, is another door.
+		door:         session.NewDoor("oidc", strings.TrimRight(cfg.IssuerURL, "/"), cfg.ClientID),
+		scopeList:    strings.Join(scopes(cfg.Scopes), " "),
+		cookieSecure: strings.HasPrefix(cfg.PublicURL, "https://"),
 	}
 }
 
@@ -207,7 +243,10 @@ func New(log logrus.FieldLogger, cfg Config) *Provider {
 func (p *Provider) Name() string { return "oidc" }
 
 // Start validates required fields, loads secret material, fetches the
-// IdP's discovery document, and primes the JWKS verifier.
+// IdP's discovery document, and sets up the JWKS verifier. A discovery
+// document that cannot be fetched fails Start; a JWKS that cannot does
+// not — the keys are loaded in the background, and until they are
+// there no token verifies (see newIDTokenVerifier).
 func (p *Provider) Start(ctx context.Context) error {
 	if p.cfg.IssuerURL == "" {
 		return errors.New("oidc: IssuerURL is required")
@@ -220,6 +259,9 @@ func (p *Provider) Start(ctx context.Context) error {
 	}
 	if p.cfg.ClientID == "" {
 		return errors.New("oidc: ClientID is required")
+	}
+	if err := p.teams.Err(); err != nil {
+		return fmt.Errorf("oidc: %w", err)
 	}
 
 	cs, err := session.LoadSecret(p.cfg.ClientSecret, p.cfg.ClientSecretFile, "ClientSecret")
@@ -239,12 +281,20 @@ func (p *Provider) Start(ctx context.Context) error {
 	}
 	p.disco = disco
 
-	verifier, err := newIDTokenVerifier(ctx, disco.JWKSURI, disco.Issuer, p.cfg.ClientID, p.cfg.Now)
+	verifier, err := newIDTokenVerifier(ctx, disco.JWKSURI, disco.Issuer, []string{p.cfg.ClientID}, p.cfg.Now)
 	if err != nil {
 		return err
 	}
 	p.verifier = verifier
 
+	if err := p.startBearer(ctx); err != nil {
+		return err
+	}
+
+	if p.cfg.TrustUnverifiedEmail {
+		p.log.Warn("trustUnverifiedEmail is on: emails are used as identity, in team rules and in grants " +
+			"even when the id_token does not mark them email_verified")
+	}
 	p.log.WithFields(logrus.Fields{
 		"issuer":       disco.Issuer,
 		"callbackURL":  p.cfg.CallbackURL,
@@ -252,6 +302,8 @@ func (p *Provider) Start(ctx context.Context) error {
 		"clientID":     p.cfg.ClientID,
 		"groups":       p.cfg.AllowedGroups,
 		"scopes":       p.scopeList,
+		"teams":        p.teams.Static(),
+		"teamRules":    p.teams.Rules(),
 	}).Info("oidc provider ready")
 	return nil
 }
@@ -276,13 +328,22 @@ func (p *Provider) LoginURL(returnTo string) string {
 
 // Authenticate looks for a valid session cookie. When absent or stale the
 // outcome redirects to the login entry, which starts the OIDC flow.
+//
+// An Authorization header is not looked at, with or without
+// Config.Bearer: bearer tokens are accepted on the token alias only
+// (AuthenticateAmbient). On /auth/* every provider gets a look at the
+// request and the first identity wins, so a header read here would be
+// judged or passed over depending on the order of the providers.
 func (p *Provider) Authenticate(_ context.Context, r *http.Request) (protection.Outcome, error) {
 	if c, err := r.Cookie(p.cfg.SessionCookieName); err == nil {
-		sub, email, perr := session.Parse(p.sessionSecret, c.Value, p.cfg.Now())
+		sess, perr := session.Parse(p.sessionSecret, p.door, c.Value, p.cfg.Now())
 		if perr == nil {
 			return protection.Outcome{Identity: &protection.Identity{
-				Subject: sub,
-				Email:   email,
+				Subject:        sess.Subject,
+				Email:          sess.Email,
+				SubjectIsEmail: sess.SubjectIsEmail,
+				Teams:          p.teams.With(sess.Teams),
+				Matches:        sess.Matches,
 			}}, nil
 		}
 		p.log.WithError(perr).Debug("session cookie invalid; redirecting to login")
@@ -434,29 +495,31 @@ func (p *Provider) handleCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if !groupAllowed(claims.Groups, p.allowedGroups) {
-		p.log.WithFields(logrus.Fields{
-			"sub":           claims.Subject,
-			"email":         claims.Email,
-			"groups":        strings.Join(claims.Groups, ", "),
-			"allowedGroups": strings.Join(p.cfg.AllowedGroups, ", "),
-		}).Warn("user not in any allowed group")
-		http.Error(w, fmt.Sprintf(
-			"your account %q is not in any allowed group.\n"+
-				"  allowed: [%s]\n"+
-				"  your groups: [%s]",
-			claims.Email,
-			strings.Join(p.cfg.AllowedGroups, ", "),
-			strings.Join(claims.Groups, ", "),
-		), http.StatusForbidden)
+	id, refusal := p.identify(claims, idToken, false)
+	if refusal != "" {
+		http.Error(w, refusal, http.StatusForbidden)
 		return
 	}
+	subject, email := id.subject, id.email
+	// Teams derived by the team rules from the id_token are captured now
+	// and travel in the session; the static teams are applied per
+	// request.
+	loginLog := p.log.WithField("sub", subject)
+	teams := p.teams.Capture(loginLog, id.attrs)
+	// The grant members the id_token satisfies are captured the same
+	// way: which members matched, not the claims.
+	matches := p.members.Capture(loginLog, id.attrs, teams)
+	p.log.WithFields(logrus.Fields{
+		"sub":   subject,
+		"teams": p.teams.With(teams),
+	}).Debug("oidc login resolved teams")
 
-	subject := claims.Email
-	if subject == "" {
-		subject = claims.Subject
+	cookie, err := p.signSessionCookie(subject, email, teams, matches)
+	if errors.Is(err, session.ErrTooLarge) {
+		loginLog.WithError(err).Warn("login refused: the session does not fit a cookie")
+		http.Error(w, protection.SessionTooLargeMessage, http.StatusForbidden)
+		return
 	}
-	cookie, err := p.signSessionCookie(subject, claims.Email)
 	if err != nil {
 		p.log.WithError(err).Error("session cookie signing failed")
 		http.Error(w, "session error", http.StatusInternalServerError)
@@ -471,6 +534,113 @@ func (p *Provider) handleCallback(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, returnTo, http.StatusFound)
 }
 
+// claimIdentity is what a verified token of the IdP says about its
+// user, after the rules of this provider were applied to it.
+type claimIdentity struct {
+	// subject is the verified email, or the IdP's "sub" without one.
+	subject string
+	// email is the verified email; empty without one.
+	email string
+	// attrs are the token's claims as team rules and grant members see
+	// them (without "email" when it is not verified).
+	attrs protection.Attributes
+}
+
+// identify turns the claims of a verified token into the identity of
+// its user. It is the one place that does so: the login callback runs
+// it on the id_token and the bearer path on the token a client
+// presented, so that the same user gets the same subject, teams and
+// grant members through both.
+//
+// It applies allowedGroups — refusal is then the message for the user
+// and the identity is not to be used — and the verified-email rule, and
+// picks the subject. token is the verified JWT the claims came from.
+//
+// perRequest says that the caller runs it on every request (the bearer
+// path) rather than once per login: what it has to say about the user —
+// not in an allowed group, email not verified, a subject that looks
+// like an email — is then logged at debug level instead of repeating
+// at its own level with every token a client fetches.
+func (p *Provider) identify(
+	claims *idTokenClaims, token string, perRequest bool,
+) (id claimIdentity, refusal string) {
+	// What a login reports once, a bearer client would repeat with
+	// every request.
+	at := func(level logrus.Level) logrus.Level {
+		if perRequest {
+			return logrus.DebugLevel
+		}
+		return level
+	}
+	if !groupAllowed(claims.Groups, p.allowedGroups) {
+		logAt(p.log.WithFields(logrus.Fields{
+			"sub":           claims.Subject,
+			"email":         claims.Email,
+			"groups":        strings.Join(claims.Groups, ", "),
+			"allowedGroups": strings.Join(p.cfg.AllowedGroups, ", "),
+		}), at(logrus.WarnLevel), "user not in any allowed group")
+		return claimIdentity{}, fmt.Sprintf(
+			"your account %q is not in any allowed group.\n"+
+				"  allowed: [%s]\n"+
+				"  your groups: [%s]",
+			claims.Email,
+			strings.Join(p.cfg.AllowedGroups, ", "),
+			strings.Join(claims.Groups, ", "),
+		)
+	}
+
+	// The email counts only when the IdP vouches for it. An unverified
+	// one is not the identity, is not put into tokens and is not shown
+	// to team rules or grant members; the subject then is the IdP's
+	// own "sub".
+	email := claims.Email
+	if email != "" && !bool(claims.EmailVerified) && !p.cfg.TrustUnverifiedEmail {
+		logAt(p.log.WithField("sub", claims.Subject), at(logrus.InfoLevel),
+			"id_token email is not marked email_verified: the email is dropped and the user is "+
+				"identified by the IdP subject (oidc.trustUnverifiedEmail is off)")
+		email = ""
+	}
+	subject := email
+	if subject == "" {
+		// A raw IdP subject. It is marked as such on the identity
+		// (SubjectIsEmail false), so a grants member that names an
+		// email address never matches it — some IdPs can be set up to
+		// use the user's address as "sub", verified or not. The token's
+		// "sub" claim has no such mark, hence the warning: a tool that
+		// reads "sub" as an email would take this one for verified.
+		subject = claims.Subject
+		if strings.Contains(subject, "@") {
+			logAt(p.log.WithField("sub", subject), at(logrus.WarnLevel),
+				"the IdP subject looks like an email address but is not a verified email; it becomes "+
+					"the token's sub as it is and matches no user: member of a grants group")
+		}
+	}
+	// The attributes are the claims of the token that was just verified
+	// — every claim, by its name ("groups", "email", "sub", nested ones
+	// by dotted path) — and nothing else: no userinfo call is made.
+	attrs, err := protection.TokenAttributes(token)
+	if err != nil {
+		p.log.WithError(err).Warn("id_token claims unreadable for team rules; none applied")
+	}
+	if email == "" {
+		delete(attrs, "email")
+	}
+	return claimIdentity{subject: subject, email: email, attrs: attrs}, ""
+}
+
+// logAt logs msg at the given level. logrus.FieldLogger has a method
+// per level and none that takes one.
+func logAt(log logrus.FieldLogger, level logrus.Level, msg string) {
+	switch level {
+	case logrus.DebugLevel:
+		log.Debug(msg)
+	case logrus.InfoLevel:
+		log.Info(msg)
+	default:
+		log.Warn(msg)
+	}
+}
+
 // signSessionCookie builds the HttpOnly session cookie for the
 // authenticated user.
 //
@@ -479,8 +649,15 @@ func (p *Provider) handleCallback(w http.ResponseWriter, r *http.Request) {
 // read and overwrite the cookie. Browsers treat *.localhost as a
 // secure context, so Secure=true works for HTTP local dev too —
 // non-localhost plain HTTP isn't a supported deployment.
-func (p *Provider) signSessionCookie(sub, email string) (*http.Cookie, error) {
-	signed, err := session.Sign(p.sessionSecret, sub, email, p.cfg.SessionTTL, p.cfg.Now())
+func (p *Provider) signSessionCookie(sub, email string, teams, matches []string) (*http.Cookie, error) {
+	// The subject is the email exactly when there is one (see
+	// handleCallback); otherwise it is the IdP's raw "sub".
+	signed, err := session.SignCookie(p.cfg.SessionCookieName, p.sessionSecret, p.door,
+		session.Payload{
+			Subject: sub, Email: email, SubjectIsEmail: email != "" && sub == email,
+			Teams: teams, Matches: matches,
+		},
+		p.cfg.SessionTTL, p.cfg.Now())
 	if err != nil {
 		return nil, err
 	}

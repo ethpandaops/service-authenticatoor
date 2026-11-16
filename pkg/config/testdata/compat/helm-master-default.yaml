@@ -1,0 +1,23 @@
+listen: "0.0.0.0:8080"
+issuer: "https://auth.devnet.example.org"
+tokenTTL: "30m"
+userHeader: "Cf-Access-Authenticated-User-Email"
+
+cloudflareAccess:
+  verifyJWT: true
+  teamDomain: "ethpandaops.cloudflareaccess.com"
+  jwtHeader: "Cf-Access-Jwt-Assertion"
+
+signing:
+  mode: rs256
+  rs256:
+    privateKeyFile: "/etc/authenticatoor/keys/active.pem"
+    generateIfMissing: true
+
+logging:
+  level: "info"
+  format: "json"
+
+metrics:
+  enabled: false
+  listen: "0.0.0.0:9090"

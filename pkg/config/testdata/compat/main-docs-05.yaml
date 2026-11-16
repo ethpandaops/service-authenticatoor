@@ -1,0 +1,5 @@
+authMode: any
+# All anyAuth fields are optional; defaults are fine for local dev.
+# anyAuth:
+#   cookieName: "authenticatoor_anyauth_user"
+#   cookieTTL:  "12h"

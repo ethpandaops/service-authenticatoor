@@ -3,8 +3,9 @@
 //
 // The cookie payloads are tiny HS256 JWTs:
 //
-//   - Session: carries Subject + Email so /auth/* handlers can rebuild
-//     a protection.Identity on subsequent requests. Built via Sign /
+//   - Session: carries Subject + Email + the teams derived from the
+//     identity source at login, so /auth/* handlers can rebuild a
+//     protection.Identity on subsequent requests. Built via Sign /
 //     Parse.
 //   - State:   carries a random Nonce + the original request URL so the
 //     OAuth/OIDC callback can verify the round-trip came from the same
@@ -20,7 +21,10 @@ package session
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
@@ -28,41 +32,183 @@ import (
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
+
+	"github.com/ethpandaops/service-authenticatoor/pkg/auth"
+	"github.com/ethpandaops/service-authenticatoor/pkg/protection"
 )
+
+// Payload is what a session cookie carries about the authenticated user.
+type Payload struct {
+	// Subject is the stable identifier of the user. Required.
+	Subject string
+	// Email is the user-facing email; may be empty.
+	Email string
+	// SubjectIsEmail records what protection.Identity.SubjectIsEmail
+	// says: Subject is an email address the provider verified, not a
+	// raw provider subject. It is stored in the cookie rather than
+	// guessed from the look of the subject when the session is read.
+	SubjectIsEmail bool
+	// Teams holds the teams the provider derived from its identity
+	// source at login (id_token groups, GitHub orgs). The provider's
+	// configured static teams are deliberately not stored: they are
+	// re-applied from the current config on every request. Empty for
+	// sessions issued before the field existed.
+	Teams []string
+	// Matches holds the attribute members of the grants section that
+	// the identity satisfied at login, as "<attribute>:<value>" keys.
+	// Only the matches are kept — never the attributes themselves.
+	Matches []string
+}
+
+// Door identifies the door a session was opened at: the kind of
+// provider and what it authenticates against. It is derived by NewDoor
+// and stored in every session cookie, inside the signed payload.
+//
+// The cookie's signing key is derived from the provider's NAME only.
+// The name alone does not say what stands behind it: an entry can keep
+// its name while its type changes (oidc → basic), or while it is
+// pointed at another identity provider. The door does say it, and a
+// session only counts for the door it was opened at.
+//
+// A Door can only be made by NewDoor. The zero value is not a door:
+// Sign and Parse refuse it, so no code path can mint or accept a
+// session that belongs to no door.
+type Door struct {
+	id string
+}
+
+// NewDoor derives the door of a provider from its kind ("oidc",
+// "cloudflare", …) and the details that make it the same door: the
+// IdP's issuer, the Cloudflare team. Changing any of them yields
+// another door. kind must not be empty; with an empty kind the result
+// is the zero Door, which nothing accepts.
+func NewDoor(kind string, details ...string) Door {
+	if kind == "" {
+		return Door{}
+	}
+	// Every part is written with its length in front, so that no two
+	// different lists of parts give the same bytes: with a separator,
+	// ("a\x00b") and ("a", "b") would be one door.
+	h := sha256.New()
+	var size [8]byte
+	for _, part := range append([]string{kind}, details...) {
+		binary.BigEndian.PutUint64(size[:], uint64(len(part)))
+		h.Write(size[:])
+		h.Write([]byte(part))
+	}
+	return Door{id: hex.EncodeToString(h.Sum(nil)[:8])}
+}
+
+// String returns the door's identifier, for logs.
+func (d Door) String() string { return d.id }
+
+// errNoDoor is returned when Sign or Parse is handed the zero Door.
+var errNoDoor = errors.New("session: no door (use session.NewDoor)")
 
 // sessionClaims is the payload of the signed session cookie.
 type sessionClaims struct {
 	jwt.RegisteredClaims
 
-	Email string `json:"email,omitempty"`
+	Email string   `json:"email,omitempty"`
+	Teams []string `json:"teams,omitempty"`
+	Match []string `json:"match,omitempty"`
+	Door  string   `json:"door,omitempty"`
+	// SubjectIsEmail is Payload.SubjectIsEmail ("sem": subject is an
+	// email).
+	SubjectIsEmail bool `json:"sem,omitempty"`
 }
 
-// Sign produces a compact signed JWT carrying the session for the
-// supplied subject/email. ttl bounds the cookie's lifetime independently
-// of the cookie's MaxAge so a tampered cookie that survives client-side
-// extension still expires server-side.
-func Sign(secret []byte, subject, email string, ttl time.Duration, now time.Time) (string, error) {
+// MaxCookieBytes is the size browsers allow a cookie: its name and its
+// value together (RFC 6265bis; Chrome and Firefox enforce exactly
+// this). A larger cookie is dropped by the browser without a word, and
+// its user would go round the login in circles.
+const MaxCookieBytes = 4096
+
+// ErrTooLarge is returned by Sign and SignCookie when the session
+// would not fit a cookie. Teams and attribute matches are bounded
+// before they get here, so what makes a session too large is a subject
+// or an email of several hundred bytes. The login has to be refused.
+var ErrTooLarge = errors.New("session: too large for a cookie")
+
+// SignCookie is Sign for a session stored in the cookie called name.
+// It fails with ErrTooLarge unless name and value together stay within
+// MaxCookieBytes, so a provider never sets a cookie the browser drops.
+func SignCookie(
+	name string, secret []byte, door Door, p Payload, ttl time.Duration, now time.Time,
+) (string, error) {
+	signed, err := Sign(secret, door, p, ttl, now)
+	if err != nil {
+		return "", err
+	}
+	if size := len(name) + len(signed); size > MaxCookieBytes {
+		return "", fmt.Errorf("%w: cookie %q would be %d bytes, browsers allow %d (subject: %d bytes, "+
+			"email: %d bytes)", ErrTooLarge, name, size, MaxCookieBytes, len(p.Subject), len(p.Email))
+	}
+	return signed, nil
+}
+
+// Sign produces a compact signed JWT carrying the session payload. ttl
+// bounds the cookie's lifetime independently of the cookie's MaxAge so a
+// tampered cookie that survives client-side extension still expires
+// server-side.
+//
+// Teams are stored in normal form and capped at auth.MaxTeams entries,
+// and the attribute matches share a byte budget with them
+// (protection.BoundMatches): 32 names of up to 63 characters make for a
+// cookie of about 3.3 KB. Callers are expected to have bounded (and
+// logged) both lists already — protection.Teams.Capture and
+// protection.Members.Capture do — so the cap here is a backstop that
+// does not bite on any path the providers take.
+//
+// Subject and email have no bound of their own. What is bounded is the
+// result: a session larger than a cookie can be is refused with
+// ErrTooLarge. Providers that store the session in a cookie use
+// SignCookie, which counts the cookie's name as well.
+func Sign(secret []byte, door Door, p Payload, ttl time.Duration, now time.Time) (string, error) {
+	if door.id == "" {
+		return "", errNoDoor
+	}
 	claims := sessionClaims{
 		RegisteredClaims: jwt.RegisteredClaims{
-			Subject:   subject,
+			Subject:   p.Subject,
 			IssuedAt:  jwt.NewNumericDate(now),
 			ExpiresAt: jwt.NewNumericDate(now.Add(ttl)),
 		},
-		Email: email,
+		Email:          p.Email,
+		Teams:          boundTeams(p.Teams),
+		Door:           door.id,
+		SubjectIsEmail: p.SubjectIsEmail,
 	}
+	claims.Match, _ = protection.BoundMatches(p.Matches, claims.Teams)
 	tok := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
 	signed, err := tok.SignedString(secret)
 	if err != nil {
 		return "", fmt.Errorf("session: sign: %w", err)
 	}
+	if len(signed) >= MaxCookieBytes {
+		return "", fmt.Errorf("%w: the value alone is %d bytes, browsers allow %d for name and value "+
+			"(subject: %d bytes, email: %d bytes)", ErrTooLarge, len(signed), MaxCookieBytes,
+			len(p.Subject), len(p.Email))
+	}
 	return signed, nil
 }
 
 // Parse verifies the signature and expiration of a session cookie and
-// returns the embedded subject/email.
-func Parse(secret []byte, raw string, now time.Time) (subject, email string, err error) {
+// returns the embedded payload. A cookie that fails verification yields
+// an error and no payload at all — callers never see unverified teams.
+//
+// door is the door of the provider reading the cookie. A session opened
+// at another door — the provider entry changed its type or its identity
+// source while keeping its name — is rejected. So is a cookie without a
+// door, as versions before doors issued them: nothing in it says what
+// it was opened at, and accepting it would let it count at whatever
+// the entry is now. Their users log in again.
+func Parse(secret []byte, door Door, raw string, now time.Time) (Payload, error) {
+	if door.id == "" {
+		return Payload{}, errNoDoor
+	}
 	if raw == "" {
-		return "", "", errors.New("session: empty token")
+		return Payload{}, errors.New("session: empty token")
 	}
 	parser := jwt.NewParser(
 		jwt.WithValidMethods([]string{jwt.SigningMethodHS256.Alg()}),
@@ -72,15 +218,40 @@ func Parse(secret []byte, raw string, now time.Time) (subject, email string, err
 	claims := &sessionClaims{}
 	tok, err := parser.ParseWithClaims(raw, claims, func(_ *jwt.Token) (any, error) { return secret, nil })
 	if err != nil {
-		return "", "", fmt.Errorf("session: parse: %w", err)
+		return Payload{}, fmt.Errorf("session: parse: %w", err)
 	}
 	if !tok.Valid {
-		return "", "", errors.New("session: token not valid")
+		return Payload{}, errors.New("session: token not valid")
 	}
 	if claims.Subject == "" {
-		return "", "", errors.New("session: missing subject")
+		return Payload{}, errors.New("session: missing subject")
 	}
-	return claims.Subject, claims.Email, nil
+	switch claims.Door {
+	case door.id:
+		teams := boundTeams(claims.Teams)
+		matches, _ := protection.BoundMatches(claims.Match, teams)
+		return Payload{
+			Subject:        claims.Subject,
+			Email:          claims.Email,
+			SubjectIsEmail: claims.SubjectIsEmail,
+			Teams:          teams,
+			Matches:        matches,
+		}, nil
+	case "":
+		return Payload{}, errors.New("session: cookie without a door (issued by an earlier version); log in again")
+	default:
+		return Payload{}, errors.New("session: opened at another door (the provider's type or identity source changed)")
+	}
+}
+
+// boundTeams returns the valid team names in normal form, de-duplicated,
+// sorted and capped at auth.MaxTeams.
+func boundTeams(names []string) []string {
+	teams, _ := auth.CanonicalTeams(names)
+	if len(teams) > auth.MaxTeams {
+		teams = teams[:auth.MaxTeams]
+	}
+	return teams
 }
 
 // stateClaims is the payload of the OAuth state cookie.

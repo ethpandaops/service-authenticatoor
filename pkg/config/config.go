@@ -13,12 +13,17 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"reflect"
 	"regexp"
 	"slices"
 	"strings"
 	"time"
 
 	"github.com/spf13/viper"
+	"go.yaml.in/yaml/v3"
+
+	"github.com/ethpandaops/service-authenticatoor/pkg/issuer"
+	"github.com/ethpandaops/service-authenticatoor/pkg/protection"
 )
 
 // AuthMode names a protection provider type. Providers are configured
@@ -97,6 +102,19 @@ type Config struct {
 
 	// UserHeader is a deprecated alias for cloudflareAccess.userHeader.
 	// When the latter is unset, this value is folded in by applyDerived.
+	// Grants is the service grants section: a list of groups, each
+	// naming its members — teams and users, always together with the
+	// provider they come through — and the services they may use. When
+	// set, the token's "services" claim is computed per identity from
+	// it (see issuer.ServiceGrants). nil means the section is absent
+	// and tokens carry no per-identity constraint; a present but empty
+	// section is non-nil and names nobody. With the section, an
+	// identity that no group names gets no token.
+	//
+	// Read from the YAML document by loadGrants rather than through
+	// viper: its members are data and must arrive as written.
+	Grants *issuer.GrantsConfig `yaml:"grants" mapstructure:"-"`
+
 	UserHeader         string   `yaml:"userHeader" mapstructure:"userHeader"`
 	AllowedReturnHosts []string `yaml:"allowedReturnHosts" mapstructure:"allowedReturnHosts"`
 
@@ -114,6 +132,10 @@ type Config struct {
 	// fields encountered during Load. The entrypoint logs each at
 	// startup; tests can inspect this slice directly.
 	DeprecationWarnings []string `yaml:"-" mapstructure:"-"`
+
+	// Warnings collects other messages about the config file that the
+	// entrypoint logs at startup, such as unknown top-level keys.
+	Warnings []string `yaml:"-" mapstructure:"-"`
 }
 
 // ProviderConfig configures one protection provider instance. Exactly
@@ -160,6 +182,14 @@ type CloudflareAccessConfig struct {
 	// SessionTTL is the session cookie lifetime for logins minted at
 	// the provider's login entry (/<name>/login). Defaults to "12h".
 	SessionTTL time.Duration `yaml:"sessionTTL" mapstructure:"sessionTTL"`
+	// Teams are static team names put into the "teams" token claim of
+	// every identity this provider authenticates — service tokens
+	// included. Names are lowercased; each must match
+	// [a-z0-9][a-z0-9._-]{0,62}, at most 32 per provider.
+	Teams []string `yaml:"teams" mapstructure:"teams"`
+	// TeamRules derive further teams from the attributes the provider
+	// verified about the user; see protection.TeamRule and docs/config.md.
+	TeamRules []protection.TeamRule `yaml:"teamRules" mapstructure:"teamRules"`
 }
 
 // VerifyJWTEnabled reports the effective verifyJWT setting (unset = true).
@@ -187,6 +217,13 @@ type BasicAuthConfig struct {
 	// SessionTTL is the session cookie lifetime for logins minted at
 	// the provider's login entry (/<name>/login). Defaults to "12h".
 	SessionTTL time.Duration `yaml:"sessionTTL" mapstructure:"sessionTTL"`
+	// Teams are static team names put into the "teams" token claim of
+	// every identity this provider authenticates. Names are lowercased;
+	// each must match [a-z0-9][a-z0-9._-]{0,62}, at most 32 per provider.
+	Teams []string `yaml:"teams" mapstructure:"teams"`
+	// TeamRules derive further teams from the attributes the provider
+	// verified about the user; see protection.TeamRule and docs/config.md.
+	TeamRules []protection.TeamRule `yaml:"teamRules" mapstructure:"teamRules"`
 }
 
 // AnyAuthConfig configures the anyauth (dev-only) protection provider.
@@ -197,6 +234,13 @@ type AnyAuthConfig struct {
 	CookieName string `yaml:"cookieName" mapstructure:"cookieName"`
 	// CookieTTL overrides the cookie lifetime. Defaults to "12h".
 	CookieTTL time.Duration `yaml:"cookieTTL" mapstructure:"cookieTTL"`
+	// Teams are static team names put into the "teams" token claim of
+	// every identity this provider authenticates. Names are lowercased;
+	// each must match [a-z0-9][a-z0-9._-]{0,62}, at most 32 per provider.
+	Teams []string `yaml:"teams" mapstructure:"teams"`
+	// TeamRules derive further teams from the attributes the provider
+	// verified about the user; see protection.TeamRule and docs/config.md.
+	TeamRules []protection.TeamRule `yaml:"teamRules" mapstructure:"teamRules"`
 }
 
 // GitHubOAuthConfig configures the github protection provider.
@@ -226,6 +270,13 @@ type GitHubOAuthConfig struct {
 	// AllowedOrgs lists the GitHub orgs whose members may authenticate.
 	// At least one is required. Comparison is case-insensitive.
 	AllowedOrgs []string `yaml:"allowedOrgs" mapstructure:"allowedOrgs"`
+	// Teams are static team names put into the "teams" token claim of
+	// every identity this provider authenticates. Names are lowercased;
+	// each must match [a-z0-9][a-z0-9._-]{0,62}, at most 32 per provider.
+	Teams []string `yaml:"teams" mapstructure:"teams"`
+	// TeamRules derive further teams from the attributes the provider
+	// verified about the user; see protection.TeamRule and docs/config.md.
+	TeamRules []protection.TeamRule `yaml:"teamRules" mapstructure:"teamRules"`
 }
 
 // OIDCConfig configures the oidc protection provider.
@@ -268,6 +319,80 @@ type OIDCConfig struct {
 	// Scopes overrides the OIDC scopes requested. Defaults to
 	// ["openid", "email", "groups"]. `openid` is required.
 	Scopes []string `yaml:"scopes" mapstructure:"scopes"`
+	// TrustUnverifiedEmail uses the id_token's email although the token
+	// does not mark it email_verified. Off by default; see the docs for
+	// the risk. A pointer so that "not set" — which gets a startup
+	// warning explaining the rule — can be told from an explicit false.
+	TrustUnverifiedEmail *bool `yaml:"trustUnverifiedEmail" mapstructure:"trustUnverifiedEmail"`
+	// Teams are static team names put into the "teams" token claim of
+	// every identity this provider authenticates. Names are lowercased;
+	// each must match [a-z0-9][a-z0-9._-]{0,62}, at most 32 per provider.
+	Teams []string `yaml:"teams" mapstructure:"teams"`
+	// TeamRules derive further teams from the attributes the provider
+	// verified about the user; see protection.TeamRule and docs/config.md.
+	TeamRules []protection.TeamRule `yaml:"teamRules" mapstructure:"teamRules"`
+	// Bearer lets non-browser clients authenticate with a JWT of the
+	// IdP instead of a browser login. Off unless the block is there.
+	Bearer OIDCBearerConfig `yaml:"bearer" mapstructure:"bearer"`
+}
+
+// OIDCBearerConfig is the oidc.bearer block: GET /<name>/token accepts
+// "Authorization: Bearer <JWT>" for a JWT of the IdP and answers like
+// /auth/token (the header is read there only, never on /auth/*). The
+// feature is on when Audiences is set; a block without audiences is a
+// startup error.
+type OIDCBearerConfig struct {
+	// Audiences are the accepted "aud" values of a presented token —
+	// client ids at the IdP. A token must name at least one. Required,
+	// and never defaulted to oidc.clientId. In the config file each
+	// item has to be a YAML string.
+	Audiences []string `yaml:"audiences" mapstructure:"audiences"`
+	// IssuerURL is the issuer of the accepted tokens when it differs
+	// from oidc.issuerURL (an IdP that gives each client its own
+	// issuer). An http or https URL. Default: oidc.issuerURL.
+	IssuerURL string `yaml:"issuerURL" mapstructure:"issuerURL"`
+}
+
+// Enabled reports whether bearer tokens are accepted.
+func (c OIDCBearerConfig) Enabled() bool { return len(c.Audiences) > 0 }
+
+// validate checks the block. An issuer without audiences is a block
+// that was meant to switch the feature on and names nobody to accept.
+// The issuer has to be an absolute http(s) URL; which of the two is
+// the operator's choice, as for oidc.issuerURL.
+func (c OIDCBearerConfig) validate() error {
+	if c.IssuerURL != "" && len(c.Audiences) == 0 {
+		return errors.New("oidc.bearer.audiences is required when oidc.bearer is configured: list the " +
+			"client ids whose tokens are accepted")
+	}
+	if c.IssuerURL != "" {
+		u, err := url.Parse(c.IssuerURL)
+		switch {
+		case err != nil:
+			return fmt.Errorf("oidc.bearer.issuerURL: %q is not a URL: %w", c.IssuerURL, err)
+		case u.Scheme != "http" && u.Scheme != "https":
+			return fmt.Errorf("oidc.bearer.issuerURL: %q must be an http or https URL", c.IssuerURL)
+		case u.Host == "":
+			return fmt.Errorf("oidc.bearer.issuerURL: %q has no host", c.IssuerURL)
+		}
+	}
+	seen := make(map[string]struct{}, len(c.Audiences))
+	for i, aud := range c.Audiences {
+		if strings.TrimSpace(aud) != aud || aud == "" {
+			return fmt.Errorf("oidc.bearer.audiences[%d]: %q is empty or has surrounding space", i, aud)
+		}
+		if _, dup := seen[aud]; dup {
+			return fmt.Errorf("oidc.bearer.audiences: %q is listed twice", aud)
+		}
+		seen[aud] = struct{}{}
+	}
+	return nil
+}
+
+// TrustsUnverifiedEmail reports the effective trustUnverifiedEmail
+// setting (unset = false).
+func (c OIDCConfig) TrustsUnverifiedEmail() bool {
+	return c.TrustUnverifiedEmail != nil && *c.TrustUnverifiedEmail
 }
 
 // CORSConfig configures the CORS middleware.
@@ -320,13 +445,10 @@ func Load(path string) (*Config, error) {
 
 	setDefaults(v)
 	// AutomaticEnv only resolves keys viper already knows (defaults or
-	// config file). These keys deliberately have no default — see
-	// setDefaults — so bind them explicitly to keep their env overrides.
-	for _, key := range []string{
-		"authMode",
-		"cloudflareAccess.verifyJWT",
-		"cloudflareAccess.allowServiceTokens",
-	} {
+	// config file). Most settings have no default, so every setting
+	// with a fixed path is bound explicitly; otherwise its env override
+	// would only work when the key also happens to be in the file.
+	for _, key := range envKeys(reflect.TypeOf(Config{}), "") {
 		if err := v.BindEnv(key); err != nil {
 			return nil, fmt.Errorf("config: bind env %s: %w", key, err)
 		}
@@ -344,13 +466,280 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("config: unmarshal: %w", err)
 	}
 
+	raw, unchecked, err := loadRawDocument(path)
+	if err != nil {
+		return nil, fmt.Errorf("config: %w", err)
+	}
+	if err := checkGrantsEnv(v.GetEnvPrefix(), os.Environ()); err != nil {
+		return nil, fmt.Errorf("config: %w", err)
+	}
+	if unchecked != "" {
+		// Nothing below can look at the file. That is tolerable for a
+		// config of the kind released versions read; it is not once
+		// teams or grants hang on the file being read exactly.
+		if feature := cfg.checkedFeature(v); feature != "" {
+			return nil, fmt.Errorf("config: %s, so the strict checks of the config file cannot run; %s is "+
+				"configured and needs them. Use a YAML (or JSON) config file", unchecked, feature)
+		}
+		cfg.Warnings = append(cfg.Warnings, unchecked+": the strict checks of the config file (unknown and "+
+			"duplicate keys, misspelled sections) are not available for it. Use a YAML (or JSON) config file")
+	}
+	warnings, err := checkRawDocument(raw)
+	if err != nil {
+		return nil, fmt.Errorf("config: %w", err)
+	}
+	cfg.Warnings = append(cfg.Warnings, warnings...)
+	if cfg.DeprecationWarnings, err = checkProviderKeys(raw); err != nil {
+		return nil, fmt.Errorf("config: %w", err)
+	}
+	if err := cfg.restoreRuleMaps(raw); err != nil {
+		return nil, fmt.Errorf("config: %w", err)
+	}
+
+	if cfg.Grants, err = loadGrants(v, raw); err != nil {
+		return nil, fmt.Errorf("config: %w", err)
+	}
+	if len(cfg.Providers) > 0 {
+		cfg.Warnings = append(cfg.Warnings, unusedBlockEnv(v.GetEnvPrefix(), os.Environ())...)
+	}
+
 	if err := cfg.applyDerived(); err != nil {
 		return nil, fmt.Errorf("config: derive: %w", err)
 	}
 	if err := cfg.Validate(); err != nil {
 		return nil, fmt.Errorf("config: validate: %w", err)
 	}
+	cfg.Warnings = append(cfg.Warnings, cfg.sharedAudienceNotes()...)
+	cfg.Warnings = append(cfg.Warnings, cfg.unverifiedEmailNotes()...)
 	return cfg, nil
+}
+
+// envKeys returns the config paths below t that can be set through the
+// environment: every setting with a fixed path. Lists of structured
+// entries (providers, teamRules, previousKeys) have none; neither has
+// the grants section, which is not read through viper at all.
+func envKeys(t reflect.Type, prefix string) []string {
+	keys := make([]string, 0, t.NumField())
+	for i := range t.NumField() {
+		field := t.Field(i)
+		tag := field.Tag.Get("mapstructure")
+		if tag == "" || tag == "-" {
+			continue
+		}
+		ft := field.Type
+		if ft.Kind() == reflect.Pointer {
+			ft = ft.Elem()
+		}
+		switch {
+		case ft.Kind() == reflect.Struct:
+			keys = append(keys, envKeys(ft, prefix+tag+".")...)
+		case ft.Kind() == reflect.Slice && ft.Elem().Kind() == reflect.Struct, ft.Kind() == reflect.Map:
+			// Structured: file only.
+		default:
+			keys = append(keys, prefix+tag)
+		}
+	}
+	return keys
+}
+
+// unusedBlockEnv returns a warning for every environment variable that
+// sets a key of a legacy top-level provider block while the config has
+// a providers list. Those blocks are only read when there is no list,
+// so such a variable changes nothing — and the operator who set, say,
+// AUTHENTICATOOR_OIDC_TRUSTUNVERIFIEDEMAIL should hear about it.
+func unusedBlockEnv(prefix string, environ []string) []string {
+	var out []string
+	for _, entry := range environ {
+		name, _, _ := strings.Cut(entry, "=")
+		upper := strings.ToUpper(name)
+		for _, block := range providerBlockKeys {
+			if strings.HasPrefix(upper, strings.ToUpper(prefix+"_"+block)+"_") {
+				out = append(out, fmt.Sprintf("environment variable %s sets the top-level %s block, which is "+
+					"not used because the config has a providers list; entries of that list are configured "+
+					"in the file only", name, block))
+			}
+		}
+	}
+	slices.Sort(out)
+	return out
+}
+
+// checkedFeature names a part of the config that must not be loaded
+// from a file the strict checks cannot inspect: teams, team rules,
+// grants and the oidc bearer block, wherever they are configured — in
+// the file or through the environment. It returns "" when the config
+// has none of them.
+func (c *Config) checkedFeature(v *viper.Viper) string {
+	if v.IsSet(grantsKey) || v.IsSet(removedTeamServicesKey) {
+		return grantsKey
+	}
+	blocks := make([]ProviderConfig, 0, len(c.Providers)+1)
+	blocks = append(blocks, ProviderConfig{
+		CloudflareAccess: c.CloudflareAccess,
+		BasicAuth:        c.BasicAuth,
+		AnyAuth:          c.AnyAuth,
+		GitHubOAuth:      c.GitHubOAuth,
+		OIDC:             c.OIDC,
+	})
+	blocks = append(blocks, c.Providers...)
+	for i := range blocks {
+		// The bearer block decides whose tokens are a login: a
+		// misspelled or misplaced key in it must not go unnoticed.
+		if bearer := blocks[i].OIDC.Bearer; bearer.Enabled() || bearer.IssuerURL != "" {
+			return "oidc.bearer"
+		}
+		for _, block := range providerBlockKeys {
+			if len(blocks[i].teamsOf(block)) > 0 {
+				return block + ".teams"
+			}
+			if len(blocks[i].teamRulesOf(block)) > 0 {
+				return block + ".teamRules"
+			}
+		}
+	}
+	return ""
+}
+
+// unverifiedEmailNotes returns one warning per oidc provider whose
+// trustUnverifiedEmail is not set, saying what happens to an email the
+// IdP does not vouch for. The rule changes who a user is compared with
+// released versions, so an operator must not have to find it in the
+// documentation.
+func (c *Config) unverifiedEmailNotes() []string {
+	var out []string
+	for i := range c.Providers {
+		p := &c.Providers[i]
+		if p.Type != AuthModeOIDC || p.OIDC.TrustUnverifiedEmail != nil {
+			continue
+		}
+		out = append(out, fmt.Sprintf("provider %q: oidc.trustUnverifiedEmail is not set. An email counts only "+
+			"when the id_token says email_verified: true. A user whose token does not is identified by the "+
+			"IdP's \"sub\" instead of the email (released versions used the email), gets no email claim, and "+
+			"matches no email-keyed team rule or grant. If the IdP flips the flag between two logins of one "+
+			"user, that user's subject alternates. Set oidc.trustUnverifiedEmail to false to keep this rule "+
+			"and silence the warning, or to true if the IdP verifies addresses without saying so "+
+			"(see docs/config.md, Upgrading)", p.Name))
+	}
+	return out
+}
+
+// grantsKey is the top-level config key of the service grants section.
+const grantsKey = "grants"
+
+// removedTeamServicesKey is the key the section had before it could
+// name individual users. It was never released; a config that still
+// has it must not be read as "no grants configured".
+const removedTeamServicesKey = "teamServices"
+
+// loadGrants reads the grants section from the YAML document. It
+// returns nil when the section is absent, and a non-nil (possibly
+// empty) config when it is present. The shape is checked here — it is
+// strict: unknown keys and wrong types are errors — while members and
+// grants are validated later, by Validate.
+func loadGrants(v *viper.Viper, root *yaml.Node) (*issuer.GrantsConfig, error) {
+	if v.IsSet(removedTeamServicesKey) || rawChild(root, removedTeamServicesKey) != nil {
+		return nil, fmt.Errorf("%s: this section was replaced by %q, a list of groups with members "+
+			"and services (see docs/config.md, Service grants)", removedTeamServicesKey, grantsKey)
+	}
+
+	section := rawChild(root, grantsKey)
+	if section == nil {
+		if v.IsSet(grantsKey) {
+			// Set somewhere this reader cannot see (not a YAML file).
+			// Guessing "absent" would leave every service open.
+			return nil, fmt.Errorf("%s: must be configured in the YAML config file", grantsKey)
+		}
+		return nil, nil
+	}
+	const shape = "a list of groups, each with members and services (use [] to grant nothing)"
+	switch {
+	case section.Kind == yaml.MappingNode:
+		for _, old := range []string{"everyone", "teams", "users"} {
+			if rawChild(section, old) != nil {
+				return nil, fmt.Errorf("%s: the keys everyone / teams / users are gone. The section is now %s; "+
+					"a member names its provider: \"<provider>/team:<team>\", \"<provider>/user:<id>\" or "+
+					"\"<provider>/<attribute>:<value>\"",
+					grantsKey, shape)
+			}
+		}
+		return nil, fmt.Errorf("%s: must be %s", grantsKey, shape)
+	case section.Kind != yaml.SequenceNode:
+		// Includes "grants:" without a value: treating that as absent
+		// would leave every service open where grants were meant.
+		return nil, fmt.Errorf("%s: must be %s", grantsKey, shape)
+	}
+
+	cfg := &issuer.GrantsConfig{Groups: make([]issuer.GrantGroup, 0, len(section.Content))}
+	for i, item := range section.Content {
+		where := fmt.Sprintf("%s[%d]", grantsKey, i)
+		group, err := loadGrantGroup(resolveNode(item), where)
+		if err != nil {
+			return nil, err
+		}
+		cfg.Groups = append(cfg.Groups, group)
+	}
+	return cfg, nil
+}
+
+// checkGrantsEnv refuses environment variables that look like an
+// attempt to configure the grants section. Settings can be overridden
+// through the environment, but grants are read from the config file
+// only; such a variable would be ignored, and with no grants in the
+// file the instance would run ungated although its operator configured
+// grants.
+func checkGrantsEnv(prefix string, environ []string) error {
+	for _, entry := range environ {
+		name, _, _ := strings.Cut(entry, "=")
+		upper := strings.ToUpper(name)
+		for _, section := range []string{grantsKey, removedTeamServicesKey} {
+			key := strings.ToUpper(prefix + "_" + section)
+			if upper == key || strings.HasPrefix(upper, key+"_") {
+				return fmt.Errorf("environment variable %s: %s cannot be set through the environment; "+
+					"it is read from the YAML config file only", name, grantsKey)
+			}
+		}
+	}
+	return nil
+}
+
+// loadGrantGroup reads one group of the grants section.
+func loadGrantGroup(node *yaml.Node, where string) (issuer.GrantGroup, error) {
+	var group issuer.GrantGroup
+	if node == nil || node.Kind != yaml.MappingNode {
+		return group, fmt.Errorf("%s: must be a group: a map with the keys name (optional), members and services", where)
+	}
+	hasMembers, hasServices := false, false
+	for i := 0; i+1 < len(node.Content); i += 2 {
+		key, value := node.Content[i].Value, resolveNode(node.Content[i+1])
+		var err error
+		switch {
+		case strings.EqualFold(key, "name"):
+			if value == nil || value.Kind != yaml.ScalarNode || isNull(value) || value.Value == "" {
+				err = fmt.Errorf("must be a non-empty text")
+			}
+			if err == nil {
+				group.Name = value.Value
+			}
+		case strings.EqualFold(key, "members"):
+			hasMembers = true
+			group.Members, err = rawStringList(value)
+		case strings.EqualFold(key, "services"):
+			hasServices = true
+			group.Services, err = rawStringList(value)
+		default:
+			return group, fmt.Errorf("%s: unknown key %q (the keys of a group are name, members and services)", where, key)
+		}
+		if err != nil {
+			return group, fmt.Errorf("%s.%s: %w", where, strings.ToLower(key), err)
+		}
+	}
+	if !hasMembers {
+		return group, fmt.Errorf("%s: members is required", where)
+	}
+	if !hasServices {
+		return group, fmt.Errorf("%s: services is required (use [] for a group that grants nothing)", where)
+	}
+	return group, nil
 }
 
 // setDefaults applies hard-coded defaults that don't depend on other fields.
@@ -581,6 +970,12 @@ func (c *Config) Validate() error {
 		}
 	}
 
+	if c.Grants != nil {
+		if _, err := issuer.NewServiceGrants(*c.Grants, c.GrantProviders()); err != nil {
+			return fmt.Errorf("%s: %w", grantsKey, err)
+		}
+	}
+
 	if slices.Contains(c.AllowedReturnHosts, "") {
 		return errors.New("allowedReturnHosts must not contain empty entries")
 	}
@@ -634,6 +1029,9 @@ func validateProviderName(name string) error {
 
 // validate applies per-provider semantic validation.
 func (p *ProviderConfig) validate() error {
+	if err := p.validateTeams(); err != nil {
+		return err
+	}
 	switch p.Type {
 	case AuthModeCloudflare:
 		if p.CloudflareAccess.VerifyJWTEnabled() && p.CloudflareAccess.TeamDomain == "" {
@@ -671,8 +1069,243 @@ func (p *ProviderConfig) validate() error {
 		// oidc.allowedGroups is optional: empty means "trust the IdP's
 		// own gating" (e.g. dex's connector orgs allow-list). Set it
 		// to narrow further on a per-instance basis.
+		if err := p.OIDC.Bearer.validate(); err != nil {
+			return err
+		}
 	default:
 		return fmt.Errorf("type: unsupported value %q", p.Type)
+	}
+	return nil
+}
+
+// teamConfig returns the team configuration of the block matching the
+// provider's type, with the block's config key.
+func (p *ProviderConfig) teamConfig() (block string, static []string, rules []protection.TeamRule) {
+	switch p.Type {
+	case AuthModeCloudflare:
+		c := &p.CloudflareAccess
+		return "cloudflareAccess", c.Teams, c.TeamRules
+	case AuthModeBasic:
+		c := &p.BasicAuth
+		return "basicAuth", c.Teams, c.TeamRules
+	case AuthModeAny:
+		c := &p.AnyAuth
+		return "anyAuth", c.Teams, c.TeamRules
+	case AuthModeGitHub:
+		c := &p.GitHubOAuth
+		return "githubOAuth", c.Teams, c.TeamRules
+	case AuthModeOIDC:
+		c := &p.OIDC
+		return "oidc", c.Teams, c.TeamRules
+	default:
+		return "", nil, nil
+	}
+}
+
+// ProducesTeams reports whether the provider is configured to put teams
+// into the tokens of the identities it authenticates.
+func (p *ProviderConfig) ProducesTeams() bool {
+	_, static, rules := p.teamConfig()
+	return len(static) > 0 || len(rules) > 0
+}
+
+// ProviderNames returns the instance names of the configured providers,
+// in order.
+func (c *Config) ProviderNames() []string {
+	names := make([]string, 0, len(c.Providers))
+	for i := range c.Providers {
+		names = append(names, c.Providers[i].Name)
+	}
+	return names
+}
+
+// GrantProviders describes the configured providers to the grants
+// section: their names and, for the types whose attributes are a fixed
+// set, which attribute members can match at all.
+func (c *Config) GrantProviders() []issuer.Provider {
+	out := make([]issuer.Provider, 0, len(c.Providers))
+	for i := range c.Providers {
+		out = append(out, issuer.Provider{
+			Name:           c.Providers[i].Name,
+			CheckAttribute: c.Providers[i].attributeCheck(),
+		})
+	}
+	return out
+}
+
+// attributeCheck returns the test a "<provider>/<attribute>:<value>"
+// member has to pass for this provider: an error says why no identity
+// the provider authenticates can ever satisfy it. nil when every
+// attribute path is possible.
+//
+//	oidc        any claim of the id_token: every path is accepted
+//	cloudflare  see cloudflareAttributeCheck
+//	github      login, email, orgs
+//	basic, any  username
+func (p *ProviderConfig) attributeCheck() func(attribute, value string) error {
+	fixed := func(names ...string) func(string, string) error {
+		return func(attribute, _ string) error {
+			if !slices.Contains(names, attribute) {
+				return fmt.Errorf("the provider type %s has no attribute %q (it has: %s)",
+					p.Type, attribute, strings.Join(names, ", "))
+			}
+			return nil
+		}
+	}
+	switch p.Type {
+	case AuthModeGitHub:
+		return fixed("login", "email", "orgs")
+	case AuthModeBasic, AuthModeAny:
+		return fixed("username")
+	case AuthModeCloudflare:
+		return p.CloudflareAccess.attributeCheck
+	default:
+		return nil
+	}
+}
+
+// cloudflareTokenAttributes are the claims of an Access token that a
+// grants member may name, next to "principal" and "custom.<…>".
+var cloudflareTokenAttributes = []string{
+	"email", "sub", "common_name", "country", "type", "identity_nonce", "iss", "aud",
+}
+
+// attributeCheck is the attributeCheck of a cloudflare provider. What
+// its identities can have depends on how it is configured:
+//
+//   - with verifyJWT there is a verified Access token: its claims
+//     (cloudflareTokenAttributes, anything under "custom."), plus
+//     "principal", which is "user" or "service";
+//   - without verifyJWT there is no token: only "email", from the
+//     trusted header, and "principal", which is always "user";
+//   - service tokens, the only identities with principal "service" and
+//     a "common_name", exist only with verifyJWT and
+//     allowServiceTokens.
+func (c CloudflareAccessConfig) attributeCheck(attribute, value string) error {
+	serviceTokens := c.VerifyJWTEnabled() && c.ServiceTokensAllowed()
+	const noServiceTokens = "this provider authenticates no service tokens (they need verifyJWT and " +
+		"allowServiceTokens)"
+
+	switch {
+	case attribute == "principal":
+		switch strings.ToLower(value) {
+		case "user":
+			return nil
+		case "service":
+			if !serviceTokens {
+				return fmt.Errorf("principal is never \"service\": %s", noServiceTokens)
+			}
+			return nil
+		default:
+			return fmt.Errorf("principal is \"user\" or \"service\", never %q", value)
+		}
+	case attribute == "email":
+		return nil
+	case !c.VerifyJWTEnabled():
+		return fmt.Errorf("with verifyJWT off a cloudflare provider has no attribute %q: there is no "+
+			"verified Access token, only email and principal", attribute)
+	case attribute == "common_name" && !serviceTokens:
+		return fmt.Errorf("only service tokens have a common_name, and %s", noServiceTokens)
+	case slices.Contains(cloudflareTokenAttributes, attribute):
+		return nil
+	case strings.HasPrefix(attribute, "custom."):
+		if slices.Contains(strings.Split(attribute, "."), "") {
+			return fmt.Errorf("%q names no claim: after \"custom.\" comes the name of a custom claim "+
+				"(\"custom.department\")", attribute)
+		}
+		return nil
+	default:
+		return fmt.Errorf("the provider type cloudflare has no attribute %q (it has: principal, %s, custom.<claim>)",
+			attribute, strings.Join(cloudflareTokenAttributes, ", "))
+	}
+}
+
+// ServicesUngated reports whether the instance hands every authenticated
+// identity a token valid for every service although it distinguishes
+// identities: there is no grants section, yet more than one
+// provider is configured or some provider produces teams. Worth a
+// startup warning — a second door (or a team claim) suggests not every
+// identity should reach every tool, and nothing enforces that.
+func (c *Config) ServicesUngated() bool {
+	if c.Grants != nil {
+		return false
+	}
+	if len(c.Providers) > 1 {
+		return true
+	}
+	for i := range c.Providers {
+		if c.Providers[i].ProducesTeams() {
+			return true
+		}
+	}
+	return false
+}
+
+// sharedAudienceNotes returns one warning per Cloudflare provider that
+// hands out teams or is named in a grants member without saying which
+// Access application it is.
+//
+// Without audTag the verifier checks an assertion's signature and
+// issuer only: it accepts the assertion of ANY Access application of
+// the same Cloudflare team. The audience that the provider can detect
+// on its own is enforced on /<name>/login and /<name>/token, but not
+// on /auth/*, where the Access headers authenticate directly. So
+// whoever is admitted to any other application of the team is this
+// door's visitor too, and gets its teams and grants.
+//
+// That is a warning and not an error: it is how every released version
+// treated a Cloudflare door without audTag, deployments rely on it, and
+// where one Access policy covers all applications of a team it is
+// exactly what is meant. (With verifyJWT off no assertion is looked at
+// at all; that mode has its own warning.)
+func (c *Config) sharedAudienceNotes() []string {
+	var inGrants []string
+	if c.Grants != nil {
+		// Validate has accepted the section, so this cannot fail.
+		if grants, err := issuer.NewServiceGrants(*c.Grants, c.GrantProviders()); err == nil {
+			inGrants = grants.Providers()
+		}
+	}
+	var out []string
+	for i := range c.Providers {
+		p := &c.Providers[i]
+		if p.Type != AuthModeCloudflare || !p.CloudflareAccess.VerifyJWTEnabled() || p.CloudflareAccess.AudTag != "" {
+			continue
+		}
+		var why []string
+		if len(p.CloudflareAccess.Teams) > 0 || len(p.CloudflareAccess.TeamRules) > 0 {
+			why = append(why, "gives teams to the identities it authenticates")
+		}
+		if slices.Contains(inGrants, p.Name) {
+			why = append(why, "is named in grants members")
+		}
+		if len(why) == 0 {
+			continue
+		}
+		out = append(out, fmt.Sprintf("provider %q %s, but cloudflareAccess.audTag is not set: /auth/* accepts "+
+			"an assertion issued for any Access application of the Cloudflare team %s, so the teams and "+
+			"grants of this door apply to everyone admitted to any of them. Set audTag to the AUD tag of "+
+			"this application to limit the door to it",
+			p.Name, strings.Join(why, " and "), p.CloudflareAccess.TeamDomain))
+	}
+	return out
+}
+
+// validateTeams rejects a malformed team configuration in the block
+// matching the provider's type, so a typo fails startup instead of
+// silently producing tokens without the team. Team names that an
+// identity provider supplies at login are, by contrast, dropped with a
+// warning.
+func (p *ProviderConfig) validateTeams() error {
+	block, static, rules := p.teamConfig()
+	if block == "" {
+		return nil // the type switch in validate reports it
+	}
+	if _, err := protection.ValidateTeams(static); err != nil {
+		return fmt.Errorf("%s.teams: %w", block, err)
+	}
+	if err := protection.ValidateTeamRules(rules); err != nil {
+		return fmt.Errorf("%s.%w", block, err)
 	}
 	return nil
 }
@@ -692,6 +1325,7 @@ func (c *Config) String() string {
 	fmt.Fprintf(&sb, "audience=%v ", c.Audience)
 	fmt.Fprintf(&sb, "scope=%s ", c.ScopePattern)
 	fmt.Fprintf(&sb, "tokenTTL=%s ", c.TokenTTL)
+	fmt.Fprintf(&sb, "grants=present(%t) ", c.Grants != nil)
 	fmt.Fprintf(&sb, "allowedReturnHosts=%v ", c.AllowedReturnHosts)
 	fmt.Fprintf(&sb, "signing.mode=%s ", c.Signing.Mode)
 	fmt.Fprintf(&sb, "signing.rs256.keyFile=present(%t) ", c.Signing.RS256.PrivateKeyFile != "")

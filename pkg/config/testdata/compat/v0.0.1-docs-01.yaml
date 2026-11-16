@@ -1,0 +1,9 @@
+issuer: "https://auth.example.com"
+
+signing:
+  rs256:
+    privateKeyFile: "/etc/authenticatoor/keys/private.pem"
+
+cloudflareAccess:
+  teamDomain: "<team>.cloudflareaccess.com"
+  audTag: "<from CF Access app config>"

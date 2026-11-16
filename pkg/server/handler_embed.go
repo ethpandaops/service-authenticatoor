@@ -19,6 +19,9 @@ import (
 // authenticated to the upstream proxy: the proxy intercepts the iframe load
 // with a login page whose own X-Frame-Options blocks rendering, postMessage
 // never fires, and the parent's timeout falls through to the redirect.
+//
+// A user who is logged in but named by no grants group gets 403 and
+// nothing is posted.
 func (s *Server) handleEmbed(w http.ResponseWriter, r *http.Request) {
 	id := identityFromContext(r.Context())
 	if id == nil || id.Subject == "" {
@@ -39,7 +42,16 @@ func (s *Server) handleEmbed(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	tok, claims, err := s.issuer.Issue(id.Subject, id.Email, nil)
+	tok, claims, err := s.issuer.IssueFor(tokenIdentity(id), nil)
+	if s.notGranted(err, id, "embed") {
+		// No token, so no postMessage: the v1 client only knows the
+		// token message and reads silence as "not logged in" once its
+		// timer runs out — it does not retry. Its login() then ends on
+		// the page of /auth/login that says why.
+		w.Header().Set("Cache-Control", "no-store")
+		http.Error(w, notGrantedMessage, http.StatusForbidden)
+		return
+	}
 	if err != nil {
 		s.tokenIssueErrors.WithLabelValues("issue").Inc()
 		s.log.WithError(err).Error("issue token")

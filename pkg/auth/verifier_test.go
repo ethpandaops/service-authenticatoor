@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"testing"
 	"time"
 
@@ -345,5 +346,55 @@ func TestVerifier_RejectsHS256(t *testing.T) {
 	}
 	if _, err := v.Verify(signed); err == nil {
 		t.Error("expected HS256 rejection")
+	}
+}
+
+// TestVerifier_Teams pins the "teams" claim contract on the consuming
+// side: a token carrying teams verifies and exposes them, and a token
+// without the claim (every token issued before the claim existed, and
+// every user without teams) verifies exactly as before.
+func TestVerifier_Teams(t *testing.T) {
+	iss, jwksBase, teardown := servedIssuer(t)
+	defer teardown()
+
+	v, err := auth.NewJWKSVerifier(context.Background(), auth.VerifierConfig{
+		JWKSURL:          jwksBase + "/jwks.json",
+		ExpectedIssuer:   "https://auth.test.example",
+		ExpectedAudience: "test.example",
+	})
+	if err != nil {
+		t.Fatalf("newverifier: %v", err)
+	}
+
+	tests := []struct {
+		name      string
+		teams     []string
+		want      []string
+		wantPanda bool
+	}{
+		{"with teams", []string{"panda", "lighthouse"}, []string{"lighthouse", "panda"}, true},
+		{"one team", []string{"geth"}, []string{"geth"}, false},
+		{"without the claim", nil, nil, false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			tok, _, err := iss.IssueFor(issuer.Identity{Subject: "alice@example.com", Email: "alice@example.com", Teams: tc.teams}, nil)
+			if err != nil {
+				t.Fatalf("issue: %v", err)
+			}
+			claims, err := v.Verify(tok)
+			if err != nil {
+				t.Fatalf("verify: %v", err)
+			}
+			if !slices.Equal(claims.Teams, tc.want) {
+				t.Errorf("teams: got %v, want %v", claims.Teams, tc.want)
+			}
+			if got := claims.HasTeam("panda"); got != tc.wantPanda {
+				t.Errorf("HasTeam(panda) = %t, want %t", got, tc.wantPanda)
+			}
+			if claims.Subject != "alice@example.com" || claims.Email != "alice@example.com" {
+				t.Errorf("identity: sub=%q email=%q", claims.Subject, claims.Email)
+			}
+		})
 	}
 }

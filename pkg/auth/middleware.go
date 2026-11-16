@@ -53,6 +53,30 @@ func RequireAuth(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
+// RequireFeature wraps a handler to enforce that the request's verified
+// claims allow a feature of a service (see FeatureAllowed for the two
+// modes). It responds 401 when no claims are on the context and 403
+// when the claims do not allow the feature.
+//
+// A feature check is an addition to the service gate, not a replacement
+// for it: the verifier behind Middleware should still be configured with
+// ExpectedService, so that a token not meant for this service is
+// rejected before any handler runs.
+func RequireFeature(service, feature string, def FeatureDefault, next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		claims, ok := ClaimsFromContext(r.Context())
+		if !ok {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		if !claims.HasFeature(service, feature, def) {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+		next(w, r)
+	}
+}
+
 // ClaimsFromContext returns the verified claims attached by Middleware. The
 // boolean is false when the request was not (successfully) authenticated.
 func ClaimsFromContext(ctx context.Context) (*Claims, bool) {

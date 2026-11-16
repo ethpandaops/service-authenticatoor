@@ -1,0 +1,12 @@
+authMode: oidc
+externalURL: "https://auth.<devnet>.ethpandaops.io"
+oidc:
+  issuerURL: "https://dex.primary.production.platform.ethpandaops.io"
+  callbackURL: "https://oidc-relay.primary.production.platform.ethpandaops.io/oidc/callback"
+  clientId: "authenticatoor"
+  clientSecretFile: "/etc/authenticatoor/oidc-client-secret"
+  allowedGroups:
+    - "ethpandaops"
+    - "EthDevOpsAccess:validatorops"
+    - "sigp"
+    # ...

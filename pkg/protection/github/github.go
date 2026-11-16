@@ -81,6 +81,18 @@ type Config struct {
 	// At least one must be supplied.
 	AllowedOrgs []string
 
+	// Teams are the static teams given to every identity this provider
+	// authenticates (normalized at New; invalid names fail Start).
+	Teams []string
+	// TeamRules derive further teams from the attributes this provider
+	// verified about the user (see the package documentation of each
+	// provider for its attributes).
+	TeamRules []protection.TeamRule
+	// GrantMembers are the attribute members the grants section names
+	// for this provider ("<provider>/<attribute>:<value>"). The provider
+	// reports which of them an identity satisfies.
+	GrantMembers []protection.AttributeMember
+
 	// HTTPClient is the http.Client used for GitHub API calls. Defaults
 	// to a sensible client; tests inject httptest.NewServer here.
 	HTTPClient *http.Client
@@ -110,6 +122,9 @@ type Provider struct {
 	tokenURL       string
 	apiBase        string
 	allowedOrgsSet map[string]struct{}
+	teams          protection.Teams
+	members        protection.Members
+	door           session.Door
 }
 
 var (
@@ -164,6 +179,9 @@ func New(log logrus.FieldLogger, cfg Config) *Provider {
 		tokenURL:       cfg.TokenURL,
 		apiBase:        cfg.APIBaseURL,
 		allowedOrgsSet: allowed,
+		teams:          protection.NewTeams(cfg.Teams, cfg.TeamRules),
+		members:        protection.NewMembers(cfg.GrantMembers),
+		door:           session.NewDoor("github", cfg.APIBaseURL),
 	}
 }
 
@@ -181,6 +199,9 @@ func (p *Provider) Start(_ context.Context) error {
 	if len(p.allowedOrgsSet) == 0 {
 		return errors.New("github: AllowedOrgs must list at least one org")
 	}
+	if err := p.teams.Err(); err != nil {
+		return fmt.Errorf("github: %w", err)
+	}
 	cs, err := session.LoadSecret(p.cfg.ClientSecret, p.cfg.ClientSecretFile, "ClientSecret")
 	if err != nil {
 		return fmt.Errorf("github: %w", err)
@@ -194,6 +215,8 @@ func (p *Provider) Start(_ context.Context) error {
 
 	p.log.WithField("orgs", p.cfg.AllowedOrgs).
 		WithField("callback", p.cfg.CallbackPath).
+		WithField("teams", p.teams.Static()).
+		WithField("teamRules", p.teams.Rules()).
 		Info("github oauth provider ready")
 	return nil
 }
@@ -221,11 +244,14 @@ func (p *Provider) LoginURL(returnTo string) string {
 // outcome redirects to the login entry, which starts the OAuth flow.
 func (p *Provider) Authenticate(_ context.Context, r *http.Request) (protection.Outcome, error) {
 	if c, err := r.Cookie(p.cfg.SessionCookieName); err == nil {
-		login, email, perr := session.Parse(p.sessionSecret, c.Value, p.cfg.Now())
+		sess, perr := session.Parse(p.sessionSecret, p.door, c.Value, p.cfg.Now())
 		if perr == nil {
 			return protection.Outcome{Identity: &protection.Identity{
-				Subject: login,
-				Email:   email,
+				Subject:        sess.Subject,
+				Email:          sess.Email,
+				SubjectIsEmail: sess.SubjectIsEmail,
+				Teams:          p.teams.With(sess.Teams),
+				Matches:        sess.Matches,
 			}}, nil
 		}
 		p.log.WithError(perr).Debug("session cookie invalid; redirecting to login")
@@ -356,7 +382,25 @@ func (p *Provider) handleCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	cookie, err := p.signSessionCookie(profile.Login, profile.Email)
+	// Teams derived by the team rules are captured now and travel in the
+	// session; the static teams are applied per request.
+	attrs := profile.attributes()
+	loginLog := p.log.WithField("login", profile.Login)
+	teams := p.teams.Capture(loginLog, attrs)
+	// So are the grant members the profile satisfies: only which ones,
+	// never the profile itself.
+	matches := p.members.Capture(loginLog, attrs, teams)
+	p.log.WithFields(logrus.Fields{
+		"login": profile.Login,
+		"teams": p.teams.With(teams),
+	}).Debug("github login resolved teams")
+
+	cookie, err := p.signSessionCookie(profile.Login, profile.Email, teams, matches)
+	if errors.Is(err, session.ErrTooLarge) {
+		loginLog.WithError(err).Warn("login refused: the session does not fit a cookie")
+		http.Error(w, protection.SessionTooLargeMessage, http.StatusForbidden)
+		return
+	}
 	if err != nil {
 		p.log.WithError(err).Error("session cookie signing failed")
 		http.Error(w, "session error", http.StatusInternalServerError)
@@ -391,6 +435,26 @@ type userProfile struct {
 	Orgs  []string
 }
 
+// attributes are what this provider knows about an authenticated user,
+// all of it from the API calls the org gate already makes:
+//
+//	login   the GitHub login
+//	email   an email GitHub reports as verified (the public one if it
+//	        is verified, else the primary verified one); absent when
+//	        there is none or it cannot be told
+//	orgs    the logins of the user's organizations (a list)
+func (u *userProfile) attributes() protection.Attributes {
+	orgs := make([]any, 0, len(u.Orgs))
+	for _, o := range u.Orgs {
+		orgs = append(orgs, o)
+	}
+	attrs := protection.Attributes{"login": u.Login, "orgs": orgs}
+	if u.Email != "" {
+		attrs["email"] = u.Email
+	}
+	return attrs
+}
+
 // fetchProfile fans out the four GitHub API calls needed to gate the
 // session: /user (login + maybe email), /user/orgs (private memberships,
 // requires the OAuth App to be approved by the org if it has third-party
@@ -413,8 +477,8 @@ func (p *Provider) fetchProfile(ctx context.Context, token string) (*userProfile
 		privateErr  error
 		publicOrgs  []githubOrg
 		publicErr   error
-		primary     string
-		primaryErr  error
+		emails      []githubEmail
+		emailsErr   error
 	)
 
 	loginCh := make(chan string, 1)
@@ -438,7 +502,7 @@ func (p *Provider) fetchProfile(ctx context.Context, token string) (*userProfile
 
 	go func() {
 		defer wg.Done()
-		primary, primaryErr = p.fetchPrimaryEmail(ctx, token)
+		emails, emailsErr = p.fetchEmails(ctx, token)
 	}()
 
 	go func() {
@@ -468,20 +532,38 @@ func (p *Provider) fetchProfile(ctx context.Context, token string) (*userProfile
 	if privateErr != nil && publicErr != nil {
 		return nil, fmt.Errorf("github orgs fetch: private=%v public=%w", privateErr, publicErr)
 	}
-	if primaryErr != nil {
-		p.log.WithError(primaryErr).Debug("/user/emails fetch failed (only matters if /user.email is empty)")
-	}
-
-	email := user.Email
-	if email == "" {
-		email = primary
+	if emailsErr != nil {
+		p.log.WithError(emailsErr).Warn("/user/emails fetch failed; the user gets no email, since none can be shown to be verified")
 	}
 
 	return &userProfile{
 		Login: user.Login,
-		Email: email,
+		Email: verifiedEmail(user.Email, emails),
 		Orgs:  mergeOrgLogins(privateOrgs, publicOrgs),
 	}, nil
+}
+
+// verifiedEmail picks the email to use for a user: only one GitHub
+// reports as verified in /user/emails. The profile's public email
+// (/user) is used when it is among the verified ones; otherwise the
+// primary verified address. Without the list — the call failed — there
+// is nothing to show an address is verified, and the user has no email:
+// it is then not put into tokens and not shown to team rules or grant
+// members.
+func verifiedEmail(public string, emails []githubEmail) string {
+	primary := ""
+	for _, e := range emails {
+		if !e.Verified {
+			continue
+		}
+		if public != "" && strings.EqualFold(e.Email, public) {
+			return e.Email
+		}
+		if e.Primary {
+			primary = e.Email
+		}
+	}
+	return primary
 }
 
 // mergeOrgLogins concatenates org-login slices and deduplicates
@@ -516,8 +598,12 @@ func mergeOrgLogins(lists ...[]githubOrg) []string {
 // read and overwrite the cookie. Browsers treat *.localhost as a
 // secure context, so Secure=true works for HTTP local dev too —
 // non-localhost plain HTTP isn't a supported deployment.
-func (p *Provider) signSessionCookie(login, email string) (*http.Cookie, error) {
-	signed, err := session.Sign(p.sessionSecret, login, email, p.cfg.SessionTTL, p.cfg.Now())
+func (p *Provider) signSessionCookie(login, email string, teams, matches []string) (*http.Cookie, error) {
+	// The subject is the GitHub login — a raw provider subject, never an
+	// email address.
+	signed, err := session.SignCookie(p.cfg.SessionCookieName, p.sessionSecret, p.door,
+		session.Payload{Subject: login, Email: email, Teams: teams, Matches: matches},
+		p.cfg.SessionTTL, p.cfg.Now())
 	if err != nil {
 		return nil, err
 	}
@@ -634,17 +720,12 @@ func (p *Provider) fetchUser(ctx context.Context, token string) (*githubUser, er
 	return &u, nil
 }
 
-func (p *Provider) fetchPrimaryEmail(ctx context.Context, token string) (string, error) {
+func (p *Provider) fetchEmails(ctx context.Context, token string) ([]githubEmail, error) {
 	var emails []githubEmail
 	if err := p.apiGet(ctx, token, "/user/emails", &emails); err != nil {
-		return "", err
+		return nil, err
 	}
-	for _, e := range emails {
-		if e.Primary && e.Verified {
-			return e.Email, nil
-		}
-	}
-	return "", nil
+	return emails, nil
 }
 
 func (p *Provider) fetchOrgs(ctx context.Context, token string) ([]githubOrg, error) {

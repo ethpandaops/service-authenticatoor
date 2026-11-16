@@ -35,10 +35,37 @@ import (
 // JWT issuer. Subject is the stable identifier (email for Cloudflare
 // Access, GitHub login for the GitHub provider). Email is the user-facing
 // email when available; it may be empty (for example when a GitHub user
-// has hidden every address on their account).
+// has hidden every address on their account). A provider only sets an
+// Email that was verified to belong to the user.
+//
+// Teams lists the teams the authenticating provider resolved for the
+// user, in normal form (see auth.NormalizeTeam), de-duplicated, sorted
+// and bounded by auth.MaxTeams; nil when there are none. It only ever
+// holds what the provider that produced this Identity resolved — its
+// configured static teams plus whatever it derived from its identity
+// source at login — never anything taken from the request itself.
 type Identity struct {
 	Subject string
 	Email   string
+	// SubjectIsEmail reports what kind of identifier Subject is: true
+	// when it is an email address the provider verified to belong to
+	// the user, false when it is a raw provider subject — an IdP "sub",
+	// a GitHub login, a username, a service token id. Every provider
+	// has to say which; the zero value is the safe one. A raw subject
+	// can look like an email address without anyone having checked it,
+	// and a grant that names an address must not be given to it.
+	SubjectIsEmail bool
+	Teams          []string
+	// Matches lists the attribute members of the grants section that
+	// the identity satisfies at this provider, as "<attribute>:<value>"
+	// keys (see MatchKey). Like Teams it only holds what the provider
+	// that produced this Identity established from attributes it
+	// verified. It is not put into tokens.
+	Matches []string
+	// Provider is the instance name of the provider that authenticated
+	// the identity. The server sets it after a provider returned the
+	// identity; providers leave it empty. It is not put into tokens.
+	Provider string
 }
 
 // Outcome describes what the auth middleware should do next after a
@@ -116,6 +143,17 @@ type AmbientAuthenticator interface {
 	AuthenticateAmbient(ctx context.Context, r *http.Request) (Outcome, error)
 }
 
+// AmbientSwitch is implemented by an AmbientAuthenticator for which
+// authenticating from the request itself is a setting (the oidc
+// provider's bearer tokens). The server mounts the token alias of such
+// a provider only when AmbientEnabled reports true; a provider without
+// this method always gets it.
+type AmbientSwitch interface {
+	// AmbientEnabled reports whether the provider is configured to
+	// authenticate ambient credentials. It is called before Start.
+	AmbientEnabled() bool
+}
+
 // SessionClearer is implemented by providers that track their session in
 // a clearable cookie. The server's multi-provider logout collects and
 // clears every provider's session cookie in one response.
@@ -124,6 +162,13 @@ type SessionClearer interface {
 	// session cookie (MaxAge=-1, attributes matching the live cookie).
 	ClearSessionCookie() *http.Cookie
 }
+
+// SessionTooLargeMessage is what a login entry answers (with 403) when
+// the session of the identity it just authenticated would not fit a
+// cookie (session.ErrTooLarge). Setting the cookie anyway would have
+// the browser drop it and send the user round the login again.
+const SessionTooLargeMessage = "login refused: your subject and email are too long to be stored in a " +
+	"session cookie. Ask the operator of this service"
 
 // SafeReturnTo sanitizes a return_to value supplied to a login entry
 // path. Only same-origin relative paths are accepted — absolute URLs and

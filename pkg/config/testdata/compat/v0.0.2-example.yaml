@@ -1,0 +1,190 @@
+# authenticatoor — example configuration
+#
+# Loaded from the path passed via --config (default: /etc/authenticatoor/config.yaml).
+# Every field can also be set via env var: AUTHENTICATOOR_<UPPER_PATH> with
+# dots replaced by underscores. For example, signing.rs256.privateKeyFile
+# becomes AUTHENTICATOOR_SIGNING_RS256_PRIVATEKEYFILE.
+
+# ─── server ───────────────────────────────────────────────────────────────────
+
+# Bind address. Default: ":8080".
+listen: ":8080"
+
+# REQUIRED. The canonical URL of this service. Used as the JWT "iss" claim.
+# Several other fields are derived from this when not configured explicitly:
+#   - audience          → the parent zone (i.e. with the "auth." stripped)
+#   - scopePattern      → "*.<parent zone>"
+#   - allowedReturnHosts → ["*.<parent zone>"]
+#   - cors.allowedOrigins → same as allowedReturnHosts
+issuer: "https://auth.example.com"
+
+# Optional. URL used in the OIDC discovery document and in the jwks_uri.
+# Defaults to the issuer URL.
+# externalURL: "https://auth.example.com"
+
+# ─── token shape ──────────────────────────────────────────────────────────────
+
+# The "aud" claim. Verifiers must accept this value. Defaults to the parent
+# zone of the issuer host.
+# audience:
+#   - "example.com"
+
+# The "scope" claim — a host wildcard pattern. Verifiers match their own
+# externally visible host against this pattern. Defaults to "*.<parent zone>".
+# scopePattern: "*.example.com"
+
+# Token lifetime. Default: "30m".
+tokenTTL: "30m"
+
+# ─── browser-callback / CORS allow-list ───────────────────────────────────────
+
+# Hosts that the /auth/login endpoint will redirect to via `return_to`.
+# Patterns use the same DNS-label glob syntax as scopePattern. Defaults to
+# ["*.<parent zone of issuer>"].
+# allowedReturnHosts:
+#   - "*.example.com"
+
+# Browsers that are allowed to call /auth/* with credentials via CORS. Defaults
+# to allowedReturnHosts.
+# cors:
+#   allowedOrigins:
+#     - "*.example.com"
+
+# ─── auth mode ────────────────────────────────────────────────────────────────
+
+# Names the active protection provider. Default: "cloudflare".
+# Other modes (basic, any, github) are configured by their own blocks below.
+authMode: cloudflare
+
+# ─── Cloudflare Access (authMode: cloudflare) ─────────────────────────────────
+
+# When enabled (default), the service verifies the Cf-Access-Jwt-Assertion
+# header against Cloudflare's JWKS, in addition to trusting the user-email
+# header. Recommended even when the service is unreachable outside the CF
+# tunnel.
+cloudflareAccess:
+  verifyJWT: true
+  teamDomain: "<team>.cloudflareaccess.com"
+  # Optional. When set, assertions whose aud doesn't match are rejected. When
+  # empty, the audience claim is not checked — assertions from any application
+  # in the same CF Access team are accepted (signature + issuer still tie them
+  # to the team). Useful when you can't easily look up the AUD per deployment.
+  audTag: ""
+  jwtHeader: "Cf-Access-Jwt-Assertion"
+  # HTTP header carrying the authenticated user's email. CF Access forwards
+  # this automatically. Default: "Cf-Access-Authenticated-User-Email".
+  # The top-level userHeader field is a deprecated alias for this one.
+  userHeader: "Cf-Access-Authenticated-User-Email"
+  # Allow non-identity CF Access service tokens to authenticate, using the
+  # token's common_name (its client ID) as the identity subject. Whether a
+  # service token can reach the app at all is still gated by the app's CF
+  # Access policy. Requires verifyJWT. Default: true.
+  allowServiceTokens: true
+
+# ─── HTTP Basic auth (authMode: basic) ────────────────────────────────────────
+
+# Self-contained alternative to a reverse-proxy SSO. The browser handles the
+# credential dialog; credentials are validated against an htpasswd file.
+
+# basicAuth:
+#   htpasswdFile: "/etc/authenticatoor/htpasswd"
+#   realm: "authenticatoor"
+
+# ─── any auth (authMode: any) ─────────────────────────────────────────────────
+
+# DEV ONLY. Unauthenticated /auth/* requests redirect to a small form where
+# the user picks any username. The picked name is stored in a clearable
+# cookie and reused as the identity until POST /auth/logout. Defaults are
+# sensible — no anyAuth: block is needed unless you want to override the
+# cookie name, login path, or TTL.
+
+# anyAuth:
+#   cookieName: "authenticatoor_anyauth_user"
+#   loginPath:  "/auth/anyauth/login"
+#   cookieTTL:  "12h"
+
+# ─── GitHub OAuth (authMode: github) ──────────────────────────────────────────
+
+# Authenticates users through GitHub OAuth, gated on org membership. The
+# clientId / clientSecret come from a "GitHub OAuth App" created at
+# https://github.com/settings/developers (or under your org's settings).
+# Register the redirect URI as <issuer>/auth/oauth/callback (or whatever
+# githubOAuth.callbackPath you configure).
+#
+# Mount clientSecret from a Kubernetes Secret in production; the inline
+# variant accepts the value directly via env var for ad-hoc deployments.
+
+# githubOAuth:
+#   clientId: "Iv1.…"
+#   clientSecretFile: "/etc/authenticatoor/gh-secret"
+#   sessionTTL: "12h"
+#   allowedOrgs:
+#     - "ethpandaops"
+#   # callbackPath: "/auth/oauth/callback"
+#   # sessionCookieName: "authenticatoor_session"
+#   # stateCookieName: "authenticatoor_oauth_state"
+
+# ─── OIDC (authMode: oidc) ────────────────────────────────────────────────────
+
+# Standard OIDC against any IdP (designed against the central ethpandaops
+# dex). One shared confidential client at the IdP; per-instance redirect
+# URI registration is avoided by routing the callback through a stateless
+# relay (platform/applications/oidc-relay) that extracts the originating
+# authenticatoor host from the state parameter.
+#
+# State contract:  state = "<externalURL>~<base64url-signed-blob>"
+# Group membership is checked against the id_token's `groups` claim — for
+# dex's GitHub connector that's org names (and optionally `<org>:<team>`).
+#
+# callbackURL is what the IdP redirects to after authentication. With a
+# relay in front: the relay's URL (shared across every authenticatoor).
+# Direct (no relay): <externalURL>/auth/oidc/callback, registered with
+# the IdP as this client's redirect_uri.
+#
+# Mount clientSecret from a Kubernetes Secret in production; the inline
+# variant works for ad-hoc setups via env var. The session HMAC key is
+# derived from the JWT signing key — no separate session secret to manage.
+
+# oidc:
+#   issuerURL: "https://dex.primary.production.platform.ethpandaops.io"
+#   callbackURL: "https://oidc-relay.primary.production.platform.ethpandaops.io/oidc/callback"
+#   clientId: "authenticatoor"
+#   clientSecretFile: "/etc/authenticatoor/oidc-client-secret"
+#   sessionTTL: "12h"
+#   allowedGroups:
+#     - "ethpandaops"
+#     - "EthDevOpsAccess:validatorops"
+#     - "sigp"
+#   # callbackPath: "/auth/oidc/callback"
+#   # sessionCookieName: "authenticatoor_oidc_session"
+#   # stateCookieName: "authenticatoor_oidc_state"
+#   # scopes: ["openid", "email", "groups"]
+
+# ─── signing keys ─────────────────────────────────────────────────────────────
+
+signing:
+  mode: rs256
+  rs256:
+    # PEM-encoded RSA-2048+ private key, PKCS#1 or PKCS#8.
+    privateKeyFile: "/etc/authenticatoor/keys/private.pem"
+    # Optional. Defaults to a SHA-256 hash of the public key.
+    # keyId: "k1"
+    # If true and the file is missing, generate a new key on startup. DEV ONLY —
+    # production deployments must use a Kubernetes Secret with a stable key.
+    generateIfMissing: false
+    # During key rotation, list the previous public keys here so verifiers can
+    # still validate already-issued tokens until they expire. Drop entries
+    # after `tokenTTL` has passed.
+    # previousKeys:
+    #   - keyId: "k0"
+    #     publicKeyFile: "/etc/authenticatoor/keys/k0.pub.pem"
+
+# ─── observability ────────────────────────────────────────────────────────────
+
+logging:
+  level: info       # debug | info | warn | error
+  format: text      # text | json
+
+metrics:
+  enabled: false
+  listen: ":9090"

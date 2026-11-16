@@ -7,7 +7,8 @@
 //   1. It can call /auth/token with the proxy/provider session cookies
 //      attached — a plain same-origin fetch, no CORS, no nested iframes.
 //      An opaqueredirect/401 response is the definitive "upstream session
-//      gone" signal.
+//      gone" signal; a 403 means "logged in, but no access here". Both
+//      end as "unauthenticated" without a retry.
 //   2. It shares localStorage with every other app's frame, so one session
 //      record (and its refreshes) serves all open apps and tabs. storage
 //      events broadcast changes; the Web Locks API (with a localStorage
@@ -366,6 +367,10 @@
         // valid until exp regardless, so only drop the session once it
         // has actually expired — apps stay authenticated on the adopted
         // token and the scheduler keeps retrying at the idle cadence.
+        //
+        // 403 is also what the service answers a user who is logged in
+        // but has no grant on this devnet. Same conclusion: no token
+        // to be had, and nothing to retry right now.
         if (!sessionValid(readSession())) {
           clearSession();
         }

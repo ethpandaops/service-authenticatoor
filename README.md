@@ -14,13 +14,22 @@ Behind the active protection provider (`/auth/*`):
 - `GET /auth/login?return_to=<url>` — issue a JWT and 302 to `return_to`
   with the token in the URL fragment. `return_to` host must match
   `allowedReturnHosts`.
-- `GET /auth/userinfo` — small introspection endpoint.
+- `GET /auth/userinfo` — small introspection endpoint (email, subject,
+  teams, audience, scope, and `granted`: whether this user gets tokens
+  at all).
 - `GET /auth/embed?target_origin=…` — issues a JWT and posts it to the
   parent window via `postMessage`, restricted to the validated origin.
   This is the silent token-acquisition path (loaded via an invisible
   iframe).
 - `POST /auth/logout` — provider-dispatched logout. Always reachable,
   regardless of authentication state.
+
+On an instance with a [`grants`](docs/config.md#service-grants-grants)
+section, a user who is logged in but named by no group gets **no
+token**: `/auth/token` and `/auth/embed` answer `403`, `/auth/login`
+shows a `403` page with a logout link instead of redirecting back, and
+`/auth/userinfo` still answers, with `"granted": false`. See
+[An identity no group names](docs/config.md#an-identity-no-group-names).
 
 Public (no upstream auth — reachable by JWKS verifiers and browser JS):
 
@@ -30,7 +39,10 @@ Public (no upstream auth — reachable by JWKS verifiers and browser JS):
   `window.ethpandaops.authenticatoor`. `client-v1.js` is the
   polling-style API (`{checkLogin, login, logout, getToken, isLoggedIn}`);
   `client-v2.js` is the shared-session, event-emitting API described
-  below. Auth service URL is templated in at serve time. Served minified
+  below. Both also tell a page what the logged-in user's token holds
+  (`getClaims`, `hasService`, `hasFeature`, `getTeams`; see
+  [Token details in the browser](#token-details-in-the-browser)).
+  Auth service URL is templated in at serve time. Served minified
   with an external source map at `/client-v{n}.js.map`; set
   `devMode: true` to serve the readable source instead. The legacy
   `/client.js` path keeps serving v1 for existing consumers.
@@ -53,7 +65,7 @@ Public (no upstream auth — reachable by JWKS verifiers and browser JS):
   // | "refreshing". Fired once with the current state right after
   // subscribing (asynchronously), so it can drive the whole auth UI.
   auth.addEventListener('status', (info) => {
-    // info = { status, authenticated, user, exp }
+    // info = { status, authenticated, user, exp, teams, services }
     if (info.authenticated) renderAuthedUI(info);
     else renderLoginButton();
   });
@@ -98,8 +110,8 @@ Local-dev pitfall: `localhost` is itself the effective TLD, so
 Either run everything on plain `localhost:<port>`s, or give every host a
 shared parent zone (`auth.dev.localhost` + `app.dev.localhost`).
 
-v1 remains available (and the default) for existing consumers; it is
-unchanged.
+v1 remains available (and the default) for existing consumers; its API
+is unchanged.
 
 ## Browser integration (v1)
 
@@ -139,6 +151,69 @@ Render the unauthenticated UI immediately — never block on the promise.
 The user can click "Login" any time during the 30-second window; the
 in-flight promise simply becomes irrelevant once the page navigates.
 
+## Token details in the browser
+
+A tool's UI often needs to know what the logged-in user may do — to hide
+or disable a control, not to enforce anything. Both clients answer that
+from the token they hold, with the same evaluation of the `services`
+claim that `pkg/auth` does in Go (`ServiceAllowed`, `FeatureAllowed`), so
+no tool has to port the directive grammar:
+
+```js
+const auth = window.ethpandaops.authenticatoor;
+
+auth.addEventListener('status', (info) => {
+  // info.teams: string[], info.services: the raw "services" claim ('' when
+  // the token has none). Both empty while unauthenticated.
+  if (auth.hasFeature('spamoor', 'plugins')) showPluginUI();
+  else hidePluginUI();
+});
+```
+
+| Function | Returns |
+| -------- | ------- |
+| `getClaims()` | The decoded payload of the current token as an object, or `null` when unauthenticated (or when the token cannot be decoded). Treat it as read-only. |
+| `hasService(service)` | Whether the token allows the service at all — the service gate, `auth.ServiceAllowed` in Go. `false` when unauthenticated. |
+| `hasFeature(service, feature, opts?)` | Whether the token grants the feature — `auth.FeatureAllowed` in Go. Default-deny: the feature needs its own grant (`+svc:feat`, `+svc:fe*`, `+svc:all`). `opts = { defaultAllow: true }` switches to default-allow: the feature follows basic access unless it was excluded. `false` when unauthenticated. |
+| `getTeams()` | The token's `teams` as a fresh array of strings; empty when it has none or when unauthenticated. |
+| `serviceAllowed(directives, service)` | The service gate for a directive list given as a string (a `services` claim). Needs no session. |
+| `featureAllowed(directives, service, feature, defaultAllow)` | The feature check for a directive list given as a string. `defaultAllow` counts only when it is exactly `true`. Needs no session. |
+
+All of them are synchronous. In v2 they are about the token of the last
+`status` event, and the `TokenInfo` object passed to `status` listeners
+and resolved by `getStatus()` carries `teams` and `services` next to
+`status`, `authenticated`, `user` and `exp`. In v1 they are about the
+token `getToken()` returns at that moment, so call them after
+`checkLogin()` resolved with `authenticated: true`; before that they
+answer as if unauthenticated. The object `checkLogin()` resolves to is
+unchanged.
+
+What to know:
+
+- **This is UI convenience, not access control.** The browser decodes
+  the token's payload and does **not verify** its signature. The API of
+  each tool verifies the token and checks the service and the feature
+  itself (see
+  [Checking features in a resource server](#checking-features-in-a-resource-server));
+  that stays the enforcement.
+- A token without a `services` claim has basic access to every service
+  and no default-deny feature, exactly as in Go. A token whose `services`
+  claim is not a string — one the Go verifier refuses — has no service
+  and no feature; `TokenInfo.services` is `''` for it too, so ask
+  `hasService` / `hasFeature` rather than evaluating the field. A `teams`
+  claim that is not an array of strings counts as no teams.
+- Service and feature names are ASCII. A directive list or a name with
+  any other character is answered with `false`, and so is an argument
+  that is not a string — the browser never allows what the Go evaluator
+  would refuse.
+- **Older authenticatoor instances** serve a client without these
+  functions. Detect that and treat it as "no features":
+
+  ```js
+  const canUsePlugins = typeof auth.hasFeature === 'function' &&
+    auth.hasFeature('spamoor', 'plugins');
+  ```
+
 ## Token format
 
 ```json
@@ -148,6 +223,7 @@ in-flight promise simply becomes irrelevant once the page navigates.
   "email": "alice@example.com",
   "aud":   ["example.com"],
   "scope": "*.example.com",
+  "teams": ["lighthouse", "panda"],
   "iat":   1714492800,
   "nbf":   1714492800,
   "exp":   1714494600,
@@ -157,6 +233,157 @@ in-flight promise simply becomes irrelevant once the page navigates.
 
 Signed RS256, `kid` in the header. Verifiers must check `iss`, `aud`,
 `exp`, and the signature.
+
+### Teams
+
+**Teams say who you are; grants say what you may use.**
+
+`teams` lists the teams the user belongs to. It is an identity
+attribute: a resource server uses it to tell whose things are whose (a
+client team acting on its own nodes). authenticatoor does not manage
+memberships: the claim carries what the provider that authenticated the
+user knows. Each provider takes a static list (`teams: [panda]`) and
+`teamRules` that derive teams from the attributes it verified — the
+`team:<slug>` groups of the central IdP's id_token, an org list, an
+email address:
+
+```yaml
+oidc:
+  teamRules:
+    - claim: groups
+      prefix: "team:"       # "team:lighthouse" → lighthouse
+```
+
+Access does not hang on a team name. Which tools a user may use is
+decided by the `grants` section, whose members always name the provider
+they come through (`cfaccess/team:panda`, `oidc/team:lighthouse`,
+`oidc/groups:panda-access`, `oidc/user:alice@example.org`), and reaches
+a tool as the `services` claim below. In a resource server, use `teams`
+for ownership and features (`HasFeature`) for what a user may do; do
+not hang privileges on a team name.
+
+See [`docs/config.md`](docs/config.md#teams) for the attributes of each
+provider, the rule forms, and how sessions and config changes interact.
+
+The claim is an array of lowercase names (`[a-z0-9][a-z0-9._-]{0,62}`),
+de-duplicated, sorted, at most 32 entries. It is **omitted** when the
+user has no teams, and absent from tokens issued by older versions —
+treat a missing claim as "no teams", never as "all teams".
+
+A Go resource server reads it from the verified claims of
+[`pkg/auth`](pkg/auth):
+
+```go
+claims, err := verifier.Verify(token) // unchanged
+if err != nil { /* 401 */ }
+
+if claims.HasTeam("panda") {
+	// internal team: everything
+} else if claims.HasAnyTeam(node.OwnerTeams...) {
+	// a client team acting on its own node
+} else {
+	// 403
+}
+```
+
+`HasTeam` / `HasAnyTeam` normalize their argument and compare exactly
+(no prefixes, no wildcards); `claims.Teams` is the raw slice. Other
+languages read the `teams` array from the JWT payload after verifying
+the token. Verification itself does not look at the claim, so tokens
+without it verify exactly as before.
+
+### Services
+
+`services` is an allow/deny directive list (`+name` / `-name`, `all` for
+every service, later entries win) saying which tools the token may be
+used against — `"-all,+dora"` is a token for dora only. A
+resource server enforces it by naming itself to the verifier:
+
+```go
+verifier, err := auth.NewJWKSVerifier(ctx, auth.VerifierConfig{
+	// ...
+	ExpectedService: "dora",
+})
+```
+
+`Verify` then rejects tokens whose directive does not allow that
+service. Two properties matter:
+
+- A missing or empty claim means **basic access to every service and
+  nothing more** — such a token passes every service check and holds no
+  granted feature (see below). That is what tokens look like unless the
+  [`grants`](docs/config.md#service-grants-grants) config section is
+  set.
+- The claim only binds resource servers that set `ExpectedService`
+  (spamoor and assertoor do; buildoor does once its branch
+  `pk910/services-gate` is merged). One that does not accepts any valid
+  token.
+
+With `grants` configured, authenticatoor computes the claim per user
+from the groups they are a member of — by team, by user id or by any
+attribute their provider verified, always together with that provider:
+`+all` for someone granted every service and `-all,+<service>…` for
+specific grants. A user in no group gets no token at all (`403`), so a
+tool that verifies tokens without setting `ExpectedService` does not
+take them for logged in. A bare `-all` is still possible — for a member
+of a group whose `services` list is empty, or holds only services the
+instance-wide directive denies.
+
+### Checking features in a resource server
+
+A service directive grants basic access; features are extras on top.
+`+dora` is basic access to dora, `+dora:admin` adds its
+feature `admin`, `+dora:all` every feature, `+dora:user*` every
+feature whose name starts with `user`, and `-dora:admin` or
+`+dora:all:-admin` exclude one. (`basic` is the reserved name of
+basic access itself; `all` is reserved too.)
+
+Keep the service gate (`ExpectedService`) and add feature checks to it —
+never replace it. Each feature is checked in one of two modes:
+
+```go
+// Privileged: must be handed out deliberately. Needs +dora:admin or
+// +dora:all.
+if !claims.HasFeature("dora", "admin", auth.FeatureDefaultDeny) {
+	http.Error(w, "forbidden", http.StatusForbidden)
+	return
+}
+
+// Ordinary: comes with basic access unless it was excluded.
+if claims.HasFeature("dora", "view-logs", auth.FeatureDefaultAllow) {
+	// ...
+}
+
+// As middleware: 401 without claims, 403 when not allowed.
+mux.Handle("POST /api/admin/reindex", auth.RequireFeature(
+	"dora", "admin", auth.FeatureDefaultDeny, handleReindex))
+```
+
+| Basic access to the service | Feature  | `FeatureDefaultDeny` | `FeatureDefaultAllow` |
+| --------------------------- | -------- | -------------------- | --------------------- |
+| denied                      | any      | no                   | no                    |
+| allowed                     | unset    | no                   | yes                   |
+| allowed                     | granted  | yes                  | yes                   |
+| allowed                     | excluded | no                   | no                    |
+| *token without a `services` claim* | *(unset)* | no              | yes                   |
+
+A feature is never allowed without basic access. A token without the
+claim has basic access to every service and nothing more: it is the row
+"allowed / unset", exactly as if the claim were `+all`. That is what an
+authenticatoor without `grants` mints, so such an instance hands out no
+default-deny feature — configure `grants` to give them out.
+
+Features name capabilities (`admin`), not endpoints. Because a grant can
+be a prefix (`user*`), feature names are namespaces: group them
+deliberately (`user-view`, `user-edit`). Introducing a
+default-deny feature takes it away from every group that only has the
+bare service — the internal team should be granted `all:all`. In
+`grants`, a grant names features as `svc:f1:f2`, `svc:all`,
+`all:f1` or `all:all`; the emitted claim always carries the bare
+directive too (`-all,+dora,+dora:admin`), so tools built
+against older versions of `pkg/auth` keep reading basic access
+correctly. Details:
+[`docs/config.md`](docs/config.md#features).
 
 ## Build
 
@@ -209,6 +436,43 @@ authMode: any
 See [`docs/config.md`](docs/config.md#protection-modes) for the full
 reference and the alternatives (`basic`, `github`).
 
+## Upgrading
+
+Configs written for earlier versions load unchanged — the single-string
+`authMode`, the top-level `userHeader` and the top-level provider blocks
+(`cloudflareAccess:`, `basicAuth:`, `anyAuth:`, `githubOAuth:`, `oidc:`)
+stay valid, and without the new settings (`teams`, `teamRules`,
+`grants`) the tokens carry the same claims as before. Three things to
+know:
+
+- **Everyone logs in again, once.** Session cookies of earlier versions
+  are not accepted. Invisible behind Cloudflare Access; a redirect
+  through the IdP for `oidc` and `github`.
+- **`oidc`: an email counts only when the id_token says
+  `email_verified: true`.** Otherwise the user's token has the IdP's
+  `sub` as its `sub` and no `email` — where earlier versions used the
+  email regardless. With an IdP that sends `false` or nothing, every
+  user's subject changes with the upgrade; with one that flips the flag
+  between logins, a user's subject alternates. Set
+  `oidc.trustUnverifiedEmail: true` to get the earlier behaviour (only
+  for an IdP that verifies addresses without saying so) or `false` to
+  keep the rule; until the key is set, the service warns at startup.
+- **Unknown keys are checked.** A misspelled key inside a provider
+  block, a top-level key within two edits of `grants`, and a map
+  written where a list belongs are startup errors that name the key.
+  Keys earlier versions knew and that are gone (`anyAuth.loginPath`,
+  `githubOAuth.sessionSecret`, `githubOAuth.sessionSecretFile`) are
+  ignored with a deprecation warning; other unknown top-level keys only
+  get a warning.
+
+Cloudflare Access needs no `audTag`: a provider without it keeps
+accepting the assertions of every Access application of the Cloudflare
+team, also when it gives teams or is named in `grants` — the service
+then says so in a startup warning. Set `audTag` to limit it to one
+application.
+
+Details: [`docs/config.md`](docs/config.md#upgrading).
+
 ## Dev quickstart
 
 ```sh
@@ -248,6 +512,14 @@ curl http://127.0.0.1:18080/.well-known/openid-configuration
 go test ./...
 ```
 
+The browser clients' evaluation of the `services` claim is tested against
+the Go one: `pkg/server/client_claims_test.go` runs the served scripts in
+a JavaScript interpreter ([goja](https://github.com/dop251/goja), a
+test-only dependency) and compares their answers with
+`auth.ServiceAllowed` / `auth.FeatureAllowed` over the tables of
+`pkg/auth`'s tests (`internal/directivecases`) and over generated
+directive lists.
+
 ## Protection providers
 
 Providers decide who is allowed to mint tokens. The `providers` list
@@ -273,6 +545,15 @@ so `/auth/*` itself needs no edge protection.
 See [`docs/config.md`](docs/config.md#protection-providers) for the
 per-provider config blocks and trade-offs.
 
+Command-line tools and other non-browser clients can get a token
+without a browser: an `oidc` provider with the `oidc.bearer` block
+(off by default) accepts a JWT the client already holds from the same
+IdP at `GET /<name>/token` and answers like `/auth/token`, with the
+identity, teams and grants of that user's browser login.
+[`docs/cli-clients.md`](docs/cli-clients.md) is the contract for client
+authors; the operator's side and its security notes are in
+[`docs/config.md`](docs/config.md#non-browser-clients-bearer-tokens).
+
 ## Repo layout
 
 ```
@@ -283,7 +564,8 @@ pkg/cors/             CORS middleware with strict allow-list
 pkg/cfaccess/         Cf-Access-Jwt-Assertion verification
 pkg/config/           YAML + env config loader, derivation, validation
 pkg/protection/       Provider interface; sub-packages cloudflare/basic/anyauth/github/oidc
-pkg/server/           HTTP server: routes, handlers, lifecycle
+pkg/server/           HTTP server: routes, handlers, lifecycle; static/ holds the browser clients
+internal/directivecases/  test tables for the services claim, shared by the Go and the browser evaluator's tests
 Dockerfile            multi-stage source build
 Dockerfile-stub       packages a pre-built binary into a distroless image (used by CI)
 config.example.yaml   annotated example config

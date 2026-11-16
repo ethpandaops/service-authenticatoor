@@ -6,11 +6,14 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"slices"
 	"strings"
 	"testing"
 
 	"github.com/gorilla/mux"
 	"github.com/sirupsen/logrus"
+
+	"github.com/ethpandaops/service-authenticatoor/pkg/protection"
 )
 
 func newTestProvider(t *testing.T) *Provider {
@@ -291,5 +294,109 @@ func TestSanitizeUsername(t *testing.T) {
 				t.Errorf("sanitize(%q): got %q want %q", tc.in, got, tc.want)
 			}
 		})
+	}
+}
+
+// TestAuthenticate_Teams: the identity gets exactly the configured static
+// teams. The username cookie is unsigned, so nothing in it (or anywhere
+// else on the request) may add one.
+func TestAuthenticate_Teams(t *testing.T) {
+	tests := []struct {
+		name   string
+		static []string
+		cookie string
+		want   []string
+	}{
+		{"none configured", nil, "alice", nil},
+		{"configured", []string{"panda", "geth"}, "alice", []string{"geth", "panda"}},
+		{"username naming a team adds nothing", []string{"geth"}, "panda", []string{"geth"}},
+		{"username shaped like a claim adds nothing", nil, "alice,teams=panda", nil},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			log := logrus.New()
+			log.SetOutput(io.Discard)
+			p := New(log, Config{Teams: tc.static})
+			if err := p.Start(context.Background()); err != nil {
+				t.Fatalf("start: %v", err)
+			}
+
+			r := httptest.NewRequest(http.MethodGet, "/auth/token?teams=panda", nil)
+			r.Header.Set("X-Teams", "panda")
+			r.AddCookie(&http.Cookie{Name: DefaultCookieName, Value: tc.cookie})
+			r.AddCookie(&http.Cookie{Name: "teams", Value: "panda"})
+			out, err := p.Authenticate(context.Background(), r)
+			if err != nil || out.Identity == nil {
+				t.Fatalf("auth: identity=%v err=%v", out.Identity, err)
+			}
+			if !slices.Equal(out.Identity.Teams, tc.want) {
+				t.Errorf("teams: got %v, want %v", out.Identity.Teams, tc.want)
+			}
+		})
+	}
+}
+
+func TestStart_RejectsInvalidTeams(t *testing.T) {
+	log := logrus.New()
+	log.SetOutput(io.Discard)
+	for _, teams := range [][]string{{"not a team"}, {"Panda"}, {"panda "}} {
+		p := New(log, Config{Teams: teams})
+		if err := p.Start(context.Background()); err == nil {
+			t.Errorf("expected Start to reject the team list %q", teams)
+		}
+	}
+}
+
+// TestAuthenticate_TeamRules: the one attribute is "username".
+func TestAuthenticate_TeamRules(t *testing.T) {
+	tests := []struct {
+		name  string
+		rules []protection.TeamRule
+		user  string
+		want  []string
+	}{
+		{"map", []protection.TeamRule{{Claim: "username", Map: map[string][]string{"alice": {"lighthouse"}}}}, "alice", []string{"dev", "lighthouse"}},
+		{"map, another user", []protection.TeamRule{{Claim: "username", Map: map[string][]string{"alice": {"lighthouse"}}}}, "bob", []string{"dev"}},
+		{"prefix: pick a team by name", []protection.TeamRule{{Claim: "username", Prefix: "team-"}}, "team-geth", []string{"dev", "geth"}},
+		{"no other attribute", []protection.TeamRule{{Claim: "email", Value: true}, {Claim: "groups", Value: true}}, "alice", []string{"dev"}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			log := logrus.New()
+			log.SetOutput(io.Discard)
+			p := New(log, Config{Teams: []string{"dev"}, TeamRules: tc.rules})
+			if err := p.Start(context.Background()); err != nil {
+				t.Fatalf("start: %v", err)
+			}
+			r := httptest.NewRequest(http.MethodGet, "/auth/token", nil)
+			r.AddCookie(&http.Cookie{Name: DefaultCookieName, Value: tc.user})
+			out, err := p.Authenticate(context.Background(), r)
+			if err != nil || out.Identity == nil {
+				t.Fatalf("auth: identity=%v err=%v", out.Identity, err)
+			}
+			if !slices.Equal(out.Identity.Teams, tc.want) {
+				t.Errorf("teams: got %v, want %v", out.Identity.Teams, tc.want)
+			}
+		})
+	}
+}
+
+// TestAuthenticate_GrantMembers: the one attribute is "username".
+func TestAuthenticate_GrantMembers(t *testing.T) {
+	log := logrus.New()
+	log.SetOutput(io.Discard)
+	p := New(log, Config{GrantMembers: []protection.AttributeMember{
+		{Attribute: "username", Value: "Alice"}, {Attribute: "username", Value: "bob"},
+	}})
+	for user, want := range map[string][]string{"alice": {"username:alice"}, "BOB": {"username:bob"}, "carol": nil} {
+		r := httptest.NewRequest(http.MethodGet, "/auth/token?username=alice", nil)
+		r.AddCookie(&http.Cookie{Name: DefaultCookieName, Value: user})
+		out, err := p.Authenticate(context.Background(), r)
+		if err != nil || out.Identity == nil {
+			t.Fatalf("auth: identity=%v err=%v", out.Identity, err)
+		}
+		if !slices.Equal(out.Identity.Matches, want) {
+			t.Errorf("%s: matches %v, want %v", user, out.Identity.Matches, want)
+		}
 	}
 }

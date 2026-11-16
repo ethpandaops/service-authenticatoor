@@ -719,3 +719,26 @@ func TestServer_Lifecycle(t *testing.T) {
 		t.Fatal("Start did not return after cancel")
 	}
 }
+
+// plainIssuer implements issuer.Issuer as it was before the teams claim
+// — no IssueFor.
+type plainIssuer struct{ issuer.Issuer }
+
+// TestNew_RequiresIdentityIssuer: Options.Issuer keeps its plain type
+// for compatibility, but an issuer that cannot take the identity's
+// teams is refused at construction rather than silently used.
+func TestNew_RequiresIdentityIssuer(t *testing.T) {
+	s, iss, prov := newTestServer(t)
+	log := logrus.New()
+	log.SetOutput(io.Discard)
+
+	_, err := New(Options{
+		Config:    s.cfg,
+		Issuer:    plainIssuer{Issuer: iss},
+		Providers: []NamedProvider{{Name: "fake", Provider: prov}},
+		Log:       log,
+	})
+	if err == nil || !strings.Contains(err.Error(), "IdentityIssuer") {
+		t.Fatalf("New: got %v, want an IdentityIssuer error", err)
+	}
+}
