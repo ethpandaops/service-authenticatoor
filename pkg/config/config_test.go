@@ -1,11 +1,16 @@
 package config
 
 import (
+	"crypto/rand"
+	"crypto/rsa"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"maps"
 	"os"
 	"path/filepath"
+	"reflect"
+	"regexp"
 	"slices"
 	"strings"
 	"testing"
@@ -1415,224 +1420,6 @@ func TestConfig_ServicesUngated(t *testing.T) {
 	}
 }
 
-// TestLoad_CaseVariantKeys: the loader reads keys case-insensitively
-// and would merge two spellings of one key — in an order that differs
-// from one start to the next. Every such pair is a startup error that
-// names both spellings, wherever it is. These load real files.
-func TestLoad_CaseVariantKeys(t *testing.T) {
-	cf := `
-cloudflareAccess:
-  teamDomain: "test.cloudflareaccess.com"
-`
-	oidcProvider := `
-providers:
-  - name: oidc
-    type: oidc
-    oidc:
-      issuerURL: "https://idp.example.com"
-      callbackURL: "https://auth.demo.example.com/oidc/callback"
-      clientId: "id"
-      clientSecret: "secret"
-`
-	tests := []struct {
-		name    string
-		body    string
-		wantErr string
-	}{
-		{
-			"the grants section written twice",
-			cf + "grants: []\nGrants:\n  - members: [\"cfaccess/team:panda\"]\n    services: [all]\n",
-			`keys "grants" and "Grants" at the top level are the same key`,
-		},
-		{
-			"an empty grants key next to a filled one in another case",
-			cf + "grants:\nGRANTS:\n  - members: [\"cfaccess/team:panda\"]\n    services: [all]\n",
-			`keys "grants" and "GRANTS" at the top level are the same key`,
-		},
-		{
-			"keys of a grants group",
-			cf + "grants:\n  - members: [\"cfaccess/team:panda\"]\n    services: [all]\n    Services: []\n",
-			`keys "services" and "Services" in grants[0] are the same key`,
-		},
-		{
-			"an exact duplicate",
-			cf + "grants:\n  - members: [\"cfaccess/team:panda\"]\n    services: [all]\n    services: []\n",
-			`mapping key "services" already defined`,
-		},
-		{
-			"rule map keys in a providers entry",
-			oidcProvider + "      teamRules:\n        - claim: groups\n          map:\n            Staff: [panda]\n            staff: []\n",
-			`keys "Staff" and "staff" in providers[0].oidc.teamRules[0].map are the same key`,
-		},
-		{
-			"rule map keys in a legacy block",
-			"authMode: any\nanyAuth:\n  teamRules:\n    - claim: username\n      map:\n        Alice: [panda]\n        ALICE: []\n",
-			`keys "Alice" and "ALICE" in anyAuth.teamRules[0].map are the same key`,
-		},
-		{
-			"a provider block written twice",
-			"providers:\n  - name: anyauth\n    type: any\n    anyAuth:\n      teams: [dev]\n    AnyAuth:\n      teams: [panda]\n",
-			`keys "anyAuth" and "AnyAuth" in providers[0] are the same key`,
-		},
-		{
-			"a setting written twice",
-			cf + "tokenTTL: 30m\nTokenTTL: 24h\n",
-			`keys "tokenTTL" and "TokenTTL" at the top level are the same key`,
-		},
-	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			// The outcome must not depend on map iteration: load it a
-			// number of times.
-			for range 20 {
-				_, err := Load(writeTempConfig(t, teamsConfigHeader+tc.body))
-				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
-					t.Fatalf("load: got %v, want an error containing %q", err, tc.wantErr)
-				}
-			}
-		})
-	}
-}
-
-// TestLoad_MisspelledGrantsSection: a key that was meant to be the
-// grants section but is not is an error — ignored, it would leave every
-// service open. Other unknown top-level keys are a warning.
-func TestLoad_MisspelledGrantsSection(t *testing.T) {
-	cf := `
-cloudflareAccess:
-  teamDomain: "test.cloudflareaccess.com"
-`
-	entries := "  - members: [\"cfaccess/team:panda\"]\n    services: [all]\n"
-
-	errors := []struct {
-		name string
-		body string
-		want string
-	}{
-		{"singular", cf + "grant:\n" + entries, `unknown key "grant": it looks like the service grants section`},
-		{"teamService", cf + "teamService:\n  panda: [all]\n", `unknown key "teamService": it looks like the service grants section`},
-		{"team_services", cf + "team_services:\n  panda: [all]\n", `unknown key "team_services"`},
-		{"team-services", cf + "team-services:\n  panda: [all]\n", `unknown key "team-services"`},
-		{"serviceGrants", cf + "serviceGrants:\n" + entries, `unknown key "serviceGrants"`},
-		{"service_grants", cf + "service_grants:\n" + entries, `unknown key "service_grants"`},
-		{"teamGrants", cf + "teamGrants:\n" + entries, `unknown key "teamGrants"`},
-		{"permissions", cf + "permissions:\n" + entries, `unknown key "permissions"`},
-		{"grants with a typo", cf + "grnats_grants:\n" + entries, `unknown key "grnats_grants"`},
-		{"nested under another key", cf + "cors:\n  grants:\n    - members: [\"cfaccess/team:panda\"]\n      services: [all]\n", `key "grants" in cors: the service grants section is the top-level key "grants"`},
-		{"nested under a provider block", "cloudflareAccess:\n  teamDomain: \"test.cloudflareaccess.com\"\n  grants: []\n", `key "grants" in cloudflareAccess: the service grants section is the top-level key`},
-		{"nested in a providers entry", "providers:\n  - name: anyauth\n    type: any\n    teamServices:\n      panda: [all]\n", `key "teamServices" in providers[0]`},
-		{"nested under an unknown key", cf + "access:\n  grants: []\n", `key "grants" in access`},
-	}
-	for _, tc := range errors {
-		t.Run(tc.name, func(t *testing.T) {
-			_, err := Load(writeTempConfig(t, teamsConfigHeader+tc.body))
-			if err == nil || !strings.Contains(err.Error(), tc.want) {
-				t.Fatalf("load: got %v, want an error containing %q", err, tc.want)
-			}
-		})
-	}
-
-	t.Run("data named like the section is fine", func(t *testing.T) {
-		cfg, err := Load(writeTempConfig(t, teamsConfigHeader+`
-authMode: any
-anyAuth:
-  teamRules:
-    - claim: username
-      map:
-        grants: [grants]
-        permissions: [ops]
-grants:
-  - name: grants
-    members: ["anyauth/team:grants", "anyauth/user:grant", "anyauth/username:teamservices"]
-    services: [all]
-`))
-		if err != nil {
-			t.Fatalf("load: %v", err)
-		}
-		if len(cfg.Warnings) != 0 {
-			t.Errorf("warnings: %v", cfg.Warnings)
-		}
-	})
-
-	t.Run("other unknown keys are a warning", func(t *testing.T) {
-		cfg, err := Load(writeTempConfig(t, teamsConfigHeader+cf+"tokenTLL: 1h\nfoo: bar\n"))
-		if err != nil {
-			t.Fatalf("load: %v", err)
-		}
-		if len(cfg.Warnings) != 1 || !strings.Contains(cfg.Warnings[0], `"tokenTLL"`) || !strings.Contains(cfg.Warnings[0], `"foo"`) {
-			t.Errorf("warnings: %v", cfg.Warnings)
-		}
-	})
-}
-
-// TestLoad_KnownKeysDoNotWarn: every documented key — the example
-// config, the local dev config, the legacy single-authMode form with
-// all its blocks — loads without a warning, and settings that only
-// come from the environment do not trip the check.
-func TestLoad_KnownKeysDoNotWarn(t *testing.T) {
-	for _, file := range []string{"../../config.example.yaml", "../../.hack/local/config.yaml"} {
-		cfg, err := Load(file)
-		if err != nil {
-			t.Fatalf("%s: %v", file, err)
-		}
-		if len(cfg.Warnings) != 0 {
-			t.Errorf("%s: warnings %v", file, cfg.Warnings)
-		}
-	}
-
-	t.Setenv("AUTHENTICATOOR_LISTEN", ":9999")
-	t.Setenv("AUTHENTICATOOR_METRICS_ENABLED", "true")
-	t.Setenv("AUTHENTICATOOR_CLOUDFLAREACCESS_TEAMS", "panda")
-	cfg, err := Load(writeTempConfig(t, `
-listen: ":8080"
-issuer: "https://auth.demo.example.com"
-externalURL: "https://auth.demo.example.com"
-authMode: [cloudflare, basic, any, github, oidc]
-devMode: false
-audience: [demo.example.com]
-scopePattern: "*.demo.example.com"
-tokenTTL: 30m
-userHeader: "Cf-Access-Authenticated-User-Email"
-allowedReturnHosts: ["*.demo.example.com"]
-cloudflareAccess:
-  teamDomain: "test.cloudflareaccess.com"
-  audTag: "aud"
-basicAuth:
-  htpasswdFile: "/etc/htpasswd"
-anyAuth: {}
-githubOAuth:
-  clientId: "id"
-  clientSecret: "secret"
-  allowedOrgs: [sigp]
-oidc:
-  issuerURL: "https://idp.example.com"
-  callbackURL: "https://auth.demo.example.com/oidc/callback"
-  clientId: "id"
-  clientSecret: "secret"
-  trustUnverifiedEmail: false
-cors:
-  allowedOrigins: ["*.demo.example.com"]
-signing:
-  mode: rs256
-  rs256:
-    privateKeyFile: "/etc/keys/private.pem"
-logging:
-  level: info
-metrics:
-  listen: ":9090"
-grants: []
-`))
-	if err != nil {
-		t.Fatalf("load: %v", err)
-	}
-	if len(cfg.Warnings) != 0 {
-		t.Errorf("warnings: %v", cfg.Warnings)
-	}
-	if cfg.Listen != ":9999" || !cfg.Metrics.Enabled {
-		t.Errorf("env overrides lost: listen=%q metrics=%t", cfg.Listen, cfg.Metrics.Enabled)
-	}
-}
-
 // TestLoad_ConfigTeamNamesAreNotFolded: a team name written in the
 // config has to be in normal form. An uppercase or padded name is an
 // error, not another spelling of the lowercase one.
@@ -1714,124 +1501,6 @@ func TestLoad_DocsDevnetExample(t *testing.T) {
 	}
 	if cfg.ServicesUngated() {
 		t.Error("the example must not be an ungated instance")
-	}
-}
-
-// TestLoad_UnknownKeysInProviderConfig: inside a providers entry, a
-// provider type block (also in the legacy top-level form) and a team
-// rule, an unknown key is a startup error that names the key and the
-// allowed ones. The loader would otherwise drop it, and a dropped key
-// there fails open.
-func TestLoad_UnknownKeysInProviderConfig(t *testing.T) {
-	oidcEntry := `
-providers:
-  - name: oidc
-    type: oidc
-    oidc:
-      issuerURL: "https://idp.example.com"
-      callbackURL: "https://auth.demo.example.com/oidc/callback"
-      clientId: "id"
-      clientSecret: "secret"
-`
-	rules := func(rule string) string { return oidcEntry + "      teamRules:\n        - " + rule + "\n" }
-
-	tests := []struct {
-		name    string
-		body    string
-		wantErr string
-	}{
-		// The reviewer's scenarios: a misspelled rule key used to load
-		// as the bare-value rule — every group that is a valid team
-		// name became that team.
-		{"prefx instead of prefix", rules("claim: groups\n          prefx: \"team:\""), `providers[0].oidc.teamRules[0]: unknown key "prefx" (the keys here are: claim, map, prefix, regex, split, value)`},
-		{"regexp instead of regex", rules("claim: groups\n          regexp: \"team:(.*)\""), `teamRules[0]: unknown key "regexp"`},
-		{"maps instead of map", rules("claim: groups\n          maps: { staff: [panda] }"), `teamRules[0]: unknown key "maps"`},
-		{"claims instead of claim", rules("claims: groups\n          prefix: \"team:\""), `teamRules[0]: unknown key "claims"`},
-		{"the second rule", oidcEntry + "      teamRules:\n        - claim: groups\n          prefix: \"team:\"\n        - claim: email\n          mapping: { a: [b] }\n", `providers[0].oidc.teamRules[1]: unknown key "mapping"`},
-
-		{"in a provider type block", oidcEntry + "      allowedGroup: [x]\n", `providers[0].oidc: unknown key "allowedGroup"`},
-		{"the removed allowedTeams", oidcEntry + "      allowedTeams: [lighthouse]\n", `providers[0].oidc: unknown key "allowedTeams"`},
-		{"the removed teamGroupPrefix", oidcEntry + "      teamGroupPrefix: \"team:\"\n", `providers[0].oidc: unknown key "teamGroupPrefix"`},
-		{"in a providers entry", oidcEntry + "    teams: [panda]\n", `providers[0]: unknown key "teams" (the keys here are: anyAuth, basicAuth, cloudflareAccess, githubOAuth, name, oidc, type)`},
-		{"the block of another type, misspelled", oidcEntry + "    cloudflare_access:\n      teams: [panda]\n", `providers[0]: unknown key "cloudflare_access"`},
-		{"in a legacy top-level block", "cloudflareAccess:\n  teamDomain: \"t.example\"\n  audTag: \"aud\"\n  team: [panda]\n", `cloudflareAccess: unknown key "team"`},
-		{"in a legacy block's rule", "authMode: any\nanyAuth:\n  teamRules:\n    - claim: username\n      prefx: \"team-\"\n", `anyAuth.teamRules[0]: unknown key "prefx"`},
-		{"in a legacy block that is not the active type", "authMode: any\ngithubOAuth:\n  orgTeams:\n    sigp: [lighthouse]\n", `githubOAuth: unknown key "orgTeams"`},
-	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			_, err := Load(writeTempConfig(t, teamsConfigHeader+tc.body))
-			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
-				t.Fatalf("load: got %v, want an error containing %q", err, tc.wantErr)
-			}
-		})
-	}
-
-	t.Run("keys in any case are the known keys", func(t *testing.T) {
-		_, err := Load(writeTempConfig(t, teamsConfigHeader+`
-providers:
-  - Name: oidc
-    Type: oidc
-    OIDC:
-      IssuerURL: "https://idp.example.com"
-      callbackurl: "https://auth.demo.example.com/oidc/callback"
-      ClientID: "id"
-      clientSecret: "secret"
-      TeamRules:
-        - Claim: groups
-          Prefix: "team:"
-`))
-		if err != nil {
-			t.Fatalf("load: %v", err)
-		}
-	})
-}
-
-// TestLoad_EmptyRuleKeys: a rule key that is written down but empty is
-// an error, never "not set" — and a rule has to say what it does: with
-// none of prefix / map / regex / value it is an error, not the rule
-// that takes every value as a team.
-func TestLoad_EmptyRuleKeys(t *testing.T) {
-	rule := func(body string) string {
-		return "authMode: any\nanyAuth:\n  teamRules:\n    - " + body + "\n"
-	}
-	tests := []struct {
-		name    string
-		body    string
-		wantErr string
-	}{
-		{"prefix: \"\"", rule("claim: username\n      prefix: \"\""), "anyAuth.teamRules[0].prefix: is empty"},
-		{"prefix: (null)", rule("claim: username\n      prefix:"), "anyAuth.teamRules[0].prefix: is empty"},
-		{"map: {}", rule("claim: username\n      map: {}"), "anyAuth.teamRules[0].map: is empty"},
-		{"map: (null)", rule("claim: username\n      map:"), "anyAuth.teamRules[0].map: is empty"},
-		{"regex: \"\"", rule("claim: username\n      regex: \"\""), "anyAuth.teamRules[0].regex: is empty"},
-		{"split: \"\"", rule("claim: username\n      split: \"\"\n      value: true"), "anyAuth.teamRules[0].split: is empty"},
-		{"claim: \"\"", rule("claim: \"\"\n      value: true"), "anyAuth.teamRules[0].claim: is empty"},
-		{"claim: (null)", rule("claim:\n      value: true"), "anyAuth.teamRules[0].claim: is empty"},
-		{"value: false", rule("claim: username\n      value: false"), "anyAuth.teamRules[0].value: must be true"},
-		{"value: (null)", rule("claim: username\n      value:"), "anyAuth.teamRules[0].value: must be true"},
-		{"value: yes-as-text", rule("claim: username\n      value: \"true\""), "anyAuth.teamRules[0].value: must be true"},
-		{"no form at all", rule("claim: username"), `anyAuth.teamRules[0]: claim "username": one of prefix, map, regex or "value: true" is required`},
-		{"only split", rule("claim: username\n      split: \",\""), `one of prefix, map, regex or "value: true" is required`},
-		{"value next to a prefix", rule("claim: username\n      prefix: \"team-\"\n      value: true"), "only one of prefix, map, regex and value may be set"},
-		{"a rule that is not a map", "authMode: any\nanyAuth:\n  teamRules:\n    - username\n", "teamRules[0]"},
-	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			_, err := Load(writeTempConfig(t, teamsConfigHeader+tc.body))
-			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
-				t.Fatalf("load: got %v, want an error containing %q", err, tc.wantErr)
-			}
-		})
-	}
-
-	// The explicit form works, in both config shapes.
-	cfg, err := Load(writeTempConfig(t, teamsConfigHeader+rule("claim: username\n      value: true")))
-	if err != nil {
-		t.Fatalf("load: %v", err)
-	}
-	if r := cfg.Providers[0].AnyAuth.TeamRules[0]; r.Claim != "username" || !r.Value {
-		t.Errorf("rule: %+v", r)
 	}
 }
 
@@ -2022,41 +1691,6 @@ grants:
 	}
 }
 
-// document is now a startup error.
-func TestLoad_SecondYAMLDocument(t *testing.T) {
-	base := teamsConfigHeader + "cloudflareAccess:\n  teamDomain: \"t.cloudflareaccess.com\"\n"
-	grants := "grants:\n  - members: [\"cfaccess/user:alice@example.org\"]\n    services: [all]\n"
-
-	tests := []struct {
-		name    string
-		body    string
-		wantErr bool
-	}{
-		{"grants in a second document", base + "---\n" + grants, true},
-		{"any second document", base + "---\nlisten: \":9999\"\n", true},
-		{"a third document", base + "---\n---\n" + grants, true},
-		{"a second document that is a list", base + "---\n- a\n- b\n", true},
-		{"a leading document marker", "---\n" + base, false},
-		{"a trailing document marker with nothing after it", base + "---\n", false},
-		{"a document end marker", base + "...\n", false},
-		{"a comment after a marker", base + "---\n# nothing here\n", false},
-	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			cfg, err := Load(writeTempConfig(t, tc.body))
-			if tc.wantErr {
-				if err == nil || !strings.Contains(err.Error(), "more than one YAML document") {
-					t.Fatalf("load: got %v (grants %+v), want a multi-document error", err, cfg)
-				}
-				return
-			}
-			if err != nil {
-				t.Fatalf("load: %v", err)
-			}
-		})
-	}
-}
-
 // TestLoad_GrantsEnvVars: grants are read from the config file only. An
 // environment variable that looks like it configures them would be
 // ignored — with no grants in the file the instance would run ungated —
@@ -2099,5 +1733,565 @@ func TestLoad_GrantsEnvVars(t *testing.T) {
 	}
 	if cfg.Listen != ":9999" || cfg.Grants != nil {
 		t.Errorf("listen=%q grants=%+v", cfg.Listen, cfg.Grants)
+	}
+}
+
+// oidcEntry is a providers list with one oidc entry; the test appends
+// the keys of its oidc block.
+const oidcEntry = teamsConfigHeader + `
+providers:
+  - name: corp
+    type: oidc
+    oidc:
+      issuerURL: "https://idp.example.org"
+      callbackURL: "https://auth.demo.example.com/corp/callback"
+      clientId: "authenticatoor"
+      clientSecret: "secret"
+`
+
+// legacyOIDC is the same provider as a legacy top-level block.
+const legacyOIDC = teamsConfigHeader + `
+authMode: oidc
+oidc:
+  issuerURL: "https://idp.example.org"
+  callbackURL: "https://auth.demo.example.com/oidc/callback"
+  clientId: "authenticatoor"
+  clientSecret: "secret"
+`
+
+// TestLoad_OIDCBearer: the oidc.bearer block is off when absent, and on
+// with its audiences (and optional issuer) when present.
+func TestLoad_OIDCBearer(t *testing.T) {
+	cfg, err := Load(writeTempConfig(t, oidcEntry))
+	if err != nil {
+		t.Fatalf("load without the block: %v", err)
+	}
+	if b := cfg.Providers[0].OIDC.Bearer; b.Enabled() || b.IssuerURL != "" {
+		t.Errorf("without the block: %+v", b)
+	}
+
+	cfg, err = Load(writeTempConfig(t, oidcEntry+
+		"      bearer:\n        audiences: [\"devnet-cli\", \"authenticatoor\"]\n"))
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	b := cfg.Providers[0].OIDC.Bearer
+	if !b.Enabled() || !slices.Equal(b.Audiences, []string{"devnet-cli", "authenticatoor"}) || b.IssuerURL != "" {
+		t.Errorf("bearer: %+v", b)
+	}
+
+	// A client id that looks like a number, written as a string; an
+	// issuer over plain http (the scheme is the operator's choice, as
+	// for oidc.issuerURL).
+	cfg, err = Load(writeTempConfig(t, oidcEntry+
+		"      bearer:\n        audiences: [\"123\", 'true', devnet-cli]\n        issuerURL: \"http://idp.internal:9000/cli\"\n"))
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	b = cfg.Providers[0].OIDC.Bearer
+	if !slices.Equal(b.Audiences, []string{"123", "true", "devnet-cli"}) || b.IssuerURL != "http://idp.internal:9000/cli" {
+		t.Errorf("bearer: %+v", b)
+	}
+
+	// The environment form switches the feature on for the legacy
+	// top-level block.
+	t.Run("environment", func(t *testing.T) {
+		t.Setenv("AUTHENTICATOOR_OIDC_BEARER_AUDIENCES", "devnet-cli,other-cli")
+		cfg, err := Load(writeTempConfig(t, legacyOIDC))
+		if err != nil {
+			t.Fatalf("load: %v", err)
+		}
+		if b := cfg.Providers[0].OIDC.Bearer; !slices.Equal(b.Audiences, []string{"devnet-cli", "other-cli"}) {
+			t.Errorf("bearer from the environment: %+v", b)
+		}
+	})
+
+	cfg, err = Load(writeTempConfig(t, legacyOIDC+
+		"  bearer:\n    audiences:\n      - devnet-cli\n    issuerURL: \"https://idp.example.org/application/o/cli/\"\n"))
+	if err != nil {
+		t.Fatalf("load legacy: %v", err)
+	}
+	b = cfg.Providers[0].OIDC.Bearer
+	if !slices.Equal(b.Audiences, []string{"devnet-cli"}) || b.IssuerURL != "https://idp.example.org/application/o/cli/" {
+		t.Errorf("legacy bearer: %+v", b)
+	}
+}
+
+// TestLoad_OIDCBearer_Errors: a block that is written down and does not
+// say exactly whose tokens are accepted is a startup error — never
+// "off", and never a guess.
+func TestLoad_OIDCBearer_Errors(t *testing.T) {
+	tests := []struct {
+		name string
+		body string // appended to the oidc block of the providers entry
+		want string
+	}{
+		{"empty block", "      bearer:\n", "providers[0].oidc.bearer: is empty"},
+		{"empty audiences", "      bearer:\n        audiences: []\n", "providers[0].oidc.bearer.audiences: must be a non-empty list"},
+		{"audiences is a single value", "      bearer:\n        audiences: devnet-cli\n", "providers[0].oidc.bearer.audiences: must be a non-empty list"},
+		{"empty audience", "      bearer:\n        audiences: [\"devnet-cli\", \"\"]\n", "providers[0].oidc.bearer.audiences[1]: must be a non-empty string"},
+		{"audiences are a number and a boolean", "      bearer:\n        audiences: [123, true]\n", "providers[0].oidc.bearer.audiences[0]: must be a non-empty string, not int (123)"},
+		{"blank audience", "      bearer:\n        audiences: [\" \"]\n", "oidc.bearer.audiences[0]"},
+		{"issuer is not a URL", "      bearer:\n        audiences: [devnet-cli]\n        issuerURL: \"http://[::1\"\n", "oidc.bearer.issuerURL"},
+		{"issuer without a scheme", "      bearer:\n        audiences: [devnet-cli]\n        issuerURL: \"idp.example.org/cli\"\n", "oidc.bearer.issuerURL: \"idp.example.org/cli\" must be an http or https URL"},
+		{"issuer without a host", "      bearer:\n        audiences: [devnet-cli]\n        issuerURL: \"https:///cli\"\n", "oidc.bearer.issuerURL: \"https:///cli\" has no host"},
+		{"duplicate audience", "      bearer:\n        audiences: [\"devnet-cli\", \"devnet-cli\"]\n", `"devnet-cli" is listed twice`},
+		{"unknown key", "      bearer:\n        audiences: [\"devnet-cli\"]\n        issuer: \"https://idp.example.org\"\n", `providers[0].oidc.bearer: unknown key "issuer"`},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			wantLoadError(t, writeTempConfig(t, oidcEntry+tc.body), tc.want)
+		})
+	}
+
+	t.Run("legacy block", func(t *testing.T) {
+		wantLoadError(t, writeTempConfig(t, legacyOIDC+"  bearer:\n    issuerURL: \"https://idp.example.org/cli\"\n"),
+			"oidc.bearer.audiences: must be a non-empty list")
+	})
+	// Through the environment there is no block to look at: an issuer
+	// without audiences is caught by the validation.
+	t.Run("environment", func(t *testing.T) {
+		t.Setenv("AUTHENTICATOOR_OIDC_BEARER_ISSUERURL", "https://idp.example.org/cli")
+		wantLoadError(t, writeTempConfig(t, legacyOIDC), "oidc.bearer.audiences is required")
+	})
+}
+
+// The files under testdata/compat are configs that versions before this
+// one accepted. They are kept as they were written then:
+//
+//	helm-master-*.yaml   what the authenticatoor chart of
+//	                     ethereum-helm-charts (master) renders: with its
+//	                     default values, and with every optional value set
+//	v0.0.N-example.yaml  config.example.yaml of the release
+//	v0.0.N-hack-local    .hack/local/config.yaml of the release
+//	v0.0.N-docs-NN.yaml  the YAML blocks of docs/config.md of the release
+//	v0.0.N-readme-NN     the YAML blocks of README.md of the release
+//	main-*               the same, from the main branch this version
+//	                     was built on
+//	deprecated-*.yaml,   written for this test: keys that a release
+//	legacy-all-blocks    documented or read and that are gone since
+//
+// A file that is byte-identical to one of an earlier release is not
+// repeated. golden.json holds, for each file, what the main branch
+// before this version made of it: the resolved config and the claims of
+// a token it issued.
+//
+// A deployment gets the new binary before it gets a new config. Every
+// one of these files therefore has to load, resolve to the same
+// providers and settings, and yield a token with the same claims.
+
+var (
+	compatHasIssuer  = regexp.MustCompile(`(?m)^issuer:`)
+	compatHasSigning = regexp.MustCompile(`(?m)^signing:`)
+)
+
+// compatConfig returns the path of a loadable copy of a fixture. The
+// snippets taken from the documentation show one section each; they get
+// the two required settings they leave out, exactly as they did when
+// golden.json was made.
+func compatConfig(t *testing.T, fixture string) string {
+	t.Helper()
+	body, err := os.ReadFile(fixture)
+	if err != nil {
+		t.Fatalf("read fixture: %v", err)
+	}
+	text := string(body)
+	if !compatHasIssuer.MatchString(text) {
+		text = "issuer: \"https://auth.example.com\"\n" + text
+	}
+	if !compatHasSigning.MatchString(text) {
+		text += "\nsigning:\n  rs256:\n    privateKeyFile: \"/etc/authenticatoor/keys/private.pem\"\n"
+	}
+	return writeTempConfig(t, text)
+}
+
+// compatTrim drops what golden.json does not record: empty values
+// (but never a boolean — an explicit false is a setting).
+func compatTrim(v any) any {
+	switch value := v.(type) {
+	case map[string]any:
+		out := make(map[string]any, len(value))
+		for k, item := range value {
+			item = compatTrim(item)
+			switch typed := item.(type) {
+			case nil:
+				continue
+			case string:
+				if typed == "" {
+					continue
+				}
+			case float64:
+				if typed == 0 {
+					continue
+				}
+			case []any:
+				if len(typed) == 0 {
+					continue
+				}
+			case map[string]any:
+				if len(typed) == 0 {
+					continue
+				}
+			}
+			out[k] = item
+		}
+		return out
+	case []any:
+		out := make([]any, 0, len(value))
+		for _, item := range value {
+			out = append(out, compatTrim(item))
+		}
+		return out
+	default:
+		return v
+	}
+}
+
+// compatGeneric turns a value into the generic form golden.json has.
+func compatGeneric(t *testing.T, v any) map[string]any {
+	t.Helper()
+	raw, err := json.Marshal(v)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var out map[string]any
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	trimmed, _ := compatTrim(out).(map[string]any)
+	return trimmed
+}
+
+// compatMissing lists where got lacks, or differs from, what want
+// holds. got may hold more: settings that did not exist before.
+func compatMissing(path string, want, got any) []string {
+	switch w := want.(type) {
+	case map[string]any:
+		g, ok := got.(map[string]any)
+		if !ok {
+			return []string{path + ": want a map, got " + reflect.TypeOf(got).String()}
+		}
+		var out []string
+		for k, item := range w {
+			child, present := g[k]
+			if !present {
+				out = append(out, path+"."+k+": missing")
+				continue
+			}
+			out = append(out, compatMissing(path+"."+k, item, child)...)
+		}
+		return out
+	case []any:
+		g, ok := got.([]any)
+		if !ok || len(g) != len(w) {
+			return []string{path + ": lists differ"}
+		}
+		var out []string
+		for i := range w {
+			out = append(out, compatMissing(path+"[]", w[i], g[i])...)
+		}
+		return out
+	default:
+		if !reflect.DeepEqual(want, got) {
+			return []string{path + ": differs"}
+		}
+		return nil
+	}
+}
+
+// TestLoad_ConfigsOfReleasedVersions: every config under testdata/compat
+// loads and resolves as it did before (see the comment on the fixtures
+// above).
+func TestLoad_ConfigsOfReleasedVersions(t *testing.T) {
+	const dir = "testdata/compat"
+	raw, err := os.ReadFile(filepath.Join(dir, "golden.json"))
+	if err != nil {
+		t.Fatalf("read golden: %v", err)
+	}
+	var golden map[string]struct {
+		Config map[string]any `json:"config"`
+		Claims map[string]any `json:"claims"`
+	}
+	if err := json.Unmarshal(raw, &golden); err != nil {
+		t.Fatalf("golden: %v", err)
+	}
+	fixtures, err := filepath.Glob(filepath.Join(dir, "*.yaml"))
+	if err != nil || len(fixtures) < 20 {
+		t.Fatalf("fixtures: %d (%v)", len(fixtures), err)
+	}
+	if len(golden) != len(fixtures) {
+		t.Fatalf("%d fixtures, %d golden entries", len(fixtures), len(golden))
+	}
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("key: %v", err)
+	}
+
+	// Deprecation warnings each fixture is expected to produce; none
+	// for all the others.
+	deprecations := map[string][]string{
+		"deprecated-anyauth-loginpath.yaml": {"anyAuth.loginPath"},
+		"deprecated-github-sessionsecret.yaml": {
+			"githubOAuth.sessionSecret ", "githubOAuth.sessionSecretFile ",
+		},
+		"legacy-all-blocks.yaml": {"anyAuth.loginPath", "githubOAuth.sessionSecretFile"},
+	}
+
+	for _, fixture := range fixtures {
+		name := filepath.Base(fixture)
+		t.Run(name, func(t *testing.T) {
+			want, ok := golden[name]
+			if !ok {
+				t.Fatal("no golden entry")
+			}
+			cfg, err := Load(compatConfig(t, fixture))
+			if err != nil {
+				t.Fatalf("a config that earlier versions accepted does not load: %v", err)
+			}
+
+			// The same resolved config: providers, their names and
+			// types, paths and cookie names, every setting.
+			got := compatGeneric(t, cfg)
+			if diff := compatMissing("config", map[string]any(want.Config), got); len(diff) > 0 {
+				slices.Sort(diff)
+				t.Errorf("the resolved config changed:\n  %s", strings.Join(diff, "\n  "))
+			}
+
+			// Nothing but what is expected is complained about.
+			if len(cfg.DeprecationWarnings) != len(deprecations[name]) {
+				t.Errorf("deprecation warnings: %v", cfg.DeprecationWarnings)
+			}
+			for i, part := range deprecations[name] {
+				if i < len(cfg.DeprecationWarnings) && !strings.Contains(cfg.DeprecationWarnings[i], part) {
+					t.Errorf("deprecation warning %d: %q, want %q in it", i, cfg.DeprecationWarnings[i], part)
+				}
+			}
+			for _, w := range cfg.Warnings {
+				// Two notes are due on such configs: what happens to
+				// unverified emails at an oidc provider, and that a
+				// Cloudflare door without audTag is shared.
+				if !strings.Contains(w, "oidc.trustUnverifiedEmail is not set") {
+					t.Errorf("unexpected warning: %s", w)
+				}
+			}
+			if cfg.Grants != nil {
+				t.Error("a config without a grants section got one")
+			}
+
+			// The same token. An identity as the first provider hands
+			// it to the issuer: with its provider name, without teams.
+			iss, err := issuer.NewRS256Issuer(issuer.Config{
+				ActiveKey:       key,
+				ActiveKeyID:     cfg.Signing.RS256.KeyID,
+				Issuer:          cfg.Issuer,
+				DefaultAudience: cfg.Audience,
+				Scope:           cfg.ScopePattern,
+				TTL:             cfg.TokenTTL,
+			})
+			if err != nil {
+				t.Fatalf("issuer: %v", err)
+			}
+			_, claims, err := iss.IssueFor(issuer.Identity{
+				Subject:        "alice@example.org",
+				Email:          "alice@example.org",
+				SubjectIsEmail: true,
+				Provider:       cfg.Providers[0].Name,
+			}, nil)
+			if err != nil {
+				t.Fatalf("issue: %v", err)
+			}
+			minted := compatGeneric(t, claims)
+			minted["ttl"] = minted["exp"].(float64) - minted["iat"].(float64)
+			for _, volatile := range []string{"iat", "nbf", "exp", "jti"} {
+				delete(minted, volatile)
+			}
+			if !reflect.DeepEqual(minted, map[string]any(want.Claims)) {
+				t.Errorf("token claims changed:\n  got  %v\n  want %v", minted, want.Claims)
+			}
+		})
+	}
+}
+
+// writeConfigFile writes a config file with the given name (and thereby
+// format) and returns its path.
+func writeConfigFile(t *testing.T, name, body string) string {
+	t.Helper()
+	p := filepath.Join(t.TempDir(), name)
+	if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	return p
+}
+
+// wantLoadError loads a config and requires an error containing want.
+func wantLoadError(t *testing.T, path, want string) {
+	t.Helper()
+	cfg, err := Load(path)
+	if err == nil {
+		t.Fatalf("load: no error, want one containing %q (providers: %+v)", want, cfg.Providers)
+	}
+	if !strings.Contains(err.Error(), want) {
+		t.Fatalf("load: got %v, want an error containing %q", err, want)
+	}
+}
+
+// TestLoad_CloudflareMembersThatCanNeverMatch: for a cloudflare
+// provider the attributes depend on its configuration. A member naming
+// something no identity of that provider can have is a startup error —
+// a group that silently never applies is not what its author meant.
+func TestLoad_CloudflareMembersThatCanNeverMatch(t *testing.T) {
+	const (
+		verified   = "cloudflareAccess:\n  teamDomain: t.cloudflareaccess.com\n  audTag: aud\n"
+		noServices = verified + "  allowServiceTokens: false\n"
+		unverified = "cloudflareAccess:\n  verifyJWT: false\n"
+	)
+	group := func(member string) string {
+		return "grants:\n  - members: [\"" + member + "\"]\n    services: [all]\n"
+	}
+	tests := []struct {
+		name    string
+		block   string
+		member  string
+		wantErr string // "": loads
+	}{
+		{"verified: country", verified, "cfaccess/country:de", ""},
+		{"verified: common_name", verified, "cfaccess/common_name:abc.access", ""},
+		{"verified: principal service", verified, "cfaccess/principal:service", ""},
+		{"verified: principal user", verified, "cfaccess/principal:User", ""},
+		{"verified: a custom claim", verified, "cfaccess/custom.department:eng", ""},
+		{"verified: a nested custom claim", verified, "cfaccess/custom.org.unit:eng", ""},
+		{"verified: email", verified, "cfaccess/email:alice@example.org", ""},
+		{"verified: custom without a name", verified, "cfaccess/custom.:x", `"custom." names no claim`},
+		{"verified: custom with an empty segment", verified, "cfaccess/custom..a:x", `names no claim`},
+		{"verified: custom itself", verified, "cfaccess/custom:x", `has no attribute "custom"`},
+		{"verified: a principal that does not exist", verified, "cfaccess/principal:admin", `principal is "user" or "service", never "admin"`},
+		{"verified: an unknown claim", verified, "cfaccess/groups:staff", `has no attribute "groups"`},
+
+		{"no service tokens: principal service", noServices, "cfaccess/principal:service", `principal is never "service"`},
+		{"no service tokens: common_name", noServices, "cfaccess/common_name:abc.access", `only service tokens have a common_name`},
+		{"no service tokens: country", noServices, "cfaccess/country:de", ""},
+
+		{"unverified: email", unverified, "cfaccess/email:alice@example.org", ""},
+		{"unverified: principal user", unverified, "cfaccess/principal:user", ""},
+		{"unverified: country", unverified, "cfaccess/country:de", `with verifyJWT off a cloudflare provider has no attribute "country"`},
+		{"unverified: common_name", unverified, "cfaccess/common_name:x", `with verifyJWT off a cloudflare provider has no attribute "common_name"`},
+		{"unverified: principal service", unverified, "cfaccess/principal:service", `principal is never "service"`},
+		{"unverified: a custom claim", unverified, "cfaccess/custom.department:eng", `with verifyJWT off`},
+		{"unverified: sub", unverified, "cfaccess/sub:abc", `with verifyJWT off`},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			path := writeTempConfig(t, teamsConfigHeader+tc.block+group(tc.member))
+			if tc.wantErr != "" {
+				wantLoadError(t, path, tc.wantErr)
+				wantLoadError(t, path, "this member can never match at the provider \"cfaccess\"")
+				return
+			}
+			if _, err := Load(path); err != nil {
+				t.Fatalf("load: %v", err)
+			}
+		})
+	}
+
+	// The same in a providers entry: the check follows the entry's own
+	// settings, not the legacy block's.
+	wantLoadError(t, writeTempConfig(t, teamsConfigHeader+
+		"providers:\n  - name: edge\n    type: cloudflare\n    cloudflareAccess:\n      verifyJWT: false\n"+
+		"grants:\n  - members: [\"edge/country:de\"]\n    services: [all]\n"), "with verifyJWT off")
+}
+
+// TestLoad_UnverifiedEmailWarning: every oidc provider that does not
+// say what to do with an unverified email gets one startup warning that
+// explains the rule. Saying it — either way — silences the warning.
+func TestLoad_UnverifiedEmailWarning(t *testing.T) {
+	entry := func(name, extra string) string {
+		return "  - name: " + name + "\n    type: oidc\n    oidc:\n      issuerURL: https://idp.example.com\n" +
+			"      callbackURL: https://auth.demo.example.com/" + name + "/callback\n      clientId: id\n" +
+			"      clientSecret: s\n" + extra
+	}
+	cfg, err := Load(writeTempConfig(t, teamsConfigHeader+"providers:\n"+
+		entry("unset", "")+
+		entry("off", "      trustUnverifiedEmail: false\n")+
+		entry("on", "      trustUnverifiedEmail: true\n")+
+		entry("unset2", "")+
+		"  - name: dev\n    type: any\n"))
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if len(cfg.Warnings) != 2 {
+		t.Fatalf("warnings: %v", cfg.Warnings)
+	}
+	for i, name := range []string{"unset", "unset2"} {
+		w := cfg.Warnings[i]
+		for _, part := range []string{
+			`provider "` + name + `"`, "oidc.trustUnverifiedEmail is not set", "email_verified: true",
+			`the IdP's "sub"`, "alternates", "Upgrading",
+		} {
+			if !strings.Contains(w, part) {
+				t.Errorf("warning %d lacks %q: %s", i, part, w)
+			}
+		}
+	}
+	trust := map[string]bool{}
+	for _, p := range cfg.Providers {
+		trust[p.Name] = p.OIDC.TrustsUnverifiedEmail()
+	}
+	if trust["unset"] || trust["off"] || !trust["on"] {
+		t.Errorf("effective settings: %v", trust)
+	}
+
+	// The legacy block is warned about only when it is the provider.
+	legacy := "oidc:\n  issuerURL: https://idp.example.com\n  callbackURL: https://auth.demo.example.com/cb\n" +
+		"  clientId: id\n  clientSecret: s\n"
+	cfg, err = Load(writeTempConfig(t, teamsConfigHeader+"authMode: oidc\n"+legacy))
+	if err != nil || len(cfg.Warnings) != 1 || !strings.Contains(cfg.Warnings[0], `provider "oidc"`) {
+		t.Errorf("legacy oidc: %v %v", err, cfg.Warnings)
+	}
+	cfg, err = Load(writeTempConfig(t, teamsConfigHeader+"authMode: any\n"+legacy))
+	if err != nil || len(cfg.Warnings) != 0 {
+		t.Errorf("unused legacy oidc block: %v %v", err, cfg.Warnings)
+	}
+}
+
+// TestLoad_EnvForUnusedLegacyBlock: the environment reaches the legacy
+// top-level blocks only. With a providers list those blocks are not
+// read, and a variable that sets one of their keys changes nothing —
+// which is said in a warning rather than passed over.
+func TestLoad_EnvForUnusedLegacyBlock(t *testing.T) {
+	t.Setenv("AUTHENTICATOOR_OIDC_TRUSTUNVERIFIEDEMAIL", "true")
+	t.Setenv("AUTHENTICATOOR_CLOUDFLAREACCESS_AUDTAG", "secret-looking-value")
+	t.Setenv("AUTHENTICATOOR_LISTEN", ":9999")
+
+	cfg, err := Load(writeTempConfig(t, teamsConfigHeader+"providers:\n  - name: dev\n    type: any\n"))
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if len(cfg.Warnings) != 2 ||
+		!strings.Contains(cfg.Warnings[0], "AUTHENTICATOOR_CLOUDFLAREACCESS_AUDTAG") ||
+		!strings.Contains(cfg.Warnings[1], "AUTHENTICATOOR_OIDC_TRUSTUNVERIFIEDEMAIL") {
+		t.Fatalf("warnings: %v", cfg.Warnings)
+	}
+	for _, w := range cfg.Warnings {
+		if strings.Contains(w, "secret-looking-value") {
+			t.Errorf("a warning shows the value of a variable: %s", w)
+		}
+	}
+
+	// In the legacy form the same variables are simply honoured.
+	cfg, err = Load(writeTempConfig(t, teamsConfigHeader+
+		"authMode: [cloudflare, oidc]\ncloudflareAccess:\n  teamDomain: t.cloudflareaccess.com\n"+
+		"oidc:\n  issuerURL: https://idp.example.com\n  callbackURL: https://auth.demo.example.com/cb\n"+
+		"  clientId: id\n  clientSecret: s\n"))
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if len(cfg.Warnings) != 0 {
+		t.Errorf("warnings: %v", cfg.Warnings)
+	}
+	if got := cfg.Providers[0].CloudflareAccess.AudTag; got != "secret-looking-value" {
+		t.Errorf("audTag from the environment: %q", got)
+	}
+	if !cfg.Providers[1].OIDC.TrustsUnverifiedEmail() {
+		t.Error("trustUnverifiedEmail from the environment was ignored")
 	}
 }

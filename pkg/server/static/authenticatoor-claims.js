@@ -21,7 +21,7 @@
 //
 // The evaluator is a port of pkg/auth/services.go (ServiceAllowed,
 // FeatureAllowed, parseDirective, queryName) and must answer exactly
-// like it; pkg/server/client_claims_test.go runs this text against the Go
+// like it; pkg/server/handler_client_test.go runs this text against the Go
 // functions. Directive grammar of the "services" claim:
 //
 //   directive = [+|-]service(:grantSpec)*

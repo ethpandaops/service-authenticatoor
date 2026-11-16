@@ -5,9 +5,6 @@ import (
 	"crypto/sha1"
 	"encoding/base64"
 	"encoding/json"
-	"errors"
-	"io"
-	"maps"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -16,350 +13,596 @@ import (
 	"slices"
 	"strings"
 	"testing"
-	"time"
 
-	"github.com/prometheus/client_golang/prometheus"
 	"github.com/sirupsen/logrus"
-	logtest "github.com/sirupsen/logrus/hooks/test"
 
 	"github.com/ethpandaops/service-authenticatoor/pkg/auth"
 	"github.com/ethpandaops/service-authenticatoor/pkg/cfaccess"
-	"github.com/ethpandaops/service-authenticatoor/pkg/config"
 	"github.com/ethpandaops/service-authenticatoor/pkg/issuer"
 	"github.com/ethpandaops/service-authenticatoor/pkg/protection"
-	"github.com/ethpandaops/service-authenticatoor/pkg/protection/anyauth"
 	"github.com/ethpandaops/service-authenticatoor/pkg/protection/basic"
 	"github.com/ethpandaops/service-authenticatoor/pkg/protection/cloudflare"
 	"github.com/ethpandaops/service-authenticatoor/pkg/protection/oidc"
 	"github.com/ethpandaops/service-authenticatoor/pkg/protection/oidc/oidctest"
 )
 
-// teamsHarness is a Server built from real providers, the real issuer
-// and a real pkg/auth verifier fed from the server's own /jwks.json — the
-// same pieces a deployment and a resource server use.
-type teamsHarness struct {
-	t        *testing.T
-	handler  http.Handler
-	verifier *auth.JWKSVerifier
-	jwksURL  string
-	issuer   string
-	// logs records what the server logged.
-	logs *logtest.Hook
+// cliAudience is the IdP client of the non-browser client.
+const cliAudience = "devnet-cli"
+
+func bearerOn() *oidc.BearerConfig { return &oidc.BearerConfig{Audiences: []string{cliAudience}} }
+
+// bearerGet requests path with the token as bearer credential.
+func bearerGet(path, token string) *http.Request {
+	req := httptest.NewRequest(http.MethodGet, path, nil)
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	return req
 }
 
-// identityIssuerOnly is the issuer of every harness: the real one, with
-// a plain Issue that fails the test. Issue mints for an identity no
-// grants group names; nothing that serves a user may reach it.
-type identityIssuerOnly struct {
-	issuer.IdentityIssuer
-	t *testing.T
+// identityClaims are the claims of a minted token that say who its
+// user is and what they may do.
+type identityClaims struct {
+	Subject  string
+	Email    string
+	Teams    []string
+	Services string
+	Scope    string
+	Audience []string
 }
 
-func (i identityIssuerOnly) Issue(subject, _ string, _ []string) (string, *auth.Claims, error) {
-	i.t.Errorf("the server called the plain Issue for %q; it must mint through IssueFor only", subject)
-	return "", nil, errors.New("plain Issue is not for the server")
+func identityOf(c *auth.Claims) identityClaims {
+	return identityClaims{
+		Subject: c.Subject, Email: c.Email, Teams: c.Teams,
+		Services: c.Services, Scope: c.Scope, Audience: c.Audience,
+	}
 }
 
-// newTeamsHarness starts the given providers and wires them into a
-// Server. Each provider gets its own session key, as in main.go.
-func newTeamsHarness(t *testing.T, providers ...NamedProvider) *teamsHarness {
-	t.Helper()
-	return newGrantsHarness(t, nil, "", providers...)
-}
+// TestBearer_SameTokenAsBrowserLogin: a client presenting the IdP's
+// token to /<name>/token gets a token with the identity, teams and
+// services of the same user's browser login through that provider —
+// for a team grant, a user grant, an attribute grant, and for an email
+// the IdP does not vouch for.
+func TestBearer_SameTokenAsBrowserLogin(t *testing.T) {
+	section := issuer.GrantsConfig{Groups: []issuer.GrantGroup{
+		{Members: []string{"corp/team:panda"}, Services: []string{"dora:reindex"}},
+		{Members: []string{"corp/user:alice@example.org"}, Services: []string{"spamoor"}},
+		{Members: []string{"corp/groups:panda-access"}, Services: []string{"assertoor"}},
+		{Members: []string{"other/team:panda", "other/user:alice@example.org"}, Services: []string{"all:all"}},
+	}}
+	grants := sectionGrants(t, section, "corp", "other")
+	groups := []string{"team:panda", "panda-access"}
 
-// newGrantsHarness is newTeamsHarness with a table of team grants
-// (nil: section absent) and an instance-wide services directive.
-func newGrantsHarness(
-	t *testing.T, teamServices map[string][]string, instanceWide string, providers ...NamedProvider,
-) *teamsHarness {
-	t.Helper()
+	tests := []struct {
+		name         string
+		user         oidctest.User
+		wantSub      string
+		wantTeams    []string
+		wantServices string
+	}{
+		{
+			"verified email", oidctest.User{Subject: "u1", Email: "alice@example.org", Groups: groups},
+			"alice@example.org", []string{"everyone", "panda"}, "-all,+assertoor,+dora,+dora:reindex,+spamoor",
+		},
+		{
+			// The IdP's sub is the subject; the user: grant for the
+			// address does not match.
+			"unverified email",
+			oidctest.User{Subject: "u1", Email: "alice@example.org", Groups: groups, Claims: map[string]any{"email_verified": false}},
+			"u1", []string{"everyone", "panda"}, "-all,+assertoor,+dora,+dora:reindex",
+		},
+		{
+			"no groups", oidctest.User{Subject: "u1", Email: "alice@example.org"},
+			"alice@example.org", []string{"everyone"}, "-all,+spamoor",
+		},
+		{
+			"in no group: no token through either", oidctest.User{Subject: "u2", Email: "bob@example.org"},
+			"bob@example.org", []string{"everyone"}, noToken,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			idp := oidctest.New(t, tc.user)
+			h := newSectionHarness(t, &section, "", newOIDCProvider(idp, "corp", oidc.Config{
+				Teams: []string{"everyone"}, TeamRules: teamRules(prefixRule),
+				GrantMembers: grants.AttributeMembers("corp"), Bearer: bearerOn(),
+			}), newBasicProvider(t, "other"))
 
-	// These tables map a team to its grants. Each becomes a group whose
-	// members are that team at every provider of the harness: the tests
-	// using them are about the claim, not about which door a team came
-	// through.
-	var section *issuer.GrantsConfig
-	if teamServices != nil {
-		section = &issuer.GrantsConfig{}
-		for _, team := range slices.Sorted(maps.Keys(teamServices)) {
-			members := make([]string, 0, len(providers))
-			for _, np := range providers {
-				members = append(members, np.Name+"/team:"+team)
+			if tc.wantServices == noToken {
+				viaBrowser := h.mint(tokenRequest(), h.oidcLogin(idp, "corp"))
+				if viaBrowser.Services != noToken || viaBrowser.Subject != tc.wantSub ||
+					!slices.Equal(viaBrowser.Teams, tc.wantTeams) {
+					t.Errorf("browser: %+v", viaBrowser)
+				}
+				rr := h.do(bearerGet("/corp/token", idp.Token(t, cliAudience)))
+				assertNotGranted(t, rr)
+				if got := rr.Header().Get("WWW-Authenticate"); got != "" {
+					t.Errorf("a refusal for want of a grant carries a challenge: %q", got)
+				}
+				if cookies := rr.Result().Cookies(); len(cookies) != 0 {
+					t.Errorf("the bearer path set cookies: %v", cookies)
+				}
+				return
 			}
-			section.Groups = append(section.Groups, issuer.GrantGroup{Members: members, Services: teamServices[team]})
-		}
-	}
-	return newSectionHarness(t, section, instanceWide, providers...)
-}
+			browser := identityOf(h.token(tokenRequest(), h.oidcLogin(idp, "corp")))
 
-// sectionGrants validates a grants section for providers of these names
-// (each accepting any attribute).
-func sectionGrants(t *testing.T, section issuer.GrantsConfig, providers ...string) *issuer.ServiceGrants {
-	t.Helper()
-	described := make([]issuer.Provider, 0, len(providers))
-	for _, name := range providers {
-		described = append(described, issuer.Provider{Name: name})
-	}
-	g, err := issuer.NewServiceGrants(section, described)
-	if err != nil {
-		t.Fatalf("grants: %v", err)
-	}
-	return g
-}
+			rr := h.do(bearerGet("/corp/token", idp.Token(t, cliAudience)))
+			if rr.Code != http.StatusOK {
+				t.Fatalf("/corp/token: status %d, body %s", rr.Code, rr.Body.String())
+			}
+			if cookies := rr.Result().Cookies(); len(cookies) != 0 {
+				t.Errorf("the bearer path set cookies: %v", cookies)
+			}
+			if got := rr.Header().Get("Cache-Control"); got != "no-store" {
+				t.Errorf("Cache-Control %q", got)
+			}
+			var resp map[string]any
+			if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+				t.Fatalf("decode: %v", err)
+			}
+			keys := make([]string, 0, len(resp))
+			for k := range resp {
+				keys = append(keys, k)
+			}
+			slices.Sort(keys)
+			if !slices.Equal(keys, []string{"expr", "now", "token", "user"}) {
+				t.Errorf("response fields %v", keys)
+			}
+			if resp["user"] != tc.wantSub {
+				t.Errorf("user %v, want %q", resp["user"], tc.wantSub)
+			}
+			token, _ := resp["token"].(string)
+			bearer := identityOf(h.verify(token))
 
-// newSectionHarness is newTeamsHarness with a grants section (nil:
-// absent) and an instance-wide services directive.
-func newSectionHarness(
-	t *testing.T, section *issuer.GrantsConfig, instanceWide string, providers ...NamedProvider,
-) *teamsHarness {
-	t.Helper()
-
-	var grants *issuer.ServiceGrants
-	if section != nil {
-		names := make([]string, 0, len(providers))
-		for _, np := range providers {
-			names = append(names, np.Name)
-		}
-		grants = sectionGrants(t, *section, names...)
-	}
-
-	cfg := &config.Config{
-		Listen:             ":0",
-		Issuer:             "https://auth.test.example",
-		ExternalURL:        "https://auth.test.example",
-		Audience:           []string{"test.example"},
-		ScopePattern:       "*.test.example",
-		TokenTTL:           30 * time.Minute,
-		AllowedReturnHosts: []string{"*.test.example"},
-		CORS:               config.CORSConfig{AllowedOrigins: []string{"*.test.example"}},
-		Signing:            config.SigningConfig{Mode: "rs256"},
-	}
-	key, err := issuer.GenerateRSAKey()
-	if err != nil {
-		t.Fatalf("genkey: %v", err)
-	}
-	iss, err := issuer.NewRS256Issuer(issuer.Config{
-		ActiveKey:       key,
-		Issuer:          cfg.Issuer,
-		DefaultAudience: cfg.Audience,
-		Scope:           cfg.ScopePattern,
-		Services:        instanceWide,
-		Grants:          grants,
-		TTL:             cfg.TokenTTL,
-	})
-	if err != nil {
-		t.Fatalf("newissuer: %v", err)
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	t.Cleanup(cancel)
-	for _, np := range providers {
-		if err := np.Provider.Start(ctx); err != nil {
-			t.Fatalf("start provider %s: %v", np.Name, err)
-		}
-	}
-
-	log := logrus.New()
-	log.SetOutput(io.Discard)
-	logs := logtest.NewLocal(log)
-	s, err := New(Options{
-		Config:    cfg,
-		Issuer:    identityIssuerOnly{IdentityIssuer: iss, t: t},
-		Providers: providers,
-		Log:       log,
-		Registry:  prometheus.NewRegistry(),
-	})
-	if err != nil {
-		t.Fatalf("new server: %v", err)
-	}
-	handler := s.routes()
-
-	jwks := httptest.NewServer(handler)
-	t.Cleanup(jwks.Close)
-	verifier, err := auth.NewJWKSVerifier(ctx, auth.VerifierConfig{
-		JWKSURL:          jwks.URL + "/jwks.json",
-		ExpectedIssuer:   cfg.Issuer,
-		ExpectedAudience: "test.example",
-	})
-	if err != nil {
-		t.Fatalf("new verifier: %v", err)
-	}
-	return &teamsHarness{
-		t: t, handler: handler, verifier: verifier,
-		jwksURL: jwks.URL + "/jwks.json", issuer: cfg.Issuer, logs: logs,
+			if bearer.Subject != browser.Subject || bearer.Email != browser.Email ||
+				!slices.Equal(bearer.Teams, browser.Teams) || bearer.Services != browser.Services ||
+				bearer.Scope != browser.Scope || !slices.Equal(bearer.Audience, browser.Audience) {
+				t.Errorf("tokens differ:\nbrowser %+v\n bearer %+v", browser, bearer)
+			}
+			if bearer.Subject != tc.wantSub || !slices.Equal(bearer.Teams, tc.wantTeams) || bearer.Services != tc.wantServices {
+				t.Errorf("bearer token: %+v, want sub %q teams %v services %q", bearer, tc.wantSub, tc.wantTeams, tc.wantServices)
+			}
+		})
 	}
 }
 
-// rawToken calls /auth/token and returns the token string.
-func (h *teamsHarness) rawToken(req *http.Request, cookies ...*http.Cookie) string {
-	h.t.Helper()
-	rr := h.do(req, cookies...)
+// TestBearer_Responses: what the token alias answers when it issues no
+// token — a status and a Bearer challenge, never a redirect to a login
+// and never a cookie.
+func TestBearer_Responses(t *testing.T) {
+	idp := oidctest.New(t, oidctest.User{Subject: "u1", Email: "alice@example.org", Groups: []string{"sigp"}})
+	h := newTeamsHarness(t,
+		newOIDCProvider(idp, "oidc", oidc.Config{AllowedGroups: []string{"ethpandaops"}, Bearer: bearerOn()}),
+		newBasicProvider(t, "htpasswd"),
+	)
+
+	tests := []struct {
+		name      string
+		token     string
+		status    int
+		challenge string
+	}{
+		{"no header", "", http.StatusUnauthorized, "Bearer"},
+		{"garbage", "garbage", http.StatusUnauthorized, `Bearer error="invalid_token"`},
+		{"wrong audience", idp.Token(t, "authenticatoor"), http.StatusUnauthorized, `Bearer error="invalid_token"`},
+		{"not in allowedGroups", idp.Token(t, cliAudience), http.StatusForbidden, ""},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			rr := h.do(bearerGet("/oidc/token", tc.token))
+			if rr.Code != tc.status {
+				t.Errorf("status %d, want %d (body %s)", rr.Code, tc.status, rr.Body.String())
+			}
+			if got := rr.Header().Get("WWW-Authenticate"); got != tc.challenge {
+				t.Errorf("WWW-Authenticate %q, want %q", got, tc.challenge)
+			}
+			if loc := rr.Header().Get("Location"); loc != "" {
+				t.Errorf("redirected to %q", loc)
+			}
+			if cookies := rr.Result().Cookies(); len(cookies) != 0 {
+				t.Errorf("cookies: %v", cookies)
+			}
+		})
+	}
+
+	// In an allowed group the same request is answered.
+	idp.SetUser(oidctest.User{Subject: "u1", Email: "alice@example.org", Groups: []string{"ethpandaops"}})
+	if rr := h.do(bearerGet("/oidc/token", idp.Token(t, cliAudience))); rr.Code != http.StatusOK {
+		t.Errorf("allowed user: status %d", rr.Code)
+	}
+	// Only GET, as for every token alias — and no CORS: the alias is
+	// not for scripts in a browser, so a preflight is a 405 like any
+	// other method, and no answer carries an Access-Control header.
+	for _, method := range []string{http.MethodPost, http.MethodPut, http.MethodDelete, http.MethodHead, http.MethodOptions} {
+		req := bearerGet("/oidc/token", idp.Token(t, cliAudience))
+		req.Method = method
+		req.Header.Set("Origin", "https://app.test.example")
+		req.Header.Set("Access-Control-Request-Method", http.MethodGet)
+		rr := h.do(req)
+		if rr.Code != http.StatusMethodNotAllowed {
+			t.Errorf("%s: status %d", method, rr.Code)
+		}
+		if strings.Contains(rr.Body.String(), "eyJ") {
+			t.Errorf("%s: the answer carries a token", method)
+		}
+	}
+	req := bearerGet("/oidc/token", idp.Token(t, cliAudience))
+	req.Header.Set("Origin", "https://app.test.example")
+	rr := h.do(req)
 	if rr.Code != http.StatusOK {
-		h.t.Fatalf("/auth/token: status %d, body %s", rr.Code, rr.Body.String())
+		t.Errorf("GET with an Origin: status %d", rr.Code)
 	}
-	var resp tokenResponse
-	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
-		h.t.Fatalf("decode token response: %v", err)
-	}
-	return resp.Token
-}
-
-// serviceVerifier builds the verifier of a resource server that gates on
-// its own service name, as spamoor, assertoor and dora do.
-func (h *teamsHarness) serviceVerifier(service string) *auth.JWKSVerifier {
-	h.t.Helper()
-	ctx, cancel := context.WithCancel(context.Background())
-	h.t.Cleanup(cancel)
-	v, err := auth.NewJWKSVerifier(ctx, auth.VerifierConfig{
-		JWKSURL:          h.jwksURL,
-		ExpectedIssuer:   h.issuer,
-		ExpectedAudience: "test.example",
-		ExpectedService:  service,
-	})
-	if err != nil {
-		h.t.Fatalf("new verifier for %s: %v", service, err)
-	}
-	return v
-}
-
-// do serves one request, carrying the given cookies.
-func (h *teamsHarness) do(req *http.Request, cookies ...*http.Cookie) *httptest.ResponseRecorder {
-	h.t.Helper()
-	for _, c := range cookies {
-		req.AddCookie(c)
-	}
-	rr := httptest.NewRecorder()
-	h.handler.ServeHTTP(rr, req)
-	return rr
-}
-
-// verify checks a token the way a resource server does and returns its
-// claims.
-func (h *teamsHarness) verify(token string) *auth.Claims {
-	h.t.Helper()
-	claims, err := h.verifier.Verify(token)
-	if err != nil {
-		h.t.Fatalf("verify: %v", err)
-	}
-	return claims
-}
-
-// token calls /auth/token and returns the verified claims of the token
-// it issued.
-func (h *teamsHarness) token(req *http.Request, cookies ...*http.Cookie) *auth.Claims {
-	h.t.Helper()
-	rr := h.do(req, cookies...)
-	if rr.Code != http.StatusOK {
-		h.t.Fatalf("/auth/token: status %d, location %q, body %s", rr.Code, rr.Header().Get("Location"), rr.Body.String())
-	}
-	var resp tokenResponse
-	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
-		h.t.Fatalf("decode token response: %v", err)
-	}
-	return h.verify(resp.Token)
-}
-
-func tokenRequest() *http.Request {
-	return httptest.NewRequest(http.MethodGet, "/auth/token", nil)
-}
-
-// liveCookies returns the cookies a response sets (ignoring deletions).
-func liveCookies(rr *httptest.ResponseRecorder) []*http.Cookie {
-	var out []*http.Cookie
-	for _, c := range rr.Result().Cookies() {
-		if c.MaxAge >= 0 && c.Value != "" {
-			out = append(out, c)
+	for name := range rr.Header() {
+		if strings.HasPrefix(name, "Access-Control-") {
+			t.Errorf("the alias sent %s: %s", name, rr.Header().Get(name))
 		}
 	}
-	return out
 }
 
-func quietLog() logrus.FieldLogger {
-	log := logrus.New()
-	log.SetOutput(io.Discard)
-	return log
-}
+// TestBearer_Off: without the bearer block the provider has no token
+// alias — the path is answered like any path nobody serves — and a
+// bearer token on /auth/token is ignored.
+func TestBearer_Off(t *testing.T) {
+	idp := oidctest.New(t, oidctest.User{Subject: "u1", Email: "alice@example.org"})
+	h := newTeamsHarness(t, newOIDCProvider(idp, "oidc", oidc.Config{}))
 
-// testSessionKey derives a distinct per-provider key, as main.go does.
-func testSessionKey(name string) []byte {
-	return []byte((name + "-0123456789abcdef0123456789abcdef")[:32])
-}
-
-func newBasicProvider(t *testing.T, name string, teams ...string) NamedProvider {
-	t.Helper()
-	sum := sha1.Sum([]byte("hunter2"))
-	file := filepath.Join(t.TempDir(), "htpasswd")
-	body := "alice:{SHA}" + base64.StdEncoding.EncodeToString(sum[:]) + "\n"
-	if err := os.WriteFile(file, []byte(body), 0o600); err != nil {
-		t.Fatalf("write htpasswd: %v", err)
+	for _, method := range []string{http.MethodGet, http.MethodPost} {
+		req := bearerGet("/oidc/token", idp.Token(t, cliAudience))
+		req.Method = method
+		got := h.do(req)
+		nowhere := h.do(httptest.NewRequest(method, "/oidc/nowhere", nil))
+		if got.Code != http.StatusNotFound || got.Code != nowhere.Code || got.Body.String() != nowhere.Body.String() {
+			t.Errorf("%s /oidc/token: %d %q, an unserved path: %d %q",
+				method, got.Code, got.Body.String(), nowhere.Code, nowhere.Body.String())
+		}
 	}
-	return NamedProvider{Name: name, Provider: basic.New(quietLog(), basic.Config{
-		HtpasswdFile:      file,
-		LoginPath:         "/" + name + "/login",
-		SessionKey:        testSessionKey(name),
-		SessionCookieName: "authenticatoor_" + name + "_session",
-		Teams:             teams,
-	})}
+
+	rr := h.do(bearerGet("/auth/token", idp.Token(t, "authenticatoor")))
+	if rr.Code != http.StatusFound || rr.Header().Get("Location") != "/oidc/login?return_to=%2Fauth%2Ftoken" {
+		t.Errorf("/auth/token with a bearer token: %d → %q", rr.Code, rr.Header().Get("Location"))
+	}
 }
 
-func newCloudflareProvider(name string, teams ...string) NamedProvider {
-	return NamedProvider{Name: name, Provider: cloudflare.New(quietLog(), cloudflare.Config{
-		VerifyJWT:         false, // trust the header, as behind a trusted ingress
-		LoginPath:         "/" + name + "/login",
-		SessionKey:        testSessionKey(name),
-		SessionCookieName: "authenticatoor_" + name + "_session",
-		Teams:             teams,
-	})}
+// TestBearer_AuthToken: the bearer block changes nothing on /auth/*.
+// A request there that carries Authorization: Bearer is answered as if
+// the header were not there — by the session cookie, or with the
+// redirect to the login — whether the token is one the alias accepts
+// or not, and wherever the provider stands among several.
+func TestBearer_AuthToken(t *testing.T) {
+	idp := oidctest.New(t, oidctest.User{Subject: "u1", Email: "alice@example.org", Groups: []string{"team:panda"}})
+	oidcDoor := func(bearer *oidc.BearerConfig) NamedProvider {
+		return newOIDCProvider(idp, "oidc", oidc.Config{TeamRules: teamRules(prefixRule), Bearer: bearer})
+	}
+	grants := map[string][]string{"panda": {"dora"}}
+
+	orders := map[string]func(*testing.T, *oidc.BearerConfig) []NamedProvider{
+		"alone": func(_ *testing.T, b *oidc.BearerConfig) []NamedProvider { return []NamedProvider{oidcDoor(b)} },
+		"first of two": func(t *testing.T, b *oidc.BearerConfig) []NamedProvider {
+			return []NamedProvider{oidcDoor(b), newBasicProvider(t, "htpasswd")}
+		},
+		"second of two": func(t *testing.T, b *oidc.BearerConfig) []NamedProvider {
+			return []NamedProvider{newBasicProvider(t, "htpasswd"), oidcDoor(b)}
+		},
+	}
+	tokens := map[string]string{
+		"a token the alias accepts": idp.Token(t, cliAudience),
+		"a token it refuses":        idp.Token(t, "authenticatoor"),
+		"garbage":                   "garbage",
+	}
+	paths := []string{"/auth/token", "/auth/userinfo", "/auth/login?return_to=https%3A%2F%2Fapp.test.example%2F"}
+
+	for order, providers := range orders {
+		t.Run(order, func(t *testing.T) {
+			on := newGrantsHarness(t, grants, "", providers(t, bearerOn())...)
+			off := newGrantsHarness(t, grants, "", providers(t, nil)...)
+			session := on.oidcLogin(idp, "oidc")
+
+			for name, token := range tokens {
+				for _, path := range paths {
+					// Without a session: exactly what an instance without
+					// the bearer block answers, and what the same request
+					// gets without the header.
+					got, before := on.do(bearerGet(path, token)), off.do(bearerGet(path, token))
+					plain := on.do(httptest.NewRequest(http.MethodGet, path, nil))
+					for what, want := range map[string]*httptest.ResponseRecorder{"bearer off": before, "no header": plain} {
+						if got.Code != want.Code || got.Header().Get("Location") != want.Header().Get("Location") ||
+							got.Body.String() != want.Body.String() {
+							t.Errorf("%s, %s: %d → %q, but with %s: %d → %q", name, path,
+								got.Code, got.Header().Get("Location"), what, want.Code, want.Header().Get("Location"))
+						}
+					}
+					if got.Code != http.StatusFound || got.Header().Get("WWW-Authenticate") != "" {
+						t.Errorf("%s, %s: status %d, challenge %q; want the redirect to the login",
+							name, path, got.Code, got.Header().Get("WWW-Authenticate"))
+					}
+				}
+
+				// With a session the cookie decides, also next to a bad
+				// token.
+				rr := on.do(bearerGet("/auth/token", token), session)
+				if rr.Code != http.StatusOK {
+					t.Fatalf("%s next to a session: status %d", name, rr.Code)
+				}
+				var resp tokenResponse
+				if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+					t.Fatalf("decode: %v", err)
+				}
+				if c := on.verify(resp.Token); c.Subject != "alice@example.org" || c.Services != "-all,+dora" {
+					t.Errorf("%s next to a session: sub %q services %q", name, c.Subject, c.Services)
+				}
+			}
+
+			// The alias is where the token counts.
+			if rr := on.do(bearerGet("/oidc/token", tokens["a token the alias accepts"])); rr.Code != http.StatusOK {
+				t.Errorf("/oidc/token: status %d", rr.Code)
+			}
+		})
+	}
 }
 
-// prefixRule is the rule the central IdP setup uses: every `team:<slug>`
-// group is the team <slug>.
-var prefixRule = protection.TeamRule{Claim: "groups", Prefix: "team:"}
-
-// mapRule maps values of the groups claim to teams.
-func mapRule(m map[string][]string) protection.TeamRule {
-	return protection.TeamRule{Claim: "groups", Map: m}
+// TestBearer_CloudflareAliasUnchanged: the token alias of a provider
+// that has no challenge to offer answers as it always did.
+func TestBearer_CloudflareAliasUnchanged(t *testing.T) {
+	h := newTeamsHarness(t, newCloudflareProvider("cfaccess"))
+	rr := h.do(httptest.NewRequest(http.MethodGet, "/cfaccess/token", nil))
+	if rr.Code != http.StatusUnauthorized || rr.Body.String() != "unauthorized\n" || rr.Header().Get("WWW-Authenticate") != "" {
+		t.Errorf("status %d body %q challenge %q", rr.Code, rr.Body.String(), rr.Header().Get("WWW-Authenticate"))
+	}
 }
 
-func teamRules(rules ...protection.TeamRule) []protection.TeamRule { return rules }
+var _ protection.AmbientSwitch = (*oidc.Provider)(nil)
 
-func newOIDCProvider(idp *oidctest.IdP, name string, cfg oidc.Config) NamedProvider {
-	cfg.IssuerURL = idp.URL
-	cfg.PublicURL = "https://auth.test.example"
-	cfg.CallbackURL = "https://auth.test.example/" + name + "/callback"
-	cfg.ClientID = "authenticatoor"
-	cfg.ClientSecret = "client-secret"
-	cfg.SessionKey = testSessionKey(name)
-	cfg.LoginPath = "/" + name + "/login"
-	cfg.CallbackPath = "/" + name + "/callback"
-	cfg.SessionCookieName = "authenticatoor_" + name + "_session"
-	cfg.StateCookieName = "authenticatoor_" + name + "_state"
-	return NamedProvider{Name: name, Provider: oidc.New(quietLog(), cfg)}
+// TestGrants_SubjectThatLooksLikeAnEmail_EndToEnd: some IdPs can be set
+// up to use an email address as the id_token's "sub" — an address
+// nobody verified. A "user:" member that names an address is about who
+// owns it, so such a subject must not get that member's grants: not
+// when the token has no email claim at all, and not when it has one
+// that is not verified. The owner of the address, verified, does.
+//
+// Every case goes login → session cookie → /auth/token, so what the
+// session remembers about the subject is covered too.
+func TestGrants_SubjectThatLooksLikeAnEmail_EndToEnd(t *testing.T) {
+	section := issuer.GrantsConfig{Groups: []issuer.GrantGroup{
+		{Members: []string{"oidc/user:alice@example.org"}, Services: []string{"spamoor:plugins"}},
+		{Members: []string{"oidc/user:sub-123"}, Services: []string{"assertoor"}},
+		// Naming the claim is the way to grant by a raw IdP subject
+		// that is an address: the operator then says "the sub claim",
+		// not "the user who owns this address".
+		{Members: []string{"oidc/sub:carol@example.org"}, Services: []string{"dora"}},
+	}}
+	grants := sectionGrants(t, section, "oidc")
+
+	const owner = "-all,+spamoor,+spamoor:plugins"
+	tests := []struct {
+		name         string
+		user         oidctest.User
+		trust        bool
+		wantSub      string
+		wantEmail    string
+		wantServices string
+	}{
+		{
+			"sub is the address, no email claim",
+			oidctest.User{Subject: "alice@example.org"},
+			false, "alice@example.org", "", noToken,
+		},
+		{
+			"sub is the address, email_verified: false",
+			oidctest.User{Subject: "alice@example.org", Email: "alice@example.org", Claims: map[string]any{"email_verified": false}},
+			false, "alice@example.org", "", noToken,
+		},
+		{
+			"sub is the address, email_verified absent",
+			oidctest.User{Subject: "alice@example.org", Email: "alice@example.org", Claims: map[string]any{"email_verified": nil}},
+			false, "alice@example.org", "", noToken,
+		},
+		{
+			"sub is the address in another case",
+			oidctest.User{Subject: "Alice@Example.ORG"},
+			false, "Alice@Example.ORG", "", noToken,
+		},
+		{
+			"sub is the address, another verified email",
+			oidctest.User{Subject: "alice@example.org", Email: "mallory@example.org"},
+			false, "mallory@example.org", "mallory@example.org", noToken,
+		},
+		{
+			"the verified owner of the address",
+			oidctest.User{Subject: "sub-999", Email: "alice@example.org"},
+			false, "alice@example.org", "alice@example.org", owner,
+		},
+		{
+			"sub and verified email are the same address",
+			oidctest.User{Subject: "alice@example.org", Email: "alice@example.org"},
+			false, "alice@example.org", "alice@example.org", owner,
+		},
+		{
+			"an unverified email the operator chose to trust",
+			oidctest.User{Subject: "sub-999", Email: "alice@example.org", Claims: map[string]any{"email_verified": false}},
+			true, "alice@example.org", "alice@example.org", owner,
+		},
+		{
+			"a raw subject without an @ still matches user:",
+			oidctest.User{Subject: "sub-123"},
+			false, "sub-123", "", "-all,+assertoor",
+		},
+		{
+			"a raw subject that is an address matches the sub claim when a member names it",
+			oidctest.User{Subject: "carol@example.org"},
+			false, "carol@example.org", "", "-all,+dora",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			idp := oidctest.New(t, tc.user)
+			h := newSectionHarness(t, &section, "", newOIDCProvider(idp, "oidc", oidc.Config{
+				GrantMembers: grants.AttributeMembers("oidc"), TrustUnverifiedEmail: tc.trust,
+			}))
+			claims := h.mint(tokenRequest(), h.oidcLogin(idp, "oidc"))
+			if claims.Subject != tc.wantSub || claims.Email != tc.wantEmail {
+				t.Errorf("identity: sub=%q email=%q, want %q / %q", claims.Subject, claims.Email, tc.wantSub, tc.wantEmail)
+			}
+			if claims.Services != tc.wantServices {
+				t.Errorf("services: %q, want %q", claims.Services, tc.wantServices)
+			}
+		})
+	}
 }
 
-// oidcLogin walks the browser through /<name>/login → IdP → callback and
-// returns the session cookie.
-func (h *teamsHarness) oidcLogin(idp *oidctest.IdP, name string) *http.Cookie {
-	h.t.Helper()
-	rr := h.do(httptest.NewRequest(http.MethodGet, "/"+name+"/login?return_to=%2Fauth%2Ftoken", nil))
-	if rr.Code != http.StatusFound {
-		h.t.Fatalf("oidc login entry: status %d", rr.Code)
-	}
-	state := liveCookies(rr)
-	if len(state) != 1 {
-		h.t.Fatalf("oidc login entry cookies: %v", state)
-	}
-	back := idp.Authorize(h.t, rr.Header().Get("Location"))
+// TestGrants_SharedCloudflareDoor_EndToEnd: a Cloudflare provider that
+// verifies assertions but has no audTag — the deployed shape — may be
+// named in grants. A person and a service token coming through it both
+// get what the group grants; with service tokens named by principal,
+// not by a team.
+func TestGrants_SharedCloudflareDoor_EndToEnd(t *testing.T) {
+	section := issuer.GrantsConfig{Groups: []issuer.GrantGroup{{
+		Name:     "staff",
+		Members:  []string{"authentik/team:ethpandaops", "cfaccess/principal:user", "cfaccess/principal:service"},
+		Services: []string{"all:all"},
+	}}}
+	grants := sectionGrants(t, section, "authentik", "cfaccess")
 
-	rr = h.do(httptest.NewRequest(http.MethodGet, "/"+name+"/callback?"+back.Encode(), nil), state[0])
-	if rr.Code != http.StatusFound || rr.Header().Get("Location") != "/auth/token" {
-		h.t.Fatalf("oidc callback: status %d location %q body %s", rr.Code, rr.Header().Get("Location"), rr.Body.String())
+	idp := oidctest.New(t, oidctest.User{Subject: "sub-1", Email: "dev@example.org", Groups: []string{"team:lighthouse"}})
+	authentik := newOIDCProvider(idp, "authentik", oidc.Config{
+		TeamRules:    []protection.TeamRule{{Claim: "groups", Prefix: "team:"}},
+		GrantMembers: grants.AttributeMembers("authentik"),
+	})
+	cf := cloudflare.New(quietLog(), cloudflare.Config{
+		VerifyJWT:          true,
+		TeamDomain:         "ethpandaops.cloudflareaccess.example",
+		AudTag:             "", // not set, as deployed
+		AllowServiceTokens: true,
+		LoginPath:          "/cfaccess/login",
+		SessionKey:         testSessionKey("cfaccess"),
+		SessionCookieName:  "authenticatoor_cfaccess_session",
+		GrantMembers:       grants.AttributeMembers("cfaccess"),
+	})
+	cf.SetVerifier(accessVerifier{})
+	h := newSectionHarness(t, &section, "", authentik, NamedProvider{Name: "cfaccess", Provider: unstartedCloudflare{cf}})
+
+	const all = "+all,+all:all"
+	for name, assertion := range map[string]map[string]any{
+		"a person":        {"email": "staff@ethpandaops.io", "aud": []string{"some-application"}},
+		"a service token": {"common_name": "0123456789abcdef.access", "aud": []string{"another-application"}},
+	} {
+		req := tokenRequest()
+		req.Header.Set(cfaccess.DefaultJWTHeader, accessAssertion(t, assertion))
+		claims := h.verify(h.rawToken(req))
+		if claims.Services != all {
+			t.Errorf("%s through Cloudflare Access: services %q, want %q", name, claims.Services, all)
+		}
+		if claims.Teams != nil {
+			t.Errorf("%s: teams %v", name, claims.Teams)
+		}
 	}
-	session := liveCookies(rr)
-	if len(session) != 1 {
-		h.t.Fatalf("oidc callback cookies: %v", session)
+
+	// The other door is still told apart: a client developer through
+	// the IdP is not staff, and — named by no group — gets no token.
+	claims := h.mint(tokenRequest(), h.oidcLogin(idp, "authentik"))
+	if !slices.Equal(claims.Teams, []string{"lighthouse"}) || claims.Services != noToken {
+		t.Errorf("a client developer through the IdP: teams %v services %q", claims.Teams, claims.Services)
 	}
-	return session[0]
+
+	// Without any credential nobody is anybody.
+	rr := h.do(httptest.NewRequest(http.MethodGet, "/auth/token", nil))
+	if rr.Code == http.StatusOK {
+		t.Errorf("an unauthenticated request got a token: %s", rr.Body.String())
+	}
+}
+
+// TestNotGranted_TokenAliases: the machine aliases (/<name>/token)
+// answer a caller no group names like /auth/token does — for the
+// Cloudflare alias and for the oidc bearer alias.
+func TestNotGranted_TokenAliases(t *testing.T) {
+	idp := oidctest.New(t, oidctest.User{Subject: "u1", Email: "mallory@example.org", Groups: []string{"team:reth"}})
+	section := &issuer.GrantsConfig{Groups: []issuer.GrantGroup{{
+		Members:  []string{"oidc/team:panda", "cfaccess/user:staff@ethpandaops.io"},
+		Services: []string{"dora"},
+	}}}
+	h := newSectionHarness(t, section, "",
+		newCloudflareProvider("cfaccess"),
+		newOIDCProvider(idp, "oidc", oidc.Config{TeamRules: teamRules(prefixRule), Bearer: bearerOn()}),
+	)
+	cf := func(email string) *http.Request {
+		req := httptest.NewRequest(http.MethodGet, "/cfaccess/token", nil)
+		req.Header.Set(cloudflare.DefaultUserHeader, email)
+		return req
+	}
+	h.refusals()
+
+	assertNotGranted(t, h.do(cf("mallory@example.org")))
+	assertNotGranted(t, h.do(bearerGet("/oidc/token", idp.Token(t, cliAudience))))
+
+	lines := h.refusals()
+	if len(lines) != 2 {
+		t.Fatalf("%d refusal lines, want 2", len(lines))
+	}
+	for i, provider := range []string{"cfaccess", "oidc"} {
+		if e := lines[i]; e.Level != logrus.InfoLevel || e.Data["sub"] != "mallory@example.org" || e.Data["provider"] != provider {
+			t.Errorf("line %d: level %s, fields %v", i, e.Level, e.Data)
+		}
+	}
+
+	// Named callers at the same aliases.
+	if rr := h.do(cf("staff@ethpandaops.io")); rr.Code != http.StatusOK {
+		t.Errorf("/cfaccess/token for a named user: %d", rr.Code)
+	}
+	idp.SetUser(oidctest.User{Subject: "u2", Email: "dev@example.org", Groups: []string{"team:panda"}})
+	if rr := h.do(bearerGet("/oidc/token", idp.Token(t, cliAudience))); rr.Code != http.StatusOK {
+		t.Errorf("/oidc/token for a named user: %d", rr.Code)
+	}
+}
+
+// TestNotGranted_GrantAddedLater: the refusal ends no session. The
+// grants are read when a token is minted, so the session cookie of a
+// user who was refused yields a token as soon as the config names them
+// — no new login. (An attribute member is the exception: what a session
+// matches is captured at login; see
+// TestGrants_AttributeMembers_Sessions.)
+func TestNotGranted_GrantAddedLater(t *testing.T) {
+	idp := oidctest.New(t, oidctest.User{Subject: "u1", Email: "dev@example.org", Groups: []string{"team:reth"}})
+	build := func(groups ...issuer.GrantGroup) *teamsHarness {
+		return newSectionHarness(t, &issuer.GrantsConfig{Groups: groups}, "",
+			newOIDCProvider(idp, "oidc", oidc.Config{TeamRules: teamRules(prefixRule)}))
+	}
+	staff := issuer.GrantGroup{Members: []string{"oidc/team:panda"}, Services: []string{"all"}}
+
+	before := build(staff)
+	session := before.oidcLogin(idp, "oidc")
+	refused := before.mint(tokenRequest(), session)
+	if refused.Services != noToken || !slices.Equal(refused.Teams, []string{"reth"}) {
+		t.Fatalf("before: %+v", refused)
+	}
+	// Still logged in after the refusals: the same cookie identifies
+	// the user, again and again.
+	for range 3 {
+		if got := before.mint(tokenRequest(), session); got.Services != noToken || got.Subject != refused.Subject {
+			t.Fatalf("a later request with the same session: %+v", got)
+		}
+	}
+
+	tests := []struct {
+		name  string
+		added issuer.GrantGroup
+		want  string
+	}{
+		{"by team", issuer.GrantGroup{Members: []string{"oidc/team:reth"}, Services: []string{"dora"}}, "-all,+dora"},
+		{"by user", issuer.GrantGroup{Members: []string{"oidc/user:dev@example.org"}, Services: []string{"spamoor"}}, "-all,+spamoor"},
+		{"into a group without services", issuer.GrantGroup{Members: []string{"oidc/team:reth"}, Services: []string{}}, "-all"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			after := build(staff, tc.added)
+			got := after.mint(tokenRequest(), session)
+			if got.Services != tc.want || got.Subject != "dev@example.org" {
+				t.Errorf("the same session after the group was added: %+v, want services %q", got, tc.want)
+			}
+			rr := after.do(loginRequest(), session)
+			if rr.Code != http.StatusFound || !strings.HasPrefix(rr.Header().Get("Location"), appURL+"#auth_token=") {
+				t.Errorf("/auth/login: %d → %q", rr.Code, rr.Header().Get("Location"))
+			}
+		})
+	}
 }
 
 // TestTeams_EndToEnd_Basic: login → cookie → /auth/token → verify → teams,
@@ -457,51 +700,6 @@ func TestTeams_EndToEnd_Basic(t *testing.T) {
 				t.Errorf("userinfo teams: got %v, want %v", *info.Teams, tc.want)
 			}
 		})
-	}
-}
-
-// embeddedToken pulls the token out of the /auth/embed page's JSON blob.
-func embeddedToken(t *testing.T, page string) string {
-	t.Helper()
-	const open = `<script id="d" type="application/json">`
-	start := strings.Index(page, open)
-	if start < 0 {
-		t.Fatalf("embed page has no payload: %s", page)
-	}
-	rest := page[start+len(open):]
-	end := strings.Index(rest, "</script>")
-	if end < 0 {
-		t.Fatalf("embed page payload is not closed: %s", page)
-	}
-	var payload struct {
-		Token string `json:"token"`
-	}
-	if err := json.Unmarshal([]byte(rest[:end]), &payload); err != nil {
-		t.Fatalf("decode embed payload: %v", err)
-	}
-	return payload.Token
-}
-
-// TestTeams_EndToEnd_AnyAuth: the dev provider hands out its configured
-// teams and nothing a client supplies.
-func TestTeams_EndToEnd_AnyAuth(t *testing.T) {
-	h := newTeamsHarness(t, NamedProvider{Name: "anyauth", Provider: anyauth.New(quietLog(), anyauth.Config{
-		LoginPath: "/anyauth/login",
-		Teams:     []string{"dev"},
-	})})
-
-	form := url.Values{"user": {"alice"}, "return_to": {"/auth/token"}, "teams": {"panda"}}
-	login := httptest.NewRequest(http.MethodPost, "/anyauth/login", strings.NewReader(form.Encode()))
-	login.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	rr := h.do(login)
-	cookies := liveCookies(rr)
-	if rr.Code != http.StatusFound || len(cookies) != 1 {
-		t.Fatalf("login: status %d cookies %v", rr.Code, cookies)
-	}
-
-	claims := h.token(tokenRequest(), cookies[0])
-	if claims.Subject != "alice" || !slices.Equal(claims.Teams, []string{"dev"}) {
-		t.Errorf("token: sub=%q teams=%v", claims.Subject, claims.Teams)
 	}
 }
 
@@ -819,61 +1017,6 @@ func TestGrants_EndToEnd(t *testing.T) {
 	}
 }
 
-// TestGrants_EveryMintingEndpoint: the grant applies wherever a
-// token is minted — /auth/token, /auth/login, /auth/embed and the
-// Cloudflare machine alias.
-func TestGrants_EveryMintingEndpoint(t *testing.T) {
-	idp := oidctest.New(t, oidctest.User{
-		Subject: "u1", Email: "dev@client.example", Groups: []string{"team:lighthouse"},
-	})
-	h := newGrantsHarness(t, map[string][]string{"panda": {"all"}, "lighthouse": {"dora"}}, "",
-		newCloudflareProvider("cfaccess", "panda"),
-		newOIDCProvider(idp, "oidc", oidc.Config{TeamRules: teamRules(prefixRule)}),
-	)
-	session := h.oidcLogin(idp, "oidc")
-
-	if got := h.verify(h.rawToken(tokenRequest(), session)).Services; got != "-all,+dora" {
-		t.Errorf("/auth/token: %q", got)
-	}
-
-	rr := h.do(httptest.NewRequest(http.MethodGet,
-		"/auth/login?return_to="+url.QueryEscape("https://app.test.example/"), nil), session)
-	loc, err := url.Parse(rr.Header().Get("Location"))
-	if err != nil || rr.Code != http.StatusFound {
-		t.Fatalf("/auth/login: status %d err %v", rr.Code, err)
-	}
-	frag, err := url.ParseQuery(loc.Fragment)
-	if err != nil {
-		t.Fatalf("parse fragment: %v", err)
-	}
-	if got := h.verify(frag.Get("auth_token")).Services; got != "-all,+dora" {
-		t.Errorf("/auth/login: %q", got)
-	}
-
-	rr = h.do(httptest.NewRequest(http.MethodGet,
-		"/auth/embed?target_origin="+url.QueryEscape("https://app.test.example"), nil), session)
-	if rr.Code != http.StatusOK {
-		t.Fatalf("/auth/embed: status %d", rr.Code)
-	}
-	if got := h.verify(embeddedToken(t, rr.Body.String())).Services; got != "-all,+dora" {
-		t.Errorf("/auth/embed: %q", got)
-	}
-
-	alias := httptest.NewRequest(http.MethodGet, "/cfaccess/token", nil)
-	alias.Header.Set(cloudflare.DefaultUserHeader, "staff@ethpandaops.io")
-	rr = h.do(alias, session)
-	if rr.Code != http.StatusOK {
-		t.Fatalf("/cfaccess/token: status %d", rr.Code)
-	}
-	var resp tokenResponse
-	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
-	if got := h.verify(resp.Token).Services; got != "+all" {
-		t.Errorf("/cfaccess/token: %q", got)
-	}
-}
-
 // TestGrants_FollowCurrentConfig: the grant is computed at every
 // mint from the config in force, not captured in the session — the same
 // session cookie yields a different services claim after the table
@@ -912,114 +1055,6 @@ func TestGrants_FollowCurrentConfig(t *testing.T) {
 			}
 			if !slices.Equal(claims.Teams, []string{"lighthouse"}) {
 				t.Errorf("teams: %v", claims.Teams)
-			}
-		})
-	}
-}
-
-// TestGrants_Features_EndToEnd: login → /auth/token → Verify with
-// ExpectedService → HasFeature, for a team with the bare service, one
-// with a feature of it, and the internal team with everything. A
-// resource server checks "roll" as a privileged (default-deny) feature
-// and "view-logs" as an ordinary (default-allow) one.
-func TestGrants_Features_EndToEnd(t *testing.T) {
-	grants := map[string][]string{
-		"panda":      {"all:all"},
-		"lighthouse": {"dora"},
-		"geth":       {"dora:roll"},
-		"reth":       {},
-	}
-
-	tests := []struct {
-		name      string
-		groups    []string // id_token groups; nil: come in through Cloudflare (team panda)
-		wantClaim string
-		wantUse   bool // dora's verifier accepts the token
-		wantRoll  bool // default-deny feature
-		wantHold  bool // another default-deny feature
-		wantLogs  bool // default-allow feature
-		wantOther bool // spamoor's verifier accepts the token
-	}{
-		{"team with the bare service", []string{"team:lighthouse"}, "-all,+dora", true, false, false, true, false},
-		{"team with a feature", []string{"team:geth"}, "-all,+dora,+dora:roll", true, true, false, true, false},
-		{"both teams", []string{"team:geth", "team:lighthouse"}, "-all,+dora,+dora:roll", true, true, false, true, false},
-		{"the internal team: everything", nil, "+all,+all:all", true, true, true, true, true},
-		{"a team in a group without services", []string{"team:reth"}, "-all", false, false, false, false, false},
-	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			idp := oidctest.New(t, oidctest.User{Subject: "u1", Email: "dev@client.example", Groups: tc.groups})
-			h := newGrantsHarness(t, grants, "",
-				newCloudflareProvider("cfaccess", "panda"),
-				newOIDCProvider(idp, "oidc", oidc.Config{TeamRules: teamRules(prefixRule)}),
-			)
-
-			var token string
-			if tc.groups == nil {
-				req := tokenRequest()
-				req.Header.Set(cloudflare.DefaultUserHeader, "staff@ethpandaops.io")
-				token = h.rawToken(req)
-			} else {
-				token = h.rawToken(tokenRequest(), h.oidcLogin(idp, "oidc"))
-			}
-			if got := h.verify(token).Services; got != tc.wantClaim {
-				t.Errorf("services claim: got %q, want %q", got, tc.wantClaim)
-			}
-
-			// The service gate first, as every resource server has it.
-			claims, err := h.serviceVerifier("dora").Verify(token)
-			if (err == nil) != tc.wantUse {
-				t.Fatalf("dora Verify: err=%v, want accepted=%t", err, tc.wantUse)
-			}
-			if _, err := h.serviceVerifier("spamoor").Verify(token); (err == nil) != tc.wantOther {
-				t.Errorf("spamoor Verify: err=%v, want accepted=%t", err, tc.wantOther)
-			}
-			if !tc.wantUse {
-				// Rejected at the gate; the feature checks agree anyway.
-				claims = h.verify(token)
-			}
-
-			if got := claims.HasFeature("dora", "roll", auth.FeatureDefaultDeny); got != tc.wantRoll {
-				t.Errorf("HasFeature(dora, roll, deny) = %t, want %t", got, tc.wantRoll)
-			}
-			if got := claims.HasFeature("dora", "hold", auth.FeatureDefaultDeny); got != tc.wantHold {
-				t.Errorf("HasFeature(dora, hold, deny) = %t, want %t", got, tc.wantHold)
-			}
-			if got := claims.HasFeature("dora", "view-logs", auth.FeatureDefaultAllow); got != tc.wantLogs {
-				t.Errorf("HasFeature(dora, view-logs, allow) = %t, want %t", got, tc.wantLogs)
-			}
-			if got := claims.HasFeature("dora", auth.FeatureBasic, auth.FeatureDefaultDeny); got != tc.wantUse {
-				t.Errorf("HasFeature(dora, basic) = %t, want %t", got, tc.wantUse)
-			}
-
-			// And through the middleware a resource server would mount.
-			for _, check := range []struct {
-				feature string
-				def     auth.FeatureDefault
-				want    bool
-			}{
-				{"roll", auth.FeatureDefaultDeny, tc.wantRoll},
-				{"view-logs", auth.FeatureDefaultAllow, tc.wantLogs},
-			} {
-				handler := auth.Middleware(h.serviceVerifier("dora"))(auth.RequireFeature(
-					"dora", check.feature, check.def,
-					func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) },
-				))
-				req := httptest.NewRequest(http.MethodPost, "https://dora.test.example/api", nil)
-				req.Header.Set("Authorization", "Bearer "+token)
-				rr := httptest.NewRecorder()
-				handler.ServeHTTP(rr, req)
-
-				want := http.StatusOK
-				switch {
-				case !tc.wantUse:
-					want = http.StatusUnauthorized // refused by the service gate
-				case !check.want:
-					want = http.StatusForbidden
-				}
-				if rr.Code != want {
-					t.Errorf("RequireFeature(%s): status %d, want %d", check.feature, rr.Code, want)
-				}
 			}
 		})
 	}
@@ -1116,122 +1151,6 @@ func TestTeamRules_EndToEnd(t *testing.T) {
 	basicReq.Header.Set("X-Username", "root")
 	if claims := h.token(basicReq); !slices.Equal(claims.Teams, []string{"ops"}) {
 		t.Errorf("basic: teams %v", claims.Teams)
-	}
-}
-
-// TestGrants_ProviderQualified_EndToEnd is the split between identity
-// and access, through the real handlers: three doors whose identities
-// carry the same team name, the same user id and the same attribute
-// value; the grants name one door each. Login → /auth/token → verify →
-// HasFeature.
-func TestGrants_ProviderQualified_EndToEnd(t *testing.T) {
-	idp := oidctest.New(t, oidctest.User{
-		Subject: "u1", Email: "alice@example.org", Groups: []string{"team:panda", "panda-access"},
-	})
-
-	section := issuer.GrantsConfig{Groups: []issuer.GrantGroup{
-		{Name: "staff", Members: []string{"cfaccess/team:panda"}, Services: []string{"all:all"}},
-		{Name: "alice", Members: []string{"oidc/user:Alice@Example.org"}, Services: []string{"dora:reindex"}},
-		{Name: "internal", Members: []string{"oidc/groups:panda-access"}, Services: []string{"assertoor"}},
-		{Name: "htpasswd-alice", Members: []string{"htpasswd/username:alice@example.org"}, Services: []string{"spamoor"}},
-	}}
-	grants := sectionGrants(t, section, "cfaccess", "oidc", "htpasswd")
-
-	// htpasswd users named like the OIDC user's email and like the IdP
-	// group; an htpasswd rule that hands out the team "panda" too.
-	sum := sha1.Sum([]byte("hunter2"))
-	htpasswd := filepath.Join(t.TempDir(), "htpasswd")
-	hash := ":{SHA}" + base64.StdEncoding.EncodeToString(sum[:]) + "\n"
-	if err := os.WriteFile(htpasswd, []byte("alice@example.org"+hash+"panda-access"+hash), 0o600); err != nil {
-		t.Fatalf("write htpasswd: %v", err)
-	}
-	basicDoor := NamedProvider{Name: "htpasswd", Provider: basic.New(quietLog(), basic.Config{
-		HtpasswdFile:      htpasswd,
-		LoginPath:         "/htpasswd/login",
-		SessionKey:        testSessionKey("htpasswd"),
-		SessionCookieName: "authenticatoor_htpasswd_session",
-		Teams:             []string{"panda"},
-		GrantMembers:      grants.AttributeMembers("htpasswd"),
-	})}
-	cfDoor := NamedProvider{Name: "cfaccess", Provider: cloudflare.New(quietLog(), cloudflare.Config{
-		VerifyJWT:         false,
-		LoginPath:         "/cfaccess/login",
-		SessionKey:        testSessionKey("cfaccess"),
-		SessionCookieName: "authenticatoor_cfaccess_session",
-		Teams:             []string{"panda"},
-		GrantMembers:      grants.AttributeMembers("cfaccess"),
-	})}
-	oidcDoor := newOIDCProvider(idp, "oidc", oidc.Config{
-		TeamRules:    teamRules(prefixRule),
-		GrantMembers: grants.AttributeMembers("oidc"),
-	})
-
-	h := newSectionHarness(t, &section, "", cfDoor, oidcDoor, basicDoor)
-
-	cfReq := func(email string) *http.Request {
-		r := tokenRequest()
-		r.Header.Set(cloudflare.DefaultUserHeader, email)
-		return r
-	}
-	basicReq := func(user string) *http.Request {
-		r := tokenRequest()
-		r.SetBasicAuth(user, "hunter2")
-		return r
-	}
-
-	tests := []struct {
-		name         string
-		claims       minted
-		wantTeams    []string
-		wantServices string
-	}{
-		{
-			"panda through the Cloudflare door: the staff group",
-			h.mint(cfReq("staff@ethpandaops.io")),
-			[]string{"panda"}, "+all,+all:all",
-		},
-		{
-			"panda through the OIDC door: the team is in the token, the staff grant is not",
-			h.mint(tokenRequest(), h.oidcLogin(idp, "oidc")),
-			[]string{"panda"}, "-all,+assertoor,+dora,+dora:reindex",
-		},
-		{
-			"panda through the basic door, named like the OIDC user: its own group only",
-			h.mint(basicReq("alice@example.org")),
-			[]string{"panda"}, "-all,+spamoor",
-		},
-		{
-			"a basic-auth user named like the IdP group: in no group",
-			h.mint(basicReq("panda-access")),
-			[]string{"panda"}, noToken,
-		},
-		{
-			"the OIDC user's email through the Cloudflare door: staff by team, not alice's group",
-			h.mint(cfReq("alice@example.org")),
-			[]string{"panda"}, "+all,+all:all",
-		},
-	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			if !slices.Equal(tc.claims.Teams, tc.wantTeams) {
-				t.Errorf("teams: got %v, want %v", tc.claims.Teams, tc.wantTeams)
-			}
-			if tc.claims.Services != tc.wantServices {
-				t.Errorf("services: got %q, want %q", tc.claims.Services, tc.wantServices)
-			}
-		})
-	}
-
-	// The provider name and the matches stay inside the service.
-	raw := h.rawToken(tokenRequest(), h.oidcLogin(idp, "oidc"))
-	payload, err := base64.RawURLEncoding.DecodeString(strings.Split(raw, ".")[1])
-	if err != nil {
-		t.Fatalf("decode payload: %v", err)
-	}
-	for _, leak := range []string{`"provider"`, `"oidc"`, "panda-access", `"match`} {
-		if strings.Contains(string(payload), leak) {
-			t.Errorf("the token carries %s: %s", leak, payload)
-		}
 	}
 }
 
@@ -1384,223 +1303,6 @@ func TestGrants_AmbientAlias(t *testing.T) {
 	req.Header.Set(cloudflare.DefaultUserHeader, "someone@ethpandaops.io")
 	// Nobody names that person at the second door: no token there.
 	assertNotGranted(t, h.do(req))
-}
-
-// accessVerifier stands in for the Cloudflare JWKS check: it accepts any
-// assertion and reports the identity the test put into it.
-type accessVerifier struct{}
-
-func (accessVerifier) Verify(_ context.Context, token string) (*cfaccess.Claims, error) {
-	attrs, err := protection.TokenAttributes(token)
-	if err != nil {
-		return nil, err
-	}
-	claims := &cfaccess.Claims{}
-	claims.Email, _ = attrs["email"].(string)
-	claims.CommonName, _ = attrs["common_name"].(string)
-	return claims, nil
-}
-
-// unstartedCloudflare is a Cloudflare provider whose Start does nothing:
-// the real one fetches the team's JWKS, which the stub verifier
-// replaces.
-type unstartedCloudflare struct{ *cloudflare.Provider }
-
-func (unstartedCloudflare) Start(context.Context) error { return nil }
-
-// accessAssertion builds a Cf-Access-Jwt-Assertion value with the given
-// claims.
-func accessAssertion(t *testing.T, claims map[string]any) string {
-	t.Helper()
-	payload, err := json.Marshal(claims)
-	if err != nil {
-		t.Fatalf("marshal: %v", err)
-	}
-	return "e30." + base64.RawURLEncoding.EncodeToString(payload) + ".c2ln"
-}
-
-// TestDevnetExample is the complete example of docs/config.md ("A
-// complete devnet"): the providers are built from the settings printed
-// there and the grants section is read from the docs file itself. The
-// rows are the claims table of the docs; teams and the services claim
-// are asserted exactly as printed, and the test fails if the docs table
-// and this one drift apart.
-func TestDevnetExample(t *testing.T) {
-	section, docTable := docsDevnetExample(t)
-
-	newIdP := func(email string, groups ...string) *oidctest.IdP {
-		return oidctest.New(t, oidctest.User{Subject: "sub-" + email, Email: email, Groups: groups})
-	}
-
-	tests := []struct {
-		name         string
-		cloudflare   map[string]any // claims of the Access assertion; nil: use the oidc door
-		idp          *oidctest.IdP
-		wantTeams    []string
-		wantServices string
-	}{
-		{
-			"A person through Cloudflare Access",
-			map[string]any{"email": "staff@ethpandaops.io"}, nil,
-			[]string{"panda"}, "+all,+all:all",
-		},
-		{
-			"A service token through Cloudflare Access",
-			map[string]any{"common_name": "abc123.access"}, nil,
-			nil, noToken,
-		},
-		{
-			"Staff via `oidc`, groups `team:ethpandaops`, `panda-access`",
-			nil, newIdP("staff@ethpandaops.io", "team:ethpandaops", "panda-access"),
-			[]string{"ethpandaops"}, "+all,+all:all",
-		},
-		{
-			"`alice@example.org` via `oidc`, group `team:lighthouse`",
-			nil, newIdP("alice@example.org", "team:lighthouse"),
-			[]string{"lighthouse"}, "-all,+dora,+dora:reindex,+spamoor,+spamoor:user*",
-		},
-		{
-			"`bob@example.org` via `oidc`, group `team:lighthouse`",
-			nil, newIdP("bob@example.org", "team:lighthouse"),
-			[]string{"lighthouse"}, "-all,+dora,+spamoor,+spamoor:user*",
-		},
-		{
-			"`carol@example.org` via `oidc`, no `team:` group",
-			nil, newIdP("carol@example.org", "clients"),
-			[]string{"geth"}, "-all,+dora,+spamoor,+spamoor:user*",
-		},
-		{
-			"`dave@example.org` via `oidc`, group `panda-access` only",
-			nil, newIdP("dave@example.org", "panda-access"),
-			nil, "-all,+assertoor",
-		},
-		{
-			"Someone via `oidc` with group `team:panda`",
-			nil, newIdP("mallory@example.org", "team:panda"),
-			[]string{"panda"}, noToken,
-		},
-	}
-
-	if len(docTable) != len(tests) {
-		t.Fatalf("the docs table has %d rows, this test %d", len(docTable), len(tests))
-	}
-
-	for i, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			// The row as the docs print it.
-			row := docTable[i]
-			wantTeamsCell := "*(none)*"
-			if tc.wantTeams != nil {
-				wantTeamsCell = "`[\"" + strings.Join(tc.wantTeams, "\", \"") + "\"]`"
-			}
-			wantServicesCell := "`" + tc.wantServices + "`"
-			if tc.wantServices == noToken {
-				// No token, so no claims: the docs print that across
-				// both columns. The teams are still checked below, as
-				// /auth/userinfo reports them.
-				wantTeamsCell, wantServicesCell = "—", "*no token*"
-			}
-			if row[0] != tc.name || row[1] != wantTeamsCell || row[2] != wantServicesCell {
-				t.Errorf("docs row %d is %q, this test expects [%q %q %q]", i, row, tc.name, wantTeamsCell, wantServicesCell)
-			}
-
-			idp := tc.idp
-			if idp == nil {
-				idp = newIdP("unused@example.org")
-			}
-			grants := sectionGrants(t, section, "cfaccess", "oidc")
-
-			cfProvider := cloudflare.New(quietLog(), cloudflare.Config{
-				VerifyJWT:          true,
-				TeamDomain:         "team.cloudflareaccess.example",
-				AudTag:             "aud",
-				AllowServiceTokens: true,
-				LoginPath:          "/cfaccess/login",
-				SessionKey:         testSessionKey("cfaccess"),
-				SessionCookieName:  "authenticatoor_cfaccess_session",
-				TeamRules: []protection.TeamRule{
-					{Claim: "principal", Map: map[string][]string{"user": {"panda"}}},
-				},
-				GrantMembers: grants.AttributeMembers("cfaccess"),
-			})
-			cfProvider.SetVerifier(accessVerifier{})
-
-			oidcDoor := newOIDCProvider(idp, "oidc", oidc.Config{
-				TeamRules: []protection.TeamRule{
-					{Claim: "groups", Prefix: "team:"},
-					{Claim: "email", Map: map[string][]string{"carol@example.org": {"geth"}}},
-				},
-				GrantMembers: grants.AttributeMembers("oidc"),
-			})
-
-			full := newSectionHarness(t, &section, "",
-				NamedProvider{Name: "cfaccess", Provider: unstartedCloudflare{cfProvider}}, oidcDoor)
-
-			var claims minted
-			if tc.cloudflare != nil {
-				req := tokenRequest()
-				req.Header.Set(cfaccess.DefaultJWTHeader, accessAssertion(t, tc.cloudflare))
-				claims = full.mint(req)
-			} else {
-				claims = full.mint(tokenRequest(), full.oidcLogin(idp, "oidc"))
-			}
-			if !slices.Equal(claims.Teams, tc.wantTeams) {
-				t.Errorf("teams: got %v, want %v", claims.Teams, tc.wantTeams)
-			}
-			if claims.Services != tc.wantServices {
-				t.Errorf("services: got %q, want %q", claims.Services, tc.wantServices)
-			}
-		})
-	}
-}
-
-// docsDevnetExample reads the "A complete devnet" section of
-// docs/config.md: the grants section of its YAML example, and the rows
-// of its claims table (cells trimmed).
-func docsDevnetExample(t *testing.T) (issuer.GrantsConfig, [][]string) {
-	t.Helper()
-	doc, err := os.ReadFile("../../docs/config.md")
-	if err != nil {
-		t.Fatalf("read docs: %v", err)
-	}
-	_, rest, found := strings.Cut(string(doc), "### A complete devnet")
-	if !found {
-		t.Fatal("docs/config.md has no \"A complete devnet\" section")
-	}
-	_, rest, _ = strings.Cut(rest, "```yaml\n")
-	example, rest, found := strings.Cut(rest, "```")
-	if !found {
-		t.Fatal("the section has no yaml block")
-	}
-	example = strings.NewReplacer(
-		"<devnet>", "devnet-1", "<team>", "ethpandaops",
-		"<central-idp>", "idp.example.org", "<oidc-relay>", "relay.example.org",
-	).Replace(example)
-	file := filepath.Join(t.TempDir(), "config.yaml")
-	if err := os.WriteFile(file, []byte(example), 0o600); err != nil {
-		t.Fatalf("write example: %v", err)
-	}
-	cfg, err := config.Load(file)
-	if err != nil {
-		t.Fatalf("the docs example does not load: %v", err)
-	}
-	if cfg.Grants == nil {
-		t.Fatal("the docs example has no grants section")
-	}
-
-	var rows [][]string
-	section, _, _ := strings.Cut(rest, "\n### ")
-	for _, line := range strings.Split(section, "\n") {
-		if !strings.HasPrefix(line, "| ") || strings.HasPrefix(line, "| Who") || strings.HasPrefix(line, "| ---") {
-			continue
-		}
-		cells := strings.Split(strings.Trim(line, "|"), "|")
-		for i := range cells {
-			cells[i] = strings.TrimSpace(cells[i])
-		}
-		rows = append(rows, cells)
-	}
-	return *cfg.Grants, rows
 }
 
 // TestGrants_UnverifiedEmail_EndToEnd: a user of an IdP that does not
